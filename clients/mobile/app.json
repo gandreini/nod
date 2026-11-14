@@ -1,0 +1,47 @@
+{
+  "expo": {
+    "name": "Nod",
+    "slug": "nod-mobile",
+    "scheme": "nod",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "automatic",
+    "android": {
+      "package": "com.gandreini.nod",
+      "adaptiveIcon": {
+        "backgroundColor": "#fafafa",
+        "foregroundImage": "./assets/android-icon-foreground.png",
+        "backgroundImage": "./assets/android-icon-background.png",
+        "monochromeImage": "./assets/android-icon-monochrome.png"
+      },
+      "predictiveBackGestureEnabled": false,
+      "allowBackup": false
+    },
+    "plugins": [
+      "expo-secure-store",
+      "expo-font",
+      [
+        "expo-splash-screen",
+        {
+          "image": "./assets/splash-icon.png",
+          "imageWidth": 120,
+          "backgroundColor": "#fafafa",
+          "dark": {
+            "backgroundColor": "#191919"
+          }
+        }
+      ],
+      "expo-router",
+      "expo-audio",
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "Nod uses your photos when you attach them to a message.",
+          "cameraPermission": "Nod uses the camera when you take a photo to attach to a message."
+        }
+      ],
+      "expo-sharing"
+    ]
+  }
+}

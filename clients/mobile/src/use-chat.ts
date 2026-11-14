@@ -1,0 +1,410 @@
+import { randomUUID } from 'expo-crypto';
+import { useCallback, useEffect, useReducer, useRef, useState } from 'react';
+import { AppState as AppLifecycle } from 'react-native';
+import EventSource from 'react-native-sse';
+import { initialStreamState, streamReducer } from '../../../src/web/lib/streams';
+import { ApiError, getState, olderMessages, sendText, stopThread } from './api';
+import { prepareTranscription, sendAudio } from './uploads';
+import type { Answer } from './cards';
+import { attachmentIds, type Draft } from './attachments';
+import { mergeMessages, type Outgoing, type Recording } from './chat-state';
+import { createOutbox, refusedAccess, type Outbox } from './outbox';
+import { dropRecording, keepRecording, loadPending, savePending } from './pending-voice';
+import type { Connection } from './connection';
+import type { Activity, AppState, Message } from './contracts';
+
+interface ServerEvent {
+  type?: string;
+  threadId?: string;
+  turnId?: string;
+  text?: string;
+  streamId?: string;
+  done?: boolean;
+  items?: Activity[];
+}
+
+const maxReconnectDelay = 30000;
+
+function describe(error: unknown) {
+  return error instanceof Error ? error.message : String(error);
+}
+
+export function useChat(connection: Connection, onRefused: (notice: string) => void) {
+  const [state, setState] = useState<AppState | null>(null);
+  const [older, setOlder] = useState<Message[]>([]);
+  const [hasEarlier, setHasEarlier] = useState(false);
+  const [loadingOlder, setLoadingOlder] = useState(false);
+  const [outgoing, setOutgoing] = useState<Outgoing[]>([]);
+  const [streams, dispatch] = useReducer(streamReducer, initialStreamState);
+  const [error, setError] = useState<string>();
+  const [live, setLive] = useState(false);
+  const [version, setVersion] = useState(0);
+  const threadId = useRef<string | null>(null);
+  const stateRef = useRef<AppState | null>(null);
+  const inFlight = useRef(false);
+  const again = useRef(false);
+  const alive = useRef(true);
+  const source = useRef<EventSource<never> | null>(null);
+  const timers = useRef(new Set<ReturnType<typeof setTimeout>>());
+
+  useEffect(() => {
+    alive.current = true;
+    const pending = timers.current;
+    return () => {
+      alive.current = false;
+      pending.forEach((timer) => clearTimeout(timer));
+      pending.clear();
+    };
+  }, []);
+
+  const later = useCallback((run: () => void, delay: number) => {
+    if (!alive.current) return;
+    const timer = setTimeout(() => {
+      timers.current.delete(timer);
+      if (alive.current) run();
+    }, delay);
+    timers.current.add(timer);
+  }, []);
+
+  const refused = useCallback(
+    (status: number) => {
+      if (!alive.current) return;
+      onRefused(
+        `${new URL(connection.origin).host} no longer accepts the saved token (HTTP ${status}). Connect again with the current token.`,
+      );
+    },
+    [connection.origin, onRefused],
+  );
+
+  const refresh = useCallback(async () => {
+    if (inFlight.current) {
+      again.current = true;
+      return;
+    }
+    inFlight.current = true;
+    try {
+      const next = await getState(connection);
+      if (!alive.current) return;
+      if (threadId.current && threadId.current !== next.threadId) setOlder([]);
+      if (threadId.current !== next.threadId) setHasEarlier(Boolean(next.hasEarlierMessages));
+      threadId.current = next.threadId;
+      stateRef.current = next;
+      dispatch({
+        type: 'persisted',
+        threadId: next.threadId,
+        streamIds: next.messages.flatMap((item) => (item.streamId ? [item.streamId] : [])),
+        discardedTurnIds: next.turns
+          .filter((turn) => turn.status === 'failed' || turn.status === 'cancelled')
+          .map((turn) => turn.id),
+      });
+      setState(next);
+      outbox.current?.settle(next.messages);
+      setError(undefined);
+    } catch (problem) {
+      if (!alive.current) return;
+      if (problem instanceof ApiError && problem.status === 401) return refused(problem.status);
+      setError(refusedAccess(problem) ?? describe(problem));
+    } finally {
+      inFlight.current = false;
+      if (again.current && alive.current) {
+        again.current = false;
+        void refresh();
+      }
+    }
+  }, [connection, refused]);
+
+  const reconnect = useCallback(() => {
+    const events = source.current;
+    if (!events) return;
+    events.close();
+    events.open();
+    void refresh();
+  }, [refresh]);
+
+  useEffect(() => {
+    const events = new EventSource<never>(`${connection.origin}/api/events`, {
+      headers: { Authorization: `Bearer ${connection.token}` },
+      pollingInterval: 3000,
+      timeout: 0,
+    });
+    source.current = events;
+    let delay = 3000;
+    let pending: ReturnType<typeof setTimeout> | null = null;
+    let stopped = false;
+    const retry = () => {
+      if (pending || stopped) return;
+      pending = setTimeout(() => {
+        pending = null;
+        if (stopped) return;
+        events.close();
+        events.open();
+      }, delay);
+      delay = Math.min(delay * 2, maxReconnectDelay);
+    };
+    events.addEventListener('open', () => {
+      delay = 3000;
+      if (pending) clearTimeout(pending);
+      pending = null;
+      setLive(true);
+      void refresh();
+    });
+    events.addEventListener('error', (event) => {
+      setLive(false);
+      const status = 'xhrStatus' in event ? event.xhrStatus : undefined;
+      if (status === 401) {
+        stopped = true;
+        events.close();
+        return refused(status);
+      }
+      if (status === 403)
+        setError(
+          `The server refused the live connection: ${'message' in event && event.message ? event.message : 'access denied'} (HTTP 403)`,
+        );
+      retry();
+    });
+    events.addEventListener('message', (event) => {
+      if (!event.data) return;
+      let data: ServerEvent;
+      try {
+        data = JSON.parse(event.data);
+      } catch {
+        return;
+      }
+      if (data.type === 'refresh') {
+        void refresh();
+        setVersion((value) => value + 1);
+      }
+      if (data.type === 'activity' && Array.isArray(data.items)) {
+        const items = data.items;
+        setState((current) => (current ? { ...current, activity: items } : current));
+      }
+      if (
+        data.type === 'delta' &&
+        typeof data.threadId === 'string' &&
+        typeof data.turnId === 'string'
+      ) {
+        if (threadId.current && data.threadId !== threadId.current) return void refresh();
+        dispatch({
+          type: 'delta',
+          threadId: data.threadId,
+          turnId: data.turnId,
+          text: typeof data.text === 'string' ? data.text : '',
+          ...(typeof data.streamId === 'string' ? { streamId: data.streamId } : {}),
+          done: data.done === true,
+        });
+      }
+    });
+    const lifecycle = AppLifecycle.addEventListener('change', (status) => {
+      if (status === 'active' && !stopped) {
+        delay = 3000;
+        events.close();
+        events.open();
+        void refresh();
+        setVersion((value) => value + 1);
+      }
+    });
+    void refresh();
+    return () => {
+      stopped = true;
+      if (pending) clearTimeout(pending);
+      lifecycle.remove();
+      events.removeAllEventListeners();
+      events.close();
+      if (source.current === events) source.current = null;
+    };
+  }, [connection, refresh, refused]);
+
+  const deliveredRef = useRef<() => void>(() => {});
+  deliveredRef.current = () => void refresh();
+  const refusedRef = useRef(refused);
+  refusedRef.current = refused;
+  const outbox = useRef<Outbox | null>(null);
+  if (!outbox.current)
+    outbox.current = createOutbox({
+      thread: () => threadId.current,
+      sendText: (item, thread) =>
+        sendText(connection, {
+          id: item.id,
+          text: item.text,
+          threadId: thread,
+          attachmentIds: item.attachmentIds,
+        }),
+      sendAudio: async (item, thread, sendId) => {
+        await prepareTranscription(connection);
+        await sendAudio(connection, { id: sendId, threadId: thread, ...item.audio! });
+      },
+      arrived: (sendId) =>
+        getState(connection).then((next) => next.messages.some((message) => message.id === sendId)),
+      newId: randomUUID,
+      later,
+      onChange: (items) => {
+        if (alive.current) setOutgoing(items);
+      },
+      onRefused: (status) => refusedRef.current(status),
+      onDelivered: () => deliveredRef.current(),
+    });
+  useEffect(() => () => outbox.current?.stop(), []);
+
+  const send = useCallback((text: string, attachments: Draft[] = []) => {
+    void outbox.current!.add({
+      id: randomUUID(),
+      text,
+      ...(attachments.length
+        ? {
+            files: attachments.map(({ uri, name, mimeType, size }) => ({
+              uri,
+              name,
+              mimeType,
+              size,
+            })),
+            attachmentIds: attachmentIds(attachments),
+          }
+        : {}),
+      status: 'sending',
+      createdAt: new Date().toISOString(),
+    });
+  }, []);
+
+  const sendVoice = useCallback(async (audio: Recording) => {
+    const id = randomUUID();
+    const uri = await keepRecording(audio.uri, id).catch(() => audio.uri);
+    if (uri !== audio.uri) dropRecording(audio.uri, true);
+    if (!alive.current) return;
+    void outbox.current!.add({
+      id,
+      text: '',
+      audio: { ...audio, uri },
+      status: 'sending',
+      createdAt: new Date().toISOString(),
+    });
+  }, []);
+
+  const retry = useCallback((id: string) => void outbox.current!.retry(id), []);
+  const discard = useCallback((id: string) => outbox.current!.discard(id), []);
+
+  const kept = useRef(new Set<string>());
+  const [hydrated, setHydrated] = useState(false);
+  useEffect(() => {
+    if (!hydrated) return;
+    const voices = outgoing.filter((item) => item.audio && item.status !== 'sent');
+    void savePending(connection.origin, voices).catch(() => {});
+    const now = new Set(voices.map((item) => item.audio!.uri));
+    kept.current.forEach((uri) => {
+      if (!now.has(uri)) dropRecording(uri);
+    });
+    kept.current = now;
+  }, [connection.origin, hydrated, outgoing]);
+
+  const restored = useRef(false);
+  const ready = state !== null;
+  useEffect(() => {
+    if (!ready || restored.current) return;
+    restored.current = true;
+    void loadPending(connection.origin).then((items) => {
+      if (!alive.current) return;
+      setHydrated(true);
+      const arrived = new Set(stateRef.current?.messages.map((message) => message.id));
+      void outbox.current!.restore(items, arrived);
+    });
+  }, [connection.origin, ready]);
+
+  useEffect(() => {
+    const subscription = AppLifecycle.addEventListener('change', (status) => {
+      if (status === 'active') void outbox.current!.revive();
+    });
+    return () => subscription.remove();
+  }, []);
+
+  const answer: Answer = useCallback(
+    async (reply) => {
+      const thread = threadId.current;
+      if (!thread) throw new Error('The conversation is still loading. Try again in a moment.');
+      try {
+        await sendText(connection, { id: randomUUID(), threadId: thread, ...reply });
+        void refresh();
+        return 'sent';
+      } catch (problem) {
+        if (problem instanceof ApiError) {
+          if (problem.status === 401) {
+            refused(problem.status);
+            return 'unavailable';
+          }
+          const stale =
+            problem.code === 'question_unavailable' ||
+            problem.code === 'approval_unavailable' ||
+            (Boolean(reply.approvalAnswer) && /no longer waiting/i.test(problem.reason ?? ''));
+          if (problem.status === 409 && stale) {
+            void refresh();
+            return 'unavailable';
+          }
+          const access = refusedAccess(problem);
+          if (access) throw new Error(access);
+        }
+        throw problem;
+      }
+    },
+    [connection, refresh, refused],
+  );
+
+  const stop = useCallback(async () => {
+    try {
+      await stopThread(connection);
+      void refresh();
+    } catch (problem) {
+      setError(`Stop failed: ${describe(problem)}`);
+    }
+  }, [connection, refresh]);
+
+  const messages = mergeMessages(older, state?.messages ?? []);
+
+  const loadOlder = useCallback(async () => {
+    const thread = threadId.current;
+    const oldest = messages[0];
+    if (!thread || !oldest || !hasEarlier || loadingOlder) return;
+    setLoadingOlder(true);
+    try {
+      const page = await olderMessages(connection, thread, oldest);
+      if (!alive.current || threadId.current !== thread) return;
+      setOlder((current) => mergeMessages(page.messages, current));
+      setHasEarlier(page.hasMore);
+    } catch (problem) {
+      if (alive.current) setError(`Older messages did not load: ${describe(problem)}`);
+    } finally {
+      if (alive.current) setLoadingOlder(false);
+    }
+  }, [connection, hasEarlier, loadingOlder, messages]);
+
+  const activity = state?.activity ?? [];
+  const active = Object.entries(streams.active).map(([id, stream]) => ({ id, ...stream }));
+  const writing = active.some((stream) => stream.text);
+  const chatWork = activity.some((item) => !item.background && !item.taskId);
+  const sending = outgoing.some((item) => item.status === 'sending');
+
+  return {
+    ready: state !== null,
+    messages,
+    outgoing,
+    streams: active,
+    activity,
+    working: activity.some((item) => !item.background),
+    thinking: (chatWork || sending) && !writing,
+    live,
+    version,
+    error,
+    hasEarlier,
+    loadingOlder,
+    pendingQuestions: new Set(
+      state?.pendingAnswerChoiceMessageIds ??
+        messages.filter((item) => item.answerChoicesPending).map((item) => item.id),
+    ),
+    send,
+    sendVoice,
+    answer,
+    retry,
+    discard,
+    stop,
+    loadOlder,
+    refresh,
+    reconnect,
+  };
+}

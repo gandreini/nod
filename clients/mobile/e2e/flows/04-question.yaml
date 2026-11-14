@@ -1,0 +1,22 @@
+appId: com.gandreini.nod.e2e
+name: Answer a question card once
+---
+- launchApp
+- extendedWaitUntil:
+    visible: Synthetic history ready
+    timeout: 15000
+- runScript:
+    file: ../scripts/control.js
+    env:
+      ROUTE: /fixture/parity/seed
+      BODY: '{}'
+- extendedWaitUntil:
+    visible: Use synthetic draft
+    timeout: 10000
+- tapOn: Use synthetic draft
+- extendedWaitUntil:
+    notVisible: A
+    timeout: 10000
+- runScript:
+    file: ../scripts/counts.js
+- assertTrue: ${output.counts.answers == 1}

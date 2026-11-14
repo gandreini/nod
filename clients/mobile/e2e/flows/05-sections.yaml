@@ -1,0 +1,39 @@
+appId: com.gandreini.nod.e2e
+name: Open every section from the menu
+---
+- launchApp
+- extendedWaitUntil:
+    visible: Synthetic history ready
+    timeout: 15000
+- tapOn:
+    id: menu-button
+- tapOn: Scheduled
+- assertVisible: Your first schedule
+- back
+- tapOn:
+    id: menu-button
+- tapOn: Apps
+- assertVisible: owner@example.com
+- assertVisible: Notion
+- back
+- tapOn:
+    id: menu-button
+- tapOn: Usage
+- assertVisible: Spent in November
+- back
+- tapOn:
+    id: menu-button
+- tapOn: Vault
+- assertVisible: Nothing saved yet
+- back
+- tapOn:
+    id: menu-button
+- tapOn: Settings
+- assertVisible: Synthetic Large
+- back
+- tapOn:
+    id: menu-button
+- tapOn: Server
+- assertVisible: Disconnect
+- back
+- assertVisible: Synthetic history ready

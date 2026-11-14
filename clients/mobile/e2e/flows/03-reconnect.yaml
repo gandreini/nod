@@ -1,0 +1,15 @@
+appId: com.gandreini.nod.e2e
+name: Reconnect after the live connection drops
+---
+- launchApp
+- extendedWaitUntil:
+    visible: Synthetic history ready
+    timeout: 15000
+- runScript:
+    file: ../scripts/control.js
+    env:
+      ROUTE: /fixture/interrupt
+      BODY: '{"id":"00000000-0000-4000-8000-000000000a02","text":"Back after the interruption"}'
+- extendedWaitUntil:
+    visible: Back after the interruption
+    timeout: 20000

@@ -1,0 +1,29 @@
+appId: com.gandreini.nod.e2e
+name: Send a message and see the answer arrive
+---
+- launchApp
+- extendedWaitUntil:
+    visible: Synthetic history ready
+    timeout: 15000
+- tapOn:
+    id: composer-input
+- inputText: Hello from the end-to-end test
+- tapOn:
+    id: composer-send
+- assertVisible: Hello from the end-to-end test
+- runScript:
+    file: ../scripts/control.js
+    env:
+      ROUTE: /fixture/stream
+      BODY: '{}'
+- extendedWaitUntil:
+    visible: Synthetic streamed reply
+    timeout: 10000
+- runScript:
+    file: ../scripts/control.js
+    env:
+      ROUTE: /fixture/reply
+      BODY: '{"id":"00000000-0000-4000-8000-000000000a01","text":"Synthetic answer for the end-to-end test"}'
+- extendedWaitUntil:
+    visible: Synthetic answer for the end-to-end test
+    timeout: 10000

@@ -1,0 +1,10 @@
+flows:
+  - flows/*
+executionOrder:
+  continueOnFailure: false
+  flowsOrder:
+    - Connect to a server
+    - Send a message and see the answer arrive
+    - Reconnect after the live connection drops
+    - Answer a question card once
+    - Open every section from the menu
