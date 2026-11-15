@@ -18,14 +18,36 @@ export async function startFakeServer() {
       NOD_VALIDATION_CONTROL_TOKEN: controlToken,
       NOD_VALIDATION_DATA: join(data, 'store.json'),
     },
-    stdio: ['ignore', 'pipe', 'inherit'],
+    stdio: ['ignore', 'pipe', 'pipe'],
   });
-  await new Promise<void>((resolve, reject) => {
-    child.once('exit', (code) => reject(new Error(`Fake server exited with code ${code}`)));
-    child.stdout!.on('data', (chunk: Buffer) => {
-      if (chunk.toString().includes('"ready":true')) resolve();
+  let output = '';
+  const collect = (chunk: Buffer) => (output += chunk.toString());
+  child.stdout!.on('data', collect);
+  child.stderr!.on('data', collect);
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(
+        () => reject(new Error(`Fake server was not ready after 10 s. Output:\n${output}`)),
+        10_000,
+      );
+      child.once('exit', (code) => {
+        clearTimeout(timer);
+        reject(new Error(`Fake server exited with code ${code}. Output:\n${output}`));
+      });
+      child.stdout!.on('data', () => {
+        if (!output.includes('"ready":true')) return;
+        clearTimeout(timer);
+        resolve();
+      });
     });
-  });
+  } catch (problem) {
+    child.kill('SIGTERM');
+    await rm(data, { recursive: true, force: true });
+    throw problem;
+  }
+  child.stdout!.removeAllListeners('data').resume();
+  child.stderr!.off('data', collect);
+  child.stderr!.pipe(process.stderr);
   return {
     origin,
     token,

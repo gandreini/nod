@@ -4,6 +4,7 @@ import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { after, before, describe, test } from 'node:test';
 import { ConnectionProblem, checkServer, serverOrigin } from '../src/connection.ts';
+import { monthlyLimit } from '../src/money.ts';
 import { startFakeServer } from './fake-server.ts';
 
 function problem(kind: ConnectionProblem['kind']) {
@@ -90,5 +91,28 @@ describe('checkServer', () => {
 
   test('reports an unreachable server', async () => {
     await assert.rejects(checkServer({ url: 'http://127.0.0.1:9', token }), problem('unreachable'));
+  });
+});
+
+describe('monthly limit', () => {
+  test('accepts whole dollars and cents typed with a dot or a comma', () => {
+    for (const [typed, usd] of [
+      ['19.99', 19.99],
+      ['1.13', 1.13],
+      ['10.29', 10.29],
+      ['25.50', 25.5],
+      ['25,50', 25.5],
+      ['12.5', 12.5],
+      ['1', 1],
+    ] as const)
+      assert.deepEqual(monthlyLimit(typed), { usd }, typed);
+  });
+
+  test('refuses amounts below $1, negatives and more than two decimals', () => {
+    for (const typed of ['0.99', '0.29', '0', '-5', '', 'abc'])
+      assert.deepEqual(monthlyLimit(typed), { error: 'Enter a limit of at least $1.' }, typed);
+    assert.deepEqual(monthlyLimit('1.234'), {
+      error: 'Use at most two decimals, for example 25.50.',
+    });
   });
 });

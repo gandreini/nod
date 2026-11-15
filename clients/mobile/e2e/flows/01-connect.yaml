@@ -13,6 +13,13 @@ name: Connect to a server
 - hideKeyboard
 - tapOn:
     id: connect-submit
+- runFlow:
+    when:
+      platform: iOS
+    commands:
+      - tapOn:
+          text: Not Now
+          optional: true
 - extendedWaitUntil:
     visible: Synthetic history ready
     timeout: 15000

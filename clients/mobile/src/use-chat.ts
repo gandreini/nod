@@ -1,33 +1,25 @@
 import { randomUUID } from 'expo-crypto';
-import { useCallback, useEffect, useReducer, useRef, useState } from 'react';
-import { AppState as AppLifecycle } from 'react-native';
-import EventSource from 'react-native-sse';
+import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
 import { initialStreamState, streamReducer } from '../../../src/web/lib/streams';
-import { ApiError, getState, olderMessages, sendText, stopThread } from './api';
+import {
+  ApiError,
+  errorText,
+  getState,
+  olderMessages,
+  refusedAccess,
+  sendText,
+  stopThread,
+  tokenRefused,
+} from './api';
 import { prepareTranscription, sendAudio } from './uploads';
 import type { Answer } from './cards';
 import { attachmentIds, type Draft } from './attachments';
-import { mergeMessages, type Outgoing, type Recording } from './chat-state';
-import { createOutbox, refusedAccess, type Outbox } from './outbox';
+import { keepOlder, mergeMessages, workState, type Outgoing, type Recording } from './chat-state';
+import { createOutbox, type Outbox } from './outbox';
 import { dropRecording, keepRecording, loadPending, savePending } from './pending-voice';
 import type { Connection } from './connection';
-import type { Activity, AppState, Message } from './contracts';
-
-interface ServerEvent {
-  type?: string;
-  threadId?: string;
-  turnId?: string;
-  text?: string;
-  streamId?: string;
-  done?: boolean;
-  items?: Activity[];
-}
-
-const maxReconnectDelay = 30000;
-
-function describe(error: unknown) {
-  return error instanceof Error ? error.message : String(error);
-}
+import type { AppState, Message } from './contracts';
+import { useServerEvents, type ServerEvent } from './use-server-events';
 
 export function useChat(connection: Connection, onRefused: (notice: string) => void) {
   const [state, setState] = useState<AppState | null>(null);
@@ -37,14 +29,13 @@ export function useChat(connection: Connection, onRefused: (notice: string) => v
   const [outgoing, setOutgoing] = useState<Outgoing[]>([]);
   const [streams, dispatch] = useReducer(streamReducer, initialStreamState);
   const [error, setError] = useState<string>();
-  const [live, setLive] = useState(false);
+  const [voiceError, setVoiceError] = useState<string>();
   const [version, setVersion] = useState(0);
   const threadId = useRef<string | null>(null);
   const stateRef = useRef<AppState | null>(null);
   const inFlight = useRef(false);
   const again = useRef(false);
   const alive = useRef(true);
-  const source = useRef<EventSource<never> | null>(null);
   const timers = useRef(new Set<ReturnType<typeof setTimeout>>());
 
   useEffect(() => {
@@ -69,9 +60,7 @@ export function useChat(connection: Connection, onRefused: (notice: string) => v
   const refused = useCallback(
     (status: number) => {
       if (!alive.current) return;
-      onRefused(
-        `${new URL(connection.origin).host} no longer accepts the saved token (HTTP ${status}). Connect again with the current token.`,
-      );
+      onRefused(tokenRefused(connection.origin, status));
     },
     [connection.origin, onRefused],
   );
@@ -87,6 +76,10 @@ export function useChat(connection: Connection, onRefused: (notice: string) => v
       if (!alive.current) return;
       if (threadId.current && threadId.current !== next.threadId) setOlder([]);
       if (threadId.current !== next.threadId) setHasEarlier(Boolean(next.hasEarlierMessages));
+      else if (next.hasEarlierMessages) setHasEarlier(true);
+      const previous = stateRef.current;
+      if (previous?.threadId === next.threadId)
+        setOlder((current) => keepOlder(current, previous.messages, next.messages));
       threadId.current = next.threadId;
       stateRef.current = next;
       dispatch({
@@ -103,7 +96,7 @@ export function useChat(connection: Connection, onRefused: (notice: string) => v
     } catch (problem) {
       if (!alive.current) return;
       if (problem instanceof ApiError && problem.status === 401) return refused(problem.status);
-      setError(refusedAccess(problem) ?? describe(problem));
+      setError(refusedAccess(problem) ?? errorText(problem));
     } finally {
       inFlight.current = false;
       if (again.current && alive.current) {
@@ -113,63 +106,8 @@ export function useChat(connection: Connection, onRefused: (notice: string) => v
     }
   }, [connection, refused]);
 
-  const reconnect = useCallback(() => {
-    const events = source.current;
-    if (!events) return;
-    events.close();
-    events.open();
-    void refresh();
-  }, [refresh]);
-
-  useEffect(() => {
-    const events = new EventSource<never>(`${connection.origin}/api/events`, {
-      headers: { Authorization: `Bearer ${connection.token}` },
-      pollingInterval: 3000,
-      timeout: 0,
-    });
-    source.current = events;
-    let delay = 3000;
-    let pending: ReturnType<typeof setTimeout> | null = null;
-    let stopped = false;
-    const retry = () => {
-      if (pending || stopped) return;
-      pending = setTimeout(() => {
-        pending = null;
-        if (stopped) return;
-        events.close();
-        events.open();
-      }, delay);
-      delay = Math.min(delay * 2, maxReconnectDelay);
-    };
-    events.addEventListener('open', () => {
-      delay = 3000;
-      if (pending) clearTimeout(pending);
-      pending = null;
-      setLive(true);
-      void refresh();
-    });
-    events.addEventListener('error', (event) => {
-      setLive(false);
-      const status = 'xhrStatus' in event ? event.xhrStatus : undefined;
-      if (status === 401) {
-        stopped = true;
-        events.close();
-        return refused(status);
-      }
-      if (status === 403)
-        setError(
-          `The server refused the live connection: ${'message' in event && event.message ? event.message : 'access denied'} (HTTP 403)`,
-        );
-      retry();
-    });
-    events.addEventListener('message', (event) => {
-      if (!event.data) return;
-      let data: ServerEvent;
-      try {
-        data = JSON.parse(event.data);
-      } catch {
-        return;
-      }
+  const received = useCallback(
+    (data: ServerEvent) => {
       if (data.type === 'refresh') {
         void refresh();
         setVersion((value) => value + 1);
@@ -193,26 +131,25 @@ export function useChat(connection: Connection, onRefused: (notice: string) => v
           done: data.done === true,
         });
       }
-    });
-    const lifecycle = AppLifecycle.addEventListener('change', (status) => {
-      if (status === 'active' && !stopped) {
-        delay = 3000;
-        events.close();
-        events.open();
-        void refresh();
-        setVersion((value) => value + 1);
-      }
-    });
+    },
+    [refresh],
+  );
+
+  const { live, reconnect: reconnectEvents } = useServerEvents(connection, {
+    opened: () => void refresh(),
+    received,
+    refused,
+    failed: setError,
+    resumed: () => {
+      void refresh();
+      setVersion((value) => value + 1);
+      void outbox.current?.revive();
+    },
+  });
+
+  useEffect(() => {
     void refresh();
-    return () => {
-      stopped = true;
-      if (pending) clearTimeout(pending);
-      lifecycle.remove();
-      events.removeAllEventListeners();
-      events.close();
-      if (source.current === events) source.current = null;
-    };
-  }, [connection, refresh, refused]);
+  }, [refresh]);
 
   const deliveredRef = useRef<() => void>(() => {});
   deliveredRef.current = () => void refresh();
@@ -287,7 +224,10 @@ export function useChat(connection: Connection, onRefused: (notice: string) => v
   useEffect(() => {
     if (!hydrated) return;
     const voices = outgoing.filter((item) => item.audio && item.status !== 'sent');
-    void savePending(connection.origin, voices).catch(() => {});
+    savePending(connection.origin, voices).catch((problem) => {
+      if (alive.current)
+        setVoiceError(`Could not keep the unsent voice message: ${errorText(problem)}`);
+    });
     const now = new Set(voices.map((item) => item.audio!.uri));
     kept.current.forEach((uri) => {
       if (!now.has(uri)) dropRecording(uri);
@@ -296,24 +236,32 @@ export function useChat(connection: Connection, onRefused: (notice: string) => v
   }, [connection.origin, hydrated, outgoing]);
 
   const restored = useRef(false);
+  const restore = useCallback(() => {
+    restored.current = true;
+    loadPending(connection.origin).then(
+      (items) => {
+        if (!alive.current) return;
+        setHydrated(true);
+        const arrived = new Set(stateRef.current?.messages.map((message) => message.id));
+        void outbox.current!.restore(items, arrived);
+      },
+      (problem) => {
+        if (!alive.current) return;
+        setHydrated(true);
+        setVoiceError(`Unsent voice messages could not be read: ${errorText(problem)}`);
+      },
+    );
+  }, [connection.origin]);
   const ready = state !== null;
   useEffect(() => {
-    if (!ready || restored.current) return;
-    restored.current = true;
-    void loadPending(connection.origin).then((items) => {
-      if (!alive.current) return;
-      setHydrated(true);
-      const arrived = new Set(stateRef.current?.messages.map((message) => message.id));
-      void outbox.current!.restore(items, arrived);
-    });
-  }, [connection.origin, ready]);
+    if (ready && !restored.current) restore();
+  }, [ready, restore]);
 
-  useEffect(() => {
-    const subscription = AppLifecycle.addEventListener('change', (status) => {
-      if (status === 'active') void outbox.current!.revive();
-    });
-    return () => subscription.remove();
-  }, []);
+  const reconnect = useCallback(() => {
+    reconnectEvents();
+    void refresh();
+    setVoiceError(undefined);
+  }, [reconnectEvents, refresh]);
 
   const answer: Answer = useCallback(
     async (reply) => {
@@ -351,11 +299,19 @@ export function useChat(connection: Connection, onRefused: (notice: string) => v
       await stopThread(connection);
       void refresh();
     } catch (problem) {
-      setError(`Stop failed: ${describe(problem)}`);
+      setError(`Stop failed: ${errorText(problem)}`);
     }
   }, [connection, refresh]);
 
-  const messages = mergeMessages(older, state?.messages ?? []);
+  const messages = useMemo(() => mergeMessages(older, state?.messages ?? []), [older, state]);
+  const pendingQuestions = useMemo(
+    () =>
+      new Set(
+        state?.pendingAnswerChoiceMessageIds ??
+          messages.filter((item) => item.answerChoicesPending).map((item) => item.id),
+      ),
+    [messages, state],
+  );
 
   const loadOlder = useCallback(async () => {
     const thread = threadId.current;
@@ -368,7 +324,7 @@ export function useChat(connection: Connection, onRefused: (notice: string) => v
       setOlder((current) => mergeMessages(page.messages, current));
       setHasEarlier(page.hasMore);
     } catch (problem) {
-      if (alive.current) setError(`Older messages did not load: ${describe(problem)}`);
+      if (alive.current) setError(`Older messages did not load: ${errorText(problem)}`);
     } finally {
       if (alive.current) setLoadingOlder(false);
     }
@@ -377,8 +333,11 @@ export function useChat(connection: Connection, onRefused: (notice: string) => v
   const activity = state?.activity ?? [];
   const active = Object.entries(streams.active).map(([id, stream]) => ({ id, ...stream }));
   const writing = active.some((stream) => stream.text);
-  const chatWork = activity.some((item) => !item.background && !item.taskId);
-  const sending = outgoing.some((item) => item.status === 'sending');
+  const work = workState(
+    activity,
+    outgoing.some((item) => item.status === 'sending'),
+    writing,
+  );
 
   return {
     ready: state !== null,
@@ -386,17 +345,13 @@ export function useChat(connection: Connection, onRefused: (notice: string) => v
     outgoing,
     streams: active,
     activity,
-    working: activity.some((item) => !item.background),
-    thinking: (chatWork || sending) && !writing,
+    ...work,
     live,
     version,
-    error,
+    error: error ?? voiceError,
     hasEarlier,
     loadingOlder,
-    pendingQuestions: new Set(
-      state?.pendingAnswerChoiceMessageIds ??
-        messages.filter((item) => item.answerChoicesPending).map((item) => item.id),
-    ),
+    pendingQuestions,
     send,
     sendVoice,
     answer,

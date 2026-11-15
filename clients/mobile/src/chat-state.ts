@@ -1,4 +1,9 @@
-import type { Message } from './contracts';
+import type { Activity, Message } from './contracts';
+
+export function workState(activity: Activity[], sending: boolean, writing: boolean) {
+  const working = activity.some((item) => !item.background);
+  return { working, thinking: (working || sending) && !writing };
+}
 
 export interface Recording {
   uri: string;
@@ -37,6 +42,15 @@ export function mergeMessages(current: Message[], incoming: Message[]): Message[
   const byId = new Map(current.map((item) => [item.id, item]));
   for (const item of incoming) byId.set(item.id, item);
   return [...byId.values()].sort(order);
+}
+
+export function keepOlder(older: Message[], previous: Message[], next: Message[]): Message[] {
+  const start = next[0];
+  if (!older.length || !start) return older;
+  return mergeMessages(
+    older,
+    previous.filter((message) => order(message, start) < 0),
+  );
 }
 
 export function unsent(outgoing: Outgoing[], messages: Message[]): Outgoing[] {

@@ -49,7 +49,13 @@ const light = {
   error: '#a52842',
   errorSoft: '#fff0f2',
   mark: black,
-  shadow: black,
+  hairline: 'rgba(25,25,25,0.06)',
+  shadow: {
+    floating: '0 4px 16px rgba(25,25,25,0.08), 0 1px 2px rgba(25,25,25,0.04)',
+    raised: '0 8px 32px rgba(25,25,25,0.07), 0 1px 3px rgba(25,25,25,0.04)',
+    sheet: '0 -8px 32px rgba(25,25,25,0.12), 0 -1px 3px rgba(25,25,25,0.05)',
+    card: '0 1px 2px rgba(25,25,25,0.04)',
+  },
 };
 
 const dark: typeof light = {
@@ -75,7 +81,13 @@ const dark: typeof light = {
   error: '#ffacb9',
   errorSoft: '#3d252e',
   mark: white,
-  shadow: '#000000',
+  hairline: 'rgba(250,250,250,0.08)',
+  shadow: {
+    floating: '0 4px 16px rgba(0,0,0,0.45)',
+    raised: '0 8px 32px rgba(0,0,0,0.45), 0 1px 2px rgba(0,0,0,0.3)',
+    sheet: '0 -8px 32px rgba(0,0,0,0.5)',
+    card: '0 1px 2px rgba(0,0,0,0.04)',
+  },
 };
 
 export type Theme = typeof light;
@@ -88,6 +100,7 @@ export const font = {
   regular: 'Geist_400Regular',
   medium: 'Geist_500Medium',
   semibold: 'Geist_600SemiBold',
+  mono: 'GeistMono_400Regular',
 };
 
 export const radius = { control: 8, input: 12, card: 12, bubble: 16, composer: 24, full: 999 };

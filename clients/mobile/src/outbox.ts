@@ -1,8 +1,8 @@
-import { ApiError } from './api';
+import { ApiError, errorText, refusedAccess } from './api';
 import { unsent, voiceStep, type Outgoing } from './chat-state';
 import type { Message } from './contracts';
 
-export const retryDelays = [3000, 10000, 30000, 60000, 120000];
+const retryDelays = [3000, 10000, 30000, 60000, 120000];
 
 export interface OutboxDeps {
   thread(): string | null;
@@ -14,16 +14,6 @@ export interface OutboxDeps {
   onChange(items: Outgoing[]): void;
   onRefused(status: number): void;
   onDelivered(): void;
-}
-
-function describe(error: unknown) {
-  return error instanceof Error ? error.message : String(error);
-}
-
-export function refusedAccess(problem: unknown) {
-  return problem instanceof ApiError && problem.status === 403
-    ? `The server refused the request: ${problem.message}`
-    : undefined;
 }
 
 export function createOutbox(deps: OutboxDeps) {
@@ -57,7 +47,7 @@ export function createOutbox(deps: OutboxDeps) {
     } catch (problem) {
       if (stopped) return;
       if (problem instanceof ApiError && problem.status === 401) return deps.onRefused(401);
-      const reason = refusedAccess(problem) ?? describe(problem);
+      const reason = refusedAccess(problem) ?? errorText(problem);
       if (!item.audio)
         return update(item.id, (entry) => ({ ...entry, status: 'failed', error: reason }));
       const failure =
@@ -94,7 +84,6 @@ export function createOutbox(deps: OutboxDeps) {
 
   return {
     items: () => items,
-    deliver,
     add(item: Outgoing) {
       items = [...items, item];
       publish();

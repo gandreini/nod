@@ -6,7 +6,8 @@ import {
   useAudioStream,
   type AudioSource,
 } from 'expo-audio';
-import { Pause, Play } from 'lucide-react-native';
+import { Pause, Play } from './icons';
+import { allowIn } from './permissions';
 import { useEffect, useRef, useState } from 'react';
 import { Pressable, StyleSheet, Text, View } from 'react-native';
 import { File } from 'expo-file-system';
@@ -14,14 +15,14 @@ import type { Recording } from './chat-state';
 import { wavBars, wavSeconds } from './waveform';
 import { dropRecording } from './pending-voice';
 import { font, radius, type Theme } from './theme';
+import { errorText } from './api';
+
+const playback = { allowsRecording: false, playsInSilentMode: true };
+let recordingNow = false;
 
 export function clock(seconds: number) {
   const whole = Math.max(0, Math.round(seconds));
   return `${Math.floor(whole / 60)}:${String(whole % 60).padStart(2, '0')}`;
-}
-
-function describe(error: unknown) {
-  return error instanceof Error ? error.message : String(error);
 }
 
 function loudness(data: ArrayBuffer | ArrayBufferView) {
@@ -38,7 +39,7 @@ function loudness(data: ArrayBuffer | ArrayBufferView) {
 }
 
 const floorLevel = 0.06;
-const bars = 40;
+const barCount = 40;
 
 export function useVoiceRecorder() {
   const recent = useRef<number[]>([]);
@@ -53,7 +54,7 @@ export function useVoiceRecorder() {
       const value = loudness(buffer.data);
       peak.current = Math.max(value, peak.current * 0.985, 0.012);
       const bar = Math.min(1, Math.max(floorLevel, Math.sqrt(value / peak.current)));
-      recent.current = [...recent.current.slice(-(bars - 1)), bar];
+      recent.current = [...recent.current.slice(-(barCount - 1)), bar];
     },
   });
   const [active, setActive] = useState(false);
@@ -83,9 +84,10 @@ export function useVoiceRecorder() {
     try {
       const permission = await requestRecordingPermissionsAsync();
       if (!permission.granted) {
-        setError('Nod needs the microphone to record. Allow it in Android Settings → Apps → Nod.');
+        setError(`Nod needs the microphone to record. ${allowIn}`);
         return;
       }
+      recordingNow = true;
       await setAudioModeAsync({ allowsRecording: true, playsInSilentMode: true });
       await stream.start();
       await stream.startFileRecordingAsync({ format: 'wav' });
@@ -97,8 +99,9 @@ export function useVoiceRecorder() {
       setActive(true);
     } catch (problem) {
       if (stream.isStreaming) stream.stop();
-      await setAudioModeAsync({ allowsRecording: false }).catch(() => {});
-      setError(`Recording did not start: ${describe(problem)}`);
+      recordingNow = false;
+      await setAudioModeAsync(playback).catch(() => {});
+      setError(`Recording did not start: ${errorText(problem)}`);
     } finally {
       busy.current = false;
     }
@@ -110,7 +113,8 @@ export function useVoiceRecorder() {
     try {
       const file = await stream.stopFileRecordingAsync();
       stream.stop();
-      await setAudioModeAsync({ allowsRecording: false });
+      recordingNow = false;
+      await setAudioModeAsync(playback);
       if (!keep) {
         dropRecording(file.uri, true);
         return null;
@@ -128,9 +132,10 @@ export function useVoiceRecorder() {
       };
     } catch (problem) {
       if (stream.isStreaming) stream.stop();
-      setError(`Recording did not stop cleanly: ${describe(problem)}`);
+      setError(`Recording did not stop cleanly: ${errorText(problem)}`);
       return null;
     } finally {
+      recordingNow = false;
       setActive(false);
       busy.current = false;
     }
@@ -157,7 +162,7 @@ export function Levels({
   theme: Theme;
   height?: number;
 }) {
-  const padded = [...Array(Math.max(0, bars - levels.length)).fill(floorLevel), ...levels];
+  const padded = [...Array(Math.max(0, barCount - levels.length)).fill(floorLevel), ...levels];
   return (
     <View style={[styles.levels, { height }]} importantForAccessibility="no-hide-descendants">
       {padded.map((level, index) => (
@@ -177,7 +182,6 @@ export function Levels({
   );
 }
 
-const waveBars = 40;
 const waves = new Map<string, Promise<{ bars: number[] | null; seconds: number | null }>>();
 
 function loadWave(source: AudioSource) {
@@ -200,7 +204,7 @@ function loadWave(source: AudioSource) {
             return new Uint8Array(await response.arrayBuffer());
           })
     )
-      .then((bytes) => ({ bars: wavBars(bytes, waveBars), seconds: wavSeconds(bytes) }))
+      .then((bytes) => ({ bars: wavBars(bytes, barCount), seconds: wavSeconds(bytes) }))
       .catch(() => ({ bars: null, seconds: null }));
     waves.set(uri, pending);
   }
@@ -251,9 +255,10 @@ export function AudioClip({
   const progress = duration > 0 ? Math.min(status.currentTime / duration, 1) : 0;
   const ended = status.didJustFinish || (duration > 0 && status.currentTime >= duration - 0.05);
 
-  function toggle() {
+  async function toggle() {
     setError(undefined);
     try {
+      if (!status.playing && !recordingNow) await setAudioModeAsync(playback);
       if (!loaded) {
         player.replace(source);
         setLoaded(true);
@@ -264,7 +269,7 @@ export function AudioClip({
       if (ended) void player.seekTo(0);
       player.play();
     } catch (problem) {
-      setError(`Playback failed: ${describe(problem)}`);
+      setError(`Playback failed: ${errorText(problem)}`);
     }
   }
 
@@ -283,12 +288,7 @@ export function AudioClip({
           {status.playing ? (
             <Pause size={16} color={theme.primaryForeground} fill={theme.primaryForeground} />
           ) : (
-            <Play
-              size={16}
-              color={theme.primaryForeground}
-              fill={theme.primaryForeground}
-              style={styles.playIcon}
-            />
+            <Play size={16} color={theme.primaryForeground} solid />
           )}
         </Pressable>
         <View style={styles.fill}>
@@ -352,7 +352,6 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
   },
-  playIcon: { marginLeft: 2 },
   wave: { height: 24, flexDirection: 'row', alignItems: 'center', gap: 2 },
   waveBar: { flex: 1, borderRadius: radius.full },
   track: { height: 4, borderRadius: radius.full, overflow: 'hidden' },

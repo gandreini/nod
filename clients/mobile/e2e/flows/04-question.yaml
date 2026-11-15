@@ -14,9 +14,34 @@ name: Answer a question card once
     visible: Use synthetic draft
     timeout: 10000
 - tapOn: Use synthetic draft
-- extendedWaitUntil:
-    notVisible: A
-    timeout: 10000
 - runScript:
     file: ../scripts/counts.js
+- repeat:
+    times: 20
+    while:
+      true: ${output.counts.answers == 0}
+    commands:
+      - extendedWaitUntil:
+          visible: Never shown on screen
+          timeout: 300
+          optional: true
+      - runScript:
+          file: ../scripts/counts.js
 - assertTrue: ${output.counts.answers == 1}
+- assertTrue: ${output.counts.refusals == 0}
+- runScript:
+    file: ../scripts/control.js
+    env:
+      ROUTE: /fixture/activity
+      BODY: '{"items":[{"turnId":"00000000-0000-4000-8000-000000000b01","taskId":"00000000-0000-4000-8000-000000000b02","title":"Synthetic benchmark","step":null,"site":null,"since":"2026-11-15T08:00:00.000Z","doing":"model","quietSince":"2099-01-01T00:00:00.000Z"}]}'
+- extendedWaitUntil:
+    visible: Synthetic benchmark
+    timeout: 10000
+- runScript:
+    file: ../scripts/control.js
+    env:
+      ROUTE: /fixture/activity
+      BODY: '{"items":[]}'
+- extendedWaitUntil:
+    notVisible: Synthetic benchmark
+    timeout: 10000

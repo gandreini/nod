@@ -1,4 +1,4 @@
-import { Fragment, useMemo, type ReactNode } from 'react';
+import { Fragment, memo, useMemo, type ReactNode } from 'react';
 import {
   Alert,
   Image,
@@ -11,27 +11,21 @@ import {
   type ViewStyle,
 } from 'react-native';
 import { Renderer, useMarkdown } from 'react-native-marked';
-import { request } from './api';
-import { openArtifact } from './attachment-views';
+import { artifactSource, errorText, request } from './api';
 import type { Connection } from './connection';
 import type { Artifact } from './contracts';
+import { useFileViewer } from './file-viewer-context';
 import { imageArtifact, safeLink } from './links';
 import { useNod } from './nod-context';
 import { font, radius, type Theme } from './theme';
 
-const mono = 'GeistMono_400Regular';
-
-function describe(error: unknown) {
-  return error instanceof Error ? error.message : String(error);
-}
-
-function open(connection: Connection, href: string) {
+function open(connection: Connection, href: string, show: (file: Artifact) => void) {
   const link = safeLink(href, connection.origin);
   if (!link) return;
-  const fail = (problem: unknown) => Alert.alert('Could not open the link', describe(problem));
+  const fail = (problem: unknown) => Alert.alert('Could not open the link', errorText(problem));
   if (link.kind === 'artifact')
     return void request<Artifact>(connection, `/api/artifacts/${link.id}/metadata`)
-      .then((artifact) => openArtifact(connection, artifact))
+      .then(show)
       .catch(fail);
   void Linking.openURL(link.url).catch(fail);
 }
@@ -40,6 +34,7 @@ class NodRenderer extends Renderer {
   constructor(
     private connection: Connection,
     private theme: Theme,
+    private show: (file: Artifact) => void,
   ) {
     super();
   }
@@ -64,7 +59,7 @@ class NodRenderer extends Renderer {
         key={this.getKey()}
         accessibilityRole="link"
         accessibilityLabel={title}
-        onPress={() => open(this.connection, href)}
+        onPress={() => open(this.connection, href, this.show)}
         style={styles}
       >
         {children}
@@ -87,15 +82,12 @@ class NodRenderer extends Renderer {
     return (
       <Pressable
         key={this.getKey()}
-        onPress={() => open(this.connection, file.path)}
+        onPress={() => open(this.connection, file.path, this.show)}
         accessibilityRole="imagebutton"
         accessibilityLabel={label}
       >
         <Image
-          source={{
-            uri: `${this.connection.origin}${file.path}`,
-            headers: { Authorization: `Bearer ${this.connection.token}` },
-          }}
+          source={artifactSource(this.connection, file.path)}
           resizeMode="cover"
           style={[
             {
@@ -121,6 +113,20 @@ class NodRenderer extends Renderer {
     return this.image(imageUrl, alt, style, title);
   }
 
+  list(
+    ordered: boolean,
+    li: ReactNode[],
+    listStyle?: ViewStyle,
+    textStyle?: TextStyle,
+    startIndex?: number,
+  ): ReactNode {
+    return (
+      <View key={this.getKey()} style={{ gap: 4, marginBottom: 12 }}>
+        {super.list(ordered, li, listStyle, textStyle, startIndex)}
+      </View>
+    );
+  }
+
   table(
     header: ReactNode[][],
     rows: ReactNode[][][],
@@ -136,15 +142,10 @@ class NodRenderer extends Renderer {
   }
 }
 
-export function Markdown({ text, theme, origin }: { text: string; theme: Theme; origin: string }) {
-  const { connection } = useNod();
-  const renderer = useMemo(() => new NodRenderer(connection, theme), [connection, theme]);
+function markdownStyles(theme: Theme) {
   const body = { fontFamily: font.regular, fontSize: 16, lineHeight: 24, color: theme.foreground };
   const heading = { fontFamily: font.semibold, color: theme.foreground, letterSpacing: -0.3 };
-  const elements = useMarkdown(text, {
-    colorScheme: theme.dark ? 'dark' : 'light',
-    baseUrl: origin,
-    renderer,
+  return {
     theme: {
       colors: {
         text: theme.foreground,
@@ -157,14 +158,17 @@ export function Markdown({ text, theme, origin }: { text: string; theme: Theme; 
       text: body,
       paragraph: { marginTop: 0, marginBottom: 12, paddingVertical: 0 },
       strong: { fontFamily: font.semibold },
-      em: { fontStyle: 'italic' },
-      link: { color: theme.link, textDecorationLine: 'underline', fontStyle: 'normal' },
+      em: { fontStyle: 'italic' as const },
+      link: {
+        color: theme.link,
+        textDecorationLine: 'underline' as const,
+        fontStyle: 'normal' as const,
+      },
       h1: { ...heading, fontSize: 24, lineHeight: 32, marginBottom: 8 },
       h2: { ...heading, fontSize: 20, lineHeight: 28, marginBottom: 8 },
       h3: { ...heading, fontSize: 18, lineHeight: 26, marginBottom: 8 },
       h4: { ...heading, fontSize: 16, lineHeight: 24, marginBottom: 8 },
       li: body,
-      list: { marginBottom: 12 },
       blockquote: {
         borderLeftWidth: 3,
         borderLeftColor: theme.primary,
@@ -173,8 +177,8 @@ export function Markdown({ text, theme, origin }: { text: string; theme: Theme; 
         backgroundColor: 'transparent',
       },
       codespan: {
-        fontFamily: mono,
-        fontStyle: 'normal',
+        fontFamily: font.mono,
+        fontStyle: 'normal' as const,
         fontSize: 14,
         backgroundColor: theme.muted,
         color: theme.foreground,
@@ -186,8 +190,8 @@ export function Markdown({ text, theme, origin }: { text: string; theme: Theme; 
         marginBottom: 12,
       },
       codeText: {
-        fontFamily: mono,
-        fontStyle: 'normal',
+        fontFamily: font.mono,
+        fontStyle: 'normal' as const,
         fontSize: 13,
         lineHeight: 20,
         color: theme.foreground,
@@ -197,7 +201,22 @@ export function Markdown({ text, theme, origin }: { text: string; theme: Theme; 
       tableRow: { borderColor: theme.border },
       tableCell: { padding: 8 },
     },
-  });
+  };
+}
+
+export const Markdown = memo(function Markdown({ text, theme }: { text: string; theme: Theme }) {
+  const { connection } = useNod();
+  const viewer = useFileViewer();
+  const options = useMemo(
+    () => ({
+      ...markdownStyles(theme),
+      colorScheme: theme.dark ? ('dark' as const) : ('light' as const),
+      baseUrl: connection.origin,
+      renderer: new NodRenderer(connection, theme, viewer.open),
+    }),
+    [connection, theme, viewer.open],
+  );
+  const elements = useMarkdown(text, options);
   return (
     <View style={{ paddingRight: 16, marginBottom: -12 }}>
       {elements.map((element, index) => (
@@ -205,4 +224,4 @@ export function Markdown({ text, theme, origin }: { text: string; theme: Theme; 
       ))}
     </View>
   );
-}
+});

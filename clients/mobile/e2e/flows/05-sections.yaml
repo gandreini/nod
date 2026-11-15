@@ -8,32 +8,34 @@ name: Open every section from the menu
 - tapOn:
     id: menu-button
 - tapOn: Scheduled
-- assertVisible: Your first schedule
-- back
+- assertVisible: '.*Your first schedule.*'
+- tapOn: Back
 - tapOn:
     id: menu-button
 - tapOn: Apps
-- assertVisible: owner@example.com
-- assertVisible: Notion
-- back
+- assertVisible: '.*owner@example\.com.*'
+- assertVisible: '.*Notion.*'
+- tapOn: Back
 - tapOn:
     id: menu-button
 - tapOn: Usage
-- assertVisible: Spent in November
-- back
+- assertVisible: '.*Spent in November.*'
+- tapOn: Back
 - tapOn:
     id: menu-button
 - tapOn: Vault
-- assertVisible: Nothing saved yet
-- back
+- assertVisible: '.*Nothing saved yet.*'
+- tapOn: Back
 - tapOn:
     id: menu-button
 - tapOn: Settings
-- assertVisible: Synthetic Large
-- back
+- assertVisible: '.*Synthetic Large.*'
+- tapOn: Back
 - tapOn:
     id: menu-button
 - tapOn: Server
-- assertVisible: Disconnect
-- back
+- assertVisible: '.*127\.0\.0\.1.*'
+- assertVisible: '.*Connected.*'
+- assertVisible: '.*Disconnect.*'
+- tapOn: Back
 - assertVisible: Synthetic history ready

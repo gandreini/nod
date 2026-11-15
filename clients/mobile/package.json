@@ -42,14 +42,17 @@
     "start": "expo start",
     "android": "expo run:android",
     "ios": "expo run:ios",
-    "web": "expo start --web",
     "typecheck": "tsc --noEmit",
     "test": "../../node_modules/.bin/tsx --test tests/*.test.ts",
     "fake-server": "../../node_modules/.bin/tsx tool/fake-server.mts",
     "android:release": "expo prebuild --platform android --no-install --clean && cd android && ./gradlew :app:assembleRelease -PreactNativeArchitectures=arm64-v8a",
     "android:dev": "APP_VARIANT=development expo prebuild --platform android --no-install --clean && cd android && ./gradlew :app:assembleDebug -PreactNativeArchitectures=arm64-v8a",
-    "android:e2e": "APP_VARIANT=e2e expo prebuild --platform android --no-install --clean && cd android && ./gradlew :app:assembleRelease -PreactNativeArchitectures=arm64-v8a",
-    "e2e": "e2e/run.sh"
+    "android:e2e": "APP_VARIANT=e2e expo prebuild --platform android --no-install --clean && cd android && ./gradlew :app:assembleRelease -PreactNativeArchitectures=${E2E_ABI:-arm64-v8a}",
+    "ios:e2e": "APP_VARIANT=e2e expo prebuild --platform ios --no-install --clean && cd ios && pod install && xcodebuild -workspace NodE2E.xcworkspace -scheme NodE2E -configuration Release -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' -derivedDataPath build ARCHS=arm64 -quiet",
+    "ios:release": "expo prebuild --platform ios --no-install --clean && cd ios && pod install && xcodebuild -workspace Nod.xcworkspace -scheme Nod -configuration Release -destination 'generic/platform=iOS' -archivePath build/Nod.xcarchive -allowProvisioningUpdates DEVELOPMENT_TEAM=$APPLE_TEAM_ID CODE_SIGN_STYLE=Automatic archive -quiet",
+    "ios:upload": "xcodebuild -exportArchive -archivePath ios/build/Nod.xcarchive -exportOptionsPlist export-options.plist -exportPath ios/build/export -allowProvisioningUpdates",
+    "e2e": "e2e/run.sh",
+    "e2e:ios": "E2E_PLATFORM=ios e2e/run.sh"
   },
   "private": true
 }

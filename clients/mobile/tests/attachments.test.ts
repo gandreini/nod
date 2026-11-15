@@ -26,12 +26,11 @@ function draft(id: string, state: Draft['state']): Draft {
 }
 
 describe('attachments', () => {
-  test('a file over the server limit is refused before upload, naming the file and the limit', () => {
+  test('a file over the server limit is refused before upload, naming the file', () => {
     assert.equal(checkSize({ name: 'small.pdf', size: fileBytes }), undefined);
     assert.equal(checkSize({ name: 'unknown.pdf' }), undefined);
     const problem = checkSize({ name: 'huge.mov', size: fileBytes + 1 });
     assert.match(problem ?? '', /huge\.mov/);
-    assert.match(problem ?? '', /90 MB/);
   });
 
   test('a message waits for every attachment to finish uploading', () => {

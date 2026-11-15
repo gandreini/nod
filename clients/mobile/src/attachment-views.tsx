@@ -1,59 +1,67 @@
-import { File, Paths } from 'expo-file-system';
+import { File } from 'expo-file-system';
 import { shareAsync } from 'expo-sharing';
-import { Camera, FileText, Image as ImageIcon, Paperclip, RotateCw, X } from 'lucide-react-native';
-import { useState } from 'react';
+import { Camera, FileText, Image as ImageIcon, Paperclip, RefreshCw, X } from './icons';
+import { useRef, useState } from 'react';
 import {
   ActivityIndicator,
+  Alert,
   Image,
   Modal,
+  Platform,
   Pressable,
   ScrollView,
   StyleSheet,
   Text,
   View,
 } from 'react-native';
-import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import { request } from './api';
-import { fileSize, isImage, type Draft } from './attachments';
+import { artifactSource, request, errorText } from './api';
+import { fileSize, isImage, type AttachSource, type Draft } from './attachments';
+import { downloadsFolder } from './downloads';
+import { useFileViewer } from './file-viewer-context';
+import { fileType } from './files';
+import { ownedArtifact } from './links';
 import type { LocalFile } from './chat-state';
 import type { Connection } from './connection';
 import type { Artifact } from './contracts';
 import { font, radius, type Theme } from './theme';
 import type { Icon } from './ui';
 
-function describe(error: unknown) {
-  return error instanceof Error ? error.message : String(error);
-}
-
-const active =
+const scriptable =
   /^(text\/html|application\/xhtml\+xml|image\/svg\+xml|text\/xml|application\/xml)(;|$)|\.(html?|xhtml|svg|xml)$/i;
 
 async function show(file: File, mimeType: string) {
-  if (active.test(mimeType) || active.test(file.uri))
-    return shareAsync(file.uri, { mimeType: 'text/plain' });
+  if (scriptable.test(mimeType) || scriptable.test(file.uri))
+    return shareAsync(file.uri, { mimeType: 'text/plain', UTI: 'public.plain-text' });
   if (await File.canPreview(file)) return File.preview(file);
   await shareAsync(file.uri, { mimeType });
 }
 
-export async function openArtifact(connection: Connection, artifact: Artifact) {
-  let file: File;
+async function download(connection: Connection, artifact: Artifact) {
+  const source = artifactSource(connection, artifact.url);
   try {
-    file = await File.downloadFileAsync(`${connection.origin}${artifact.url}`, Paths.cache, {
-      headers: { Authorization: `Bearer ${connection.token}` },
+    return await File.downloadFileAsync(source.uri, downloadsFolder(), {
+      headers: source.headers,
       idempotent: true,
     });
   } catch (problem) {
     await request(connection, `${artifact.url}/metadata`);
     throw problem;
   }
-  await show(file, artifact.mimeType);
+}
+
+export async function openArtifact(connection: Connection, artifact: Artifact) {
+  await show(await download(connection, artifact), artifact.mimeType);
 }
 
 export function openLocal(file: LocalFile) {
   return show(new File(file.uri), file.mimeType);
 }
 
-const sources: Array<{ key: 'camera' | 'photos' | 'files'; icon: Icon; label: string }> = [
+function openFailed(name: string) {
+  return (problem: unknown) => Alert.alert(`Could not open ${name}`, errorText(problem));
+}
+
+const sources: Array<{ key: AttachSource; icon: Icon; label: string }> = [
   { key: 'camera', icon: Camera, label: 'Camera' },
   { key: 'photos', icon: ImageIcon, label: 'Photos' },
   { key: 'files', icon: FileText, label: 'Files' },
@@ -62,29 +70,42 @@ const sources: Array<{ key: 'camera' | 'photos' | 'files'; icon: Icon; label: st
 export function AttachMenu({
   visible,
   theme,
+  above,
   onClose,
   onPick,
 }: {
   visible: boolean;
   theme: Theme;
+  above: number;
   onClose(): void;
-  onPick(source: 'camera' | 'photos' | 'files'): void;
+  onPick(source: AttachSource): void;
 }) {
-  const insets = useSafeAreaInsets();
+  const picked = useRef<AttachSource | null>(null);
+  function dismissed() {
+    const source = picked.current;
+    picked.current = null;
+    if (source) onPick(source);
+  }
   return (
-    <Modal visible={visible} transparent animationType="fade" onRequestClose={onClose}>
-      <Pressable style={styles.backdrop} onPress={onClose} accessibilityLabel="Close">
+    <Modal
+      visible={visible}
+      transparent
+      animationType="fade"
+      onRequestClose={onClose}
+      onDismiss={dismissed}
+    >
+      <View style={styles.backdrop}>
+        <Pressable style={StyleSheet.absoluteFill} onPress={onClose} accessible={false} />
         <View
-          onStartShouldSetResponder={() => true}
+          accessibilityViewIsModal
+          onAccessibilityEscape={onClose}
           style={[
             styles.menu,
             {
-              bottom: insets.bottom + 84,
+              bottom: above,
               backgroundColor: theme.surface,
-              borderColor: theme.dark ? 'rgba(250,250,250,0.08)' : 'rgba(25,25,25,0.06)',
-              boxShadow: theme.dark
-                ? '0 8px 32px rgba(0,0,0,0.45)'
-                : '0 8px 32px rgba(25,25,25,0.1), 0 1px 3px rgba(25,25,25,0.05)',
+              borderColor: theme.hairline,
+              boxShadow: theme.shadow.raised,
             },
           ]}
         >
@@ -93,7 +114,8 @@ export function AttachMenu({
               key={key}
               onPress={() => {
                 onClose();
-                onPick(key);
+                if (Platform.OS === 'ios') picked.current = key;
+                else onPick(key);
               }}
               accessibilityRole="menuitem"
               style={({ pressed }) => [
@@ -110,7 +132,7 @@ export function AttachMenu({
             </Pressable>
           ))}
         </View>
-      </Pressable>
+      </View>
     </Modal>
   );
 }
@@ -141,7 +163,9 @@ export function DraftStrip({
           <View key={draft.id} style={styles.draftWrap}>
             <Pressable
               onPress={
-                failed ? () => onRetry(draft.id) : () => void openLocal(draft).catch(() => {})
+                failed
+                  ? () => onRetry(draft.id)
+                  : () => void openLocal(draft).catch(openFailed(draft.name))
               }
               accessibilityRole="button"
               accessibilityLabel={failed ? `Retry ${draft.name}: ${draft.error}` : draft.name}
@@ -190,7 +214,7 @@ export function DraftStrip({
               ) : null}
               {failed && image ? (
                 <View style={[styles.overlay, { backgroundColor: 'rgba(0,0,0,0.35)' }]}>
-                  <RotateCw size={20} color="#fafafa" />
+                  <RefreshCw size={20} color="#fafafa" />
                 </View>
               ) : null}
             </Pressable>
@@ -204,7 +228,7 @@ export function DraftStrip({
                 { backgroundColor: theme.foreground, borderColor: theme.surface },
               ]}
             >
-              <X size={12} color={theme.background} strokeWidth={3} />
+              <X size={12} color={theme.background} />
             </Pressable>
           </View>
         );
@@ -222,7 +246,7 @@ function FileChip({
   name: string;
   meta: string;
   theme: Theme;
-  onPress(): void;
+  onPress(): void | Promise<void>;
 }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string>();
@@ -235,7 +259,7 @@ function FileChip({
           try {
             await onPress();
           } catch (problem) {
-            setError(`Could not open ${name}: ${describe(problem)}`);
+            setError(`Could not open ${name}: ${errorText(problem)}`);
           } finally {
             setBusy(false);
           }
@@ -284,18 +308,18 @@ export function MessageAttachments({
   theme: Theme;
   alignEnd?: boolean;
 }) {
+  const viewer = useFileViewer();
   const items = [
-    ...(attachments ?? []).map((artifact) => ({
-      key: artifact.id,
-      name: artifact.name,
-      mimeType: artifact.mimeType,
-      size: artifact.size as number | undefined,
-      source: {
-        uri: `${connection.origin}${artifact.url}`,
-        headers: { Authorization: `Bearer ${connection.token}` },
-      },
-      open: () => openArtifact(connection, artifact),
-    })),
+    ...(attachments ?? [])
+      .filter((artifact) => ownedArtifact(artifact.url))
+      .map((artifact) => ({
+        key: artifact.id,
+        name: artifact.name,
+        mimeType: artifact.mimeType,
+        size: artifact.size,
+        source: artifactSource(connection, artifact.url),
+        open: async () => viewer.open(artifact),
+      })),
     ...(local ?? []).map((file) => ({
       key: file.uri,
       name: file.name,
@@ -315,7 +339,7 @@ export function MessageAttachments({
           {images.map((item) => (
             <Pressable
               key={item.key}
-              onPress={() => void item.open().catch(() => {})}
+              onPress={() => void item.open().catch(openFailed(item.name))}
               accessibilityRole="imagebutton"
               accessibilityLabel={`Open ${item.name}`}
             >
@@ -335,10 +359,7 @@ export function MessageAttachments({
         <FileChip
           key={item.key}
           name={item.name}
-          meta={[
-            item.mimeType.split('/')[1]?.toUpperCase(),
-            item.size !== undefined ? fileSize(item.size) : undefined,
-          ]
+          meta={[fileType(item.name), item.size !== undefined ? fileSize(item.size) : undefined]
             .filter(Boolean)
             .join(' · ')}
           theme={theme}
@@ -410,8 +431,8 @@ const styles = StyleSheet.create({
   },
   fileName: { fontFamily: font.medium, fontSize: 13, lineHeight: 18 },
   fileMeta: { fontFamily: font.regular, fontSize: 12, lineHeight: 16 },
-  attachments: { gap: 8, maxWidth: '85%' },
-  end: { alignSelf: 'flex-end' },
+  attachments: { gap: 8 },
+  end: { alignSelf: 'flex-end', maxWidth: '85%', minWidth: 220 },
   endRow: { justifyContent: 'flex-end' },
   images: { flexDirection: 'row', flexWrap: 'wrap', gap: 4 },
   single: { width: 240, height: 240, borderRadius: radius.bubble },
@@ -421,7 +442,6 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     gap: 12,
-    minWidth: 220,
     padding: 8,
     paddingRight: 16,
     borderRadius: radius.input,

@@ -1,0 +1,36 @@
+appId: com.gandreini.nod.e2e
+name: Read a file Nod sent in the bottom panel
+---
+- launchApp
+- extendedWaitUntil:
+    visible: Synthetic history ready
+    timeout: 15000
+- runScript:
+    file: ../scripts/control.js
+    env:
+      ROUTE: /fixture/reply
+      BODY: '{"id":"00000000-0000-4000-8000-000000000f01","text":"Here are the synthetic notes","file":{"name":"Synthetic notes.md","mimeType":"text/markdown","text":"# Synthetic plan\n\nStep **one** is ready."}}'
+- extendedWaitUntil:
+    visible: Here are the synthetic notes
+    timeout: 10000
+- tapOn: Open Synthetic notes.md
+- extendedWaitUntil:
+    visible: Synthetic plan
+    timeout: 10000
+- tapOn: Source
+- assertVisible: '# Synthetic plan.*'
+- tapOn: Close the file
+- extendedWaitUntil:
+    notVisible: '# Synthetic plan.*'
+    timeout: 5000
+- tapOn: Open Synthetic notes.md
+- extendedWaitUntil:
+    visible: Synthetic plan
+    timeout: 10000
+- swipe:
+    from:
+      id: file-sheet-handle
+    direction: DOWN
+- extendedWaitUntil:
+    notVisible: Synthetic plan
+    timeout: 5000

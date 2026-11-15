@@ -1,14 +1,14 @@
-import { Blocks, Plus, Search, TriangleAlert, X } from 'lucide-react-native';
+import { Blocks, CircleAlert, Plus, Search, X } from '../icons';
 import { useState } from 'react';
 import { Alert, Pressable, StyleSheet, Text, TextInput, View } from 'react-native';
 import { searchApps } from '../../../../src/web/lib/app-search';
-import { request } from '../api';
-import { AppLogo } from '../cards';
+import { errorText } from '../api';
+import { AppLogo } from '../app-logo';
 import type { AppConnection } from '../contracts';
 import { useNod } from '../nod-context';
 import { radius, useTheme } from '../theme';
-import { Button, Empty, Loading, Notice, Page, Pill, SectionTitle, text } from '../ui';
-import { describe, useResource } from '../use-resource';
+import { Button, Empty, Group, Loaded, Notice, Page, Pill, SectionTitle, text } from '../ui';
+import { useRequest, useResource } from '../use-resource';
 
 function search(items: AppConnection[], query: string) {
   return searchApps(
@@ -51,7 +51,19 @@ function AppRow({
       onPress={onPress}
       disabled={busy}
       accessibilityRole="button"
-      accessibilityLabel={`${app.name}${who ? `, ${who}` : ''}`}
+      accessibilityLabel={[
+        app.name,
+        who,
+        !app.connectionId
+          ? 'Connect'
+          : needsYou(app)
+            ? 'Sign in again'
+            : app.disconnectPending
+              ? 'Disconnecting'
+              : null,
+      ]
+        .filter(Boolean)
+        .join(', ')}
       style={({ pressed }) => [
         styles.row,
         {
@@ -78,7 +90,7 @@ function AppRow({
       {!app.connectionId ? (
         <Text style={[text.label, { color: theme.accent }]}>Connect</Text>
       ) : needsYou(app) ? (
-        <Pill label="Sign in again" icon={TriangleAlert} kind="attention" />
+        <Pill label="Sign in again" icon={CircleAlert} kind="attention" />
       ) : app.disconnectPending ? (
         <Pill label="Disconnecting" />
       ) : null}
@@ -88,7 +100,8 @@ function AppRow({
 
 export function AppsScreen() {
   const theme = useTheme();
-  const { connection, ask } = useNod();
+  const { ask } = useNod();
+  const send = useRequest();
   const apps = useResource<AppConnection[]>('/api/apps');
   const catalog = useResource<AppConnection[]>('/api/apps/catalog', { optional: true });
   const [busy, setBusy] = useState<string>();
@@ -136,14 +149,13 @@ export function AppsScreen() {
     setBusy(app.connectionId);
     setError(undefined);
     try {
-      await request(
-        connection,
+      await send(
         `/api/apps/${encodeURIComponent(app.slug)}/accounts/${encodeURIComponent(app.connectionId)}/disconnect`,
         'POST',
         {},
       );
     } catch (problem) {
-      setError(`Disconnecting ${app.name} failed: ${describe(problem)}`);
+      setError(`Disconnecting ${app.name} failed: ${errorText(problem)}`);
     } finally {
       setBusy(undefined);
       void apps.reload();
@@ -151,7 +163,7 @@ export function AppsScreen() {
   }
 
   const group = (items: AppConnection[]) => (
-    <View style={[styles.group, { backgroundColor: theme.surface, borderColor: theme.border }]}>
+    <Group>
       {items.map((app, index) => (
         <AppRow
           key={app.connectionId ?? `${app.slug}:${index}`}
@@ -161,7 +173,7 @@ export function AppsScreen() {
           onPress={() => manage(app)}
         />
       ))}
-    </View>
+    </Group>
   );
 
   return (
@@ -209,72 +221,68 @@ export function AppsScreen() {
           ) : null}
         </View>
       ) : null}
-      {apps.error ? (
-        <Notice text={`Apps did not load: ${apps.error}`} onRetry={apps.reload} />
-      ) : null}
       {error ? <Notice text={error} /> : null}
-      {!apps.data ? (
-        apps.error ? null : (
-          <Loading />
-        )
-      ) : !list.length && !searching ? (
-        <Empty
-          fill
-          icon={Blocks}
-          title="Connect your first app"
-          body="Gmail, Calendar, Notion and more. Nod reads and acts in them only when your words allow it."
-        >
-          <Button label="Connect an app" icon={Plus} variant="primary" onPress={connect} />
-        </Empty>
-      ) : (
-        <>
-          {attention.length ? (
+      <Loaded resource={apps} label="Apps">
+        {() =>
+          !list.length && !searching ? (
+            <Empty
+              fill
+              icon={Blocks}
+              title="Connect your first app"
+              body="Gmail, Calendar, Notion and more. Nod reads and acts in them only when your words allow it."
+            >
+              <Button label="Connect an app" icon={Plus} variant="primary" onPress={connect} />
+            </Empty>
+          ) : (
             <>
-              <SectionTitle count={attention.length}>Needs you</SectionTitle>
-              {group(attention)}
-            </>
-          ) : null}
-          {connected.length ? (
-            <>
-              <SectionTitle count={connected.length}>Connected</SectionTitle>
-              {group(connected)}
-            </>
-          ) : null}
-          {available.length ? (
-            <>
-              <SectionTitle count={matches.length}>
-                {searching ? 'Results' : 'All apps'}
-              </SectionTitle>
-              {group(available)}
-              {matches.length > available.length ? (
-                <Text style={[text.small, styles.more, { color: theme.mutedForeground }]}>
-                  {searching
-                    ? `Showing ${available.length} of ${matches.length}. Type more to narrow it down.`
-                    : `Showing the first ${available.length}. Search to find the other ${matches.length - available.length}.`}
+              {attention.length ? (
+                <>
+                  <SectionTitle count={attention.length}>Needs you</SectionTitle>
+                  {group(attention)}
+                </>
+              ) : null}
+              {connected.length ? (
+                <>
+                  <SectionTitle count={connected.length}>Connected</SectionTitle>
+                  {group(connected)}
+                </>
+              ) : null}
+              {available.length ? (
+                <>
+                  <SectionTitle count={matches.length}>
+                    {searching ? 'Results' : 'All apps'}
+                  </SectionTitle>
+                  {group(available)}
+                  {matches.length > available.length ? (
+                    <Text style={[text.small, styles.more, { color: theme.mutedForeground }]}>
+                      {searching
+                        ? `Showing ${available.length} of ${matches.length}. Type more to narrow it down.`
+                        : `Showing the first ${available.length}. Search to find the other ${matches.length - available.length}.`}
+                    </Text>
+                  ) : null}
+                </>
+              ) : null}
+              {searching && !attention.length && !connected.length && !available.length ? (
+                <Text style={[text.body, styles.more, { color: theme.mutedForeground }]}>
+                  No apps match “{query.trim()}”.
                 </Text>
               ) : null}
+              {catalog.error && !searching ? (
+                <Notice
+                  text={`The full app list did not load: ${catalog.error}`}
+                  onRetry={catalog.reload}
+                />
+              ) : null}
             </>
-          ) : null}
-          {searching && !attention.length && !connected.length && !available.length ? (
-            <Text style={[text.body, styles.more, { color: theme.mutedForeground }]}>
-              No apps match “{query.trim()}”.
-            </Text>
-          ) : null}
-          {catalog.error && !searching ? (
-            <Notice
-              text={`The full app list did not load: ${catalog.error}`}
-              onRetry={catalog.reload}
-            />
-          ) : null}
-        </>
-      )}
+          )
+        }
+      </Loaded>
     </Page>
   );
 }
 
 const styles = StyleSheet.create({
   fill: { flex: 1 },
-  group: { borderWidth: 1, borderRadius: radius.card, overflow: 'hidden' },
   row: {
     flexDirection: 'row',
     alignItems: 'center',

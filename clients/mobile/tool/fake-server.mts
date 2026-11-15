@@ -31,24 +31,14 @@ type AudioFault = 'drop-response' | 'abort-after-claim' | 'cancel' | 'busy';
 interface FixtureStore {
   messages: FixtureMessage[];
   artifacts?: FixtureArtifact[];
+  files?: Record<string, string>;
   audioClaims?: Record<string, { fingerprint: string; response?: object }>;
   audioFaults?: AudioFault[];
   turn: 'idle' | 'running' | 'waiting' | 'cancelled';
   parity?: {
-    question: 'pending' | 'answered' | 'replaced';
-    task: 'pending' | 'answered';
-    source: boolean;
-    privateStatus: 'pending' | 'filled' | 'expired';
+    question: 'pending' | 'answered';
     dispatches: number;
-    taskDispatches: number;
     refusals: number;
-    privateSubmissions: number;
-    accountWrites: number;
-    aroundReads: number;
-    linkReady?: boolean;
-    theme: 'light' | 'dark';
-    usageData: boolean;
-    traces: boolean;
   };
 }
 
@@ -60,17 +50,7 @@ const origin = `http://127.0.0.1:${port}`;
 const threadId = '00000000-0000-4000-8000-000000000001';
 const questionId = '00000000-0000-4000-8000-000000000101';
 const choiceId = '00000000-0000-4000-8000-000000000102';
-const taskQuestionId = '00000000-0000-4000-8000-000000000103';
 const taskId = '00000000-0000-4000-8000-000000000104';
-const preparedId = '00000000-0000-4000-8000-000000000105';
-const privateId = 'synthetic_private_request_00000000000000000';
-const taskQuestion: FixtureMessage = {
-  id: taskQuestionId,
-  role: 'assistant',
-  text: 'Synthetic older task question: continue the draft?',
-  turnId: taskId,
-  createdAt: '2026-11-06T11:00:00.000Z',
-};
 const initialStore: FixtureStore = {
   turn: 'idle',
   messages: [
@@ -130,24 +110,15 @@ app.addHook('preClose', async () => {
 app.get('/api/session', async () => ({
   threadId,
   user: { id: '00000000-0000-4000-8000-000000000005' },
-  settings: {
-    onboardingCompleted: true,
-    theme: store.parity?.theme ?? 'light',
-    usageData: store.parity?.usageData ?? false,
-    traces: store.parity?.traces ?? false,
-  },
-  capabilities: { traces: true },
+  settings: { onboardingCompleted: true },
 }));
-app.get('/fixture/info', async (request, reply) => {
-  if (!controlled(request.headers)) return reply.code(401).send({ error: 'Unauthorized.' });
-  return { fixture: 'nod-synthetic-validation-v1', syntheticOnly: true };
-});
 app.get('/fixture/counts', async (request, reply) => {
   if (!controlled(request.headers)) return reply.code(401).send({ error: 'Unauthorized.' });
   return {
     messages: store.messages.length,
     userMessages: store.messages.filter((message) => message.role === 'user').length,
     answers: store.parity?.dispatches ?? 0,
+    refusals: store.parity?.refusals ?? 0,
   };
 });
 app.get('/api/schedules', async () => []);
@@ -194,32 +165,20 @@ app.post('/api/messages', async (request, reply) => {
   if (existing) return { messageId: existing.id, turnId: existing.turnId };
   const parity = store.parity;
   if (parity) {
-    const choice = body.replyToMessageId === questionId;
-    const task = body.replyToMessageId === taskQuestionId;
     const allowed =
       body.threadId === threadId &&
-      ((choice &&
-        parity.question === 'pending' &&
-        body.text === 'Use synthetic draft' &&
-        JSON.stringify(body.questionAnswer) === JSON.stringify({ choiceIds: [choiceId] })) ||
-        (task &&
-          parity.task === 'pending' &&
-          body.text === 'Continue synthetic task' &&
-          body.questionAnswer === undefined));
+      body.replyToMessageId === questionId &&
+      parity.question === 'pending' &&
+      body.text === 'Use synthetic draft' &&
+      JSON.stringify(body.questionAnswer) === JSON.stringify({ choiceIds: [choiceId] });
     if (!allowed) {
       parity.refusals++;
       await persist();
       return reply.code(409).send({ code: 'question_unavailable' });
     }
-    if (choice) {
-      parity.question = 'answered';
-      parity.dispatches++;
-      const question = store.messages.find((item) => item.id === questionId)!;
-      question.answerChoicesPending = false;
-    } else {
-      parity.task = 'answered';
-      parity.taskDispatches++;
-    }
+    parity.question = 'answered';
+    parity.dispatches++;
+    store.messages.find((item) => item.id === questionId)!.answerChoicesPending = false;
   }
   const attachmentIds = (body as { attachmentIds?: unknown }).attachmentIds;
   const attachments = Array.isArray(attachmentIds)
@@ -236,7 +195,7 @@ app.post('/api/messages', async (request, reply) => {
     ...(typeof body.replyToMessageId === 'string'
       ? { replyToMessageId: body.replyToMessageId }
       : {}),
-    turnId: body.replyToMessageId === taskQuestionId ? taskId : randomUUID(),
+    turnId: randomUUID(),
     createdAt: new Date(Date.UTC(2026, 10, 6, 12, 0, store.messages.length)).toISOString(),
   };
   store.messages.push(message);
@@ -284,11 +243,12 @@ app.post('/fixture/stream', async (request, reply) => {
   });
   return { ok: true };
 });
-app.post('/fixture/wait', async (request, reply) => {
+app.post('/fixture/activity', async (request, reply) => {
   if (!controlled(request.headers)) return reply.code(401).send({ error: 'Unauthorized.' });
-  store.turn = 'waiting';
-  await persist();
-  emitRefresh();
+  const body = request.body as { items?: unknown };
+  if (!Array.isArray(body?.items))
+    return reply.code(400).send({ error: 'Invalid synthetic activity.' });
+  emit({ type: 'activity', items: body.items });
   return { ok: true };
 });
 app.post('/fixture/interrupt', async (request, reply) => {
@@ -311,14 +271,37 @@ app.post('/fixture/interrupt', async (request, reply) => {
 });
 app.post('/fixture/reply', async (request, reply) => {
   if (!controlled(request.headers)) return reply.code(401).send({ error: 'Unauthorized.' });
-  const body = request.body as { id?: unknown; text?: unknown };
+  const body = request.body as {
+    id?: unknown;
+    text?: unknown;
+    file?: { name?: unknown; mimeType?: unknown; text?: unknown };
+  };
   if (typeof body?.id !== 'string' || typeof body.text !== 'string')
     return reply.code(400).send({ error: 'Invalid synthetic reply.' });
+  const file = body.file;
+  if (
+    file &&
+    (typeof file.name !== 'string' ||
+      typeof file.mimeType !== 'string' ||
+      typeof file.text !== 'string')
+  )
+    return reply.code(400).send({ error: 'Invalid synthetic file.' });
   if (!store.messages.some((message) => message.id === body.id)) {
     store.messages.push({
       id: body.id,
       role: 'assistant',
       text: body.text,
+      ...(file
+        ? {
+            attachments: [
+              artifact(
+                Buffer.from(file.text as string),
+                file.name as string,
+                file.mimeType as string,
+              ),
+            ],
+          }
+        : {}),
       turnId: randomUUID(),
       createdAt: new Date(Date.UTC(2026, 10, 6, 12, 0, store.messages.length)).toISOString(),
     });
@@ -333,65 +316,25 @@ app.post<{ Params: { action: string } }>('/fixture/parity/:action', async (reque
   const action = request.params.action;
   if (action === 'seed') {
     if (store.parity) return reply.code(409).send({ error: 'Use a fresh fixture directory.' });
-    store.parity = {
-      question: 'pending',
-      task: 'pending',
-      source: true,
-      privateStatus: 'pending',
-      dispatches: 0,
-      taskDispatches: 0,
-      refusals: 0,
-      privateSubmissions: 0,
-      accountWrites: 0,
-      aroundReads: 0,
-      theme: 'light',
-      usageData: false,
-      traces: false,
-    };
-    for (const [id, text] of [
-      [questionId, 'Synthetic pending choice'],
-      [preparedId, `Synthetic finding [View prepared result](/prepared/${preparedId})`],
-      [privateId, `Synthetic private step [Open private entry](/credentials/${privateId})`],
-    ]) {
-      store.messages.push({
-        id: id === privateId ? '00000000-0000-4000-8000-000000000106' : id,
-        role: 'assistant',
-        text,
-        turnId: taskId,
-        createdAt: '2026-11-06T12:02:00.000Z',
-        ...(id === questionId
-          ? {
-              answerChoices: {
-                multiple: false,
-                options: [{ id: choiceId, label: 'Use synthetic draft' }],
-              },
-              answerChoicesPending: true,
-            }
-          : {}),
-      });
-    }
+    store.parity = { question: 'pending', dispatches: 0, refusals: 0 };
+    store.messages.push({
+      id: questionId,
+      role: 'assistant',
+      text: 'Synthetic pending choice',
+      turnId: taskId,
+      createdAt: '2026-11-06T12:02:00.000Z',
+      answerChoices: { multiple: false, options: [{ id: choiceId, label: 'Use synthetic draft' }] },
+      answerChoicesPending: true,
+    });
     store.turn = 'idle';
   } else if (!store.parity) {
     return reply.code(409).send({ error: 'Seed the synthetic workflows first.' });
-  } else if (action === 'replace-question') {
-    store.parity.question = 'replaced';
-    store.messages.find((item) => item.id === questionId)!.answerChoicesPending = false;
-  } else if (action === 'remove-source') {
-    store.parity.source = false;
-  } else if (action === 'expire-private') {
-    store.parity.privateStatus = 'expired';
-  } else if (action === 'link-ready') {
-    store.parity.linkReady = true;
   } else if (action !== 'inspect') {
     return reply.code(404).send({ error: 'Unknown fixture action.' });
   }
   await persist();
   if (action !== 'inspect') emitRefresh();
-  return {
-    marker: 'synthetic-parity-v1',
-    ...store.parity,
-    chatSends: store.messages.filter((item) => item.role === 'user').length,
-  };
+  return store.parity;
 });
 app.get('/api/preferences', async () => ({
   hourCycle: 'auto',
@@ -437,96 +380,19 @@ app.get('/api/models', async () => ({
     effort: 'low',
   },
 }));
-app.patch('/api/account', async (request, reply) => {
-  const body = request.body as Record<string, unknown>;
-  const parity = store.parity;
-  if (!parity || !body || Object.keys(body).length !== 1)
-    return reply.code(400).send({ error: 'Invalid synthetic settings.' });
-  if (body.theme === 'light' || body.theme === 'dark') parity.theme = body.theme;
-  else if (typeof body.usageData === 'boolean') parity.usageData = body.usageData;
-  else if (typeof body.traces === 'boolean') parity.traces = body.traces;
-  else return reply.code(400).send({ error: 'Unsupported synthetic settings.' });
-  parity.accountWrites++;
-  await persist();
-  return { ok: true };
-});
 const taskView = () => ({
   id: taskId,
   title: 'Synthetic saved task',
-  status: store.parity?.task === 'answered' ? 'working' : 'needs_you',
+  status: 'needs_you',
   now: 'Synthetic task state',
   result: 'Synthetic task result',
   doneWhen: 'The draft is ready',
   waitingFor: [],
-  question: taskQuestion.text,
-  questionMessageId: taskQuestionId,
+  question: 'Synthetic older task question: continue the draft?',
   messageId: questionId,
-  createdAt: taskQuestion.createdAt,
+  createdAt: '2026-11-06T11:00:00.000Z',
 });
 app.get('/api/tasks', async () => (store.parity ? [taskView()] : []));
-app.get<{ Params: { id: string } }>('/api/tasks/:id', async (request, reply) => {
-  if (!store.parity || request.params.id !== taskId)
-    return reply.code(404).send({ error: 'Unavailable.' });
-  return { task: taskView(), events: [] };
-});
-app.get<{ Params: { id: string } }>('/api/messages/around/:id', async (request, reply) => {
-  if (!store.parity || request.params.id !== taskQuestionId)
-    return reply.code(404).send({ error: 'Unavailable.' });
-  store.parity.aroundReads++;
-  await persist();
-  return [taskQuestion];
-});
-app.get<{ Params: { id: string } }>('/api/prepared/:id', async (request, reply) => {
-  if (!store.parity?.source || request.params.id !== preparedId)
-    return reply.code(404).send({ error: 'Source removed.' });
-  return {
-    id: preparedId,
-    title: 'Synthetic prepared result',
-    draft: 'Synthetic source-bound draft',
-    state: 'offered',
-    updatedAt: '2026-11-06T12:00:00.000Z',
-    unknowns: [],
-    sources: [
-      {
-        sourceId: 'synthetic-source',
-        id: 'synthetic-record',
-        version: '1',
-        label: 'Synthetic source record',
-        checkedAt: '2026-11-06T12:00:00.000Z',
-      },
-    ],
-  };
-});
-app.get<{ Params: { id: string } }>('/api/credential-requests/:id', async (request, reply) => {
-  if (!store.parity || request.params.id !== privateId)
-    return reply.code(404).send({ error: 'Unavailable.' });
-  return {
-    id: privateId,
-    status: store.parity.privateStatus,
-    kind: 'method',
-    origin: 'https://synthetic.example.test',
-    methods: [{ id: 'synthetic-method', label: 'Synthetic sign-in method' }],
-  };
-});
-app.get('/api/credential-requests/:id/flow', async () => ({ nextId: null }));
-app.post<{ Params: { id: string } }>(
-  '/api/credential-requests/:id/method',
-  async (request, reply) => {
-    const parity = store.parity;
-    const body = request.body as { methodId?: unknown };
-    if (
-      !parity ||
-      request.params.id !== privateId ||
-      parity.privateStatus !== 'pending' ||
-      body?.methodId !== 'synthetic-method'
-    )
-      return reply.code(409).send({ error: 'Request replaced.' });
-    parity.privateStatus = 'filled';
-    parity.privateSubmissions++;
-    await persist();
-    return { ok: true };
-  },
-);
 app.get('/api/apps', async () => [
   {
     slug: 'gmail',
@@ -550,8 +416,20 @@ function artifact(bytes: Buffer, name: string, mimeType: string) {
   const id = randomUUID();
   const item = { id, name, mimeType, size: bytes.length, url: `/api/artifacts/${id}` };
   store.artifacts = [...(store.artifacts ?? []), item];
+  store.files = { ...store.files, [id]: bytes.toString('base64') };
   return item;
 }
+
+app.get<{ Params: { id: string } }>('/api/artifacts/:id', async (request, reply) => {
+  const item = store.artifacts?.find((artifact) => artifact.id === request.params.id);
+  const bytes = store.files?.[request.params.id];
+  if (!item || bytes === undefined) return reply.code(404).send({ error: 'File not found.' });
+  return reply.type(item.mimeType).send(Buffer.from(bytes, 'base64'));
+});
+app.get<{ Params: { id: string } }>('/api/artifacts/:id/metadata', async (request, reply) => {
+  const item = store.artifacts?.find((artifact) => artifact.id === request.params.id);
+  return item ?? reply.code(404).send({ error: 'File not found.' });
+});
 
 app.post('/api/uploads', async (request, reply) => {
   const file = await request.file();

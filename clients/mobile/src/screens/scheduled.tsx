@@ -11,14 +11,14 @@ import {
   Plus,
   Sparkles,
   Trash2,
-} from 'lucide-react-native';
+} from '../icons';
 import { router } from 'expo-router';
 import { useState } from 'react';
 import { Alert, Pressable, StyleSheet, Switch, Text, View } from 'react-native';
 import { money } from '../money';
 import { scheduleDate, scheduleLabel } from '../../../../src/web/lib/schedules';
 import { formatDateTime, useDateFormat } from '../../../../src/web/lib/date-format';
-import { request } from '../api';
+import { errorText } from '../api';
 import {
   taskHeadline,
   taskLabels,
@@ -33,7 +33,7 @@ import {
   Button,
   Card,
   Empty,
-  Loading,
+  Loaded,
   Meta,
   Notice,
   Page,
@@ -42,7 +42,7 @@ import {
   text,
   type Icon,
 } from '../ui';
-import { describe, useResource } from '../use-resource';
+import { useRequest, useResource } from '../use-resource';
 
 const statusIcons: Record<TaskStatus, Icon> = {
   queued: Clock,
@@ -69,7 +69,7 @@ const closed = (task: Task) => task.status === 'done' || task.status === 'cancel
 function TaskCard({ task, onChanged }: { task: Task; onChanged(): void }) {
   const theme = useTheme();
   const format = useDateFormat();
-  const { connection } = useNod();
+  const send = useRequest();
   const [open, setOpen] = useState(task.status === 'failed' || task.status === 'needs_you');
   const [stopping, setStopping] = useState(false);
   const [error, setError] = useState<string>();
@@ -87,10 +87,10 @@ function TaskCard({ task, onChanged }: { task: Task; onChanged(): void }) {
           setStopping(true);
           setError(undefined);
           try {
-            await request(connection, `/api/tasks/${task.id}/stop`, 'POST', {});
+            await send(`/api/tasks/${encodeURIComponent(task.id)}/stop`, 'POST', {});
             onChanged();
           } catch (problem) {
-            setError(`Stop failed: ${describe(problem)}`);
+            setError(`Stop failed: ${errorText(problem)}`);
           } finally {
             setStopping(false);
           }
@@ -195,37 +195,49 @@ function Runs({ schedule }: { schedule: Schedule }) {
   const runs = useResource<ScheduleHistory>(
     `/api/schedule-runs?scheduleId=${encodeURIComponent(schedule.id)}&limit=5`,
   );
-  if (runs.error) return <Notice text={`Runs did not load: ${runs.error}`} onRetry={runs.reload} />;
-  if (!runs.data) return <Loading />;
-  if (!runs.data.runs.length)
-    return <Text style={[text.small, { color: theme.mutedForeground }]}>No runs yet.</Text>;
   return (
-    <View style={styles.runs}>
-      {runs.data.runs.map((run) => (
-        <View key={run.id} style={[styles.run, { borderTopColor: theme.border }]}>
-          <View style={styles.titleRow}>
-            <Text style={[text.small, styles.fill, { color: theme.foreground }]}>
-              {scheduleDate(run.scheduledFor, run.timeZone, format)}
-            </Text>
-            <Pill
-              label={runLabels[run.status]}
-              kind={
-                run.status === 'failed' ? 'error' : run.status === 'waiting' ? 'attention' : 'quiet'
-              }
-            />
+    <Loaded resource={runs} label="Runs">
+      {({ runs: items }) =>
+        !items.length ? (
+          <Text style={[text.small, { color: theme.mutedForeground }]}>No runs yet.</Text>
+        ) : (
+          <View style={styles.runs}>
+            {items.map((run) => (
+              <View key={run.id} style={[styles.run, { borderTopColor: theme.border }]}>
+                <View style={styles.titleRow}>
+                  <Text style={[text.small, styles.fill, { color: theme.foreground }]}>
+                    {scheduleDate(run.scheduledFor, run.timeZone, format)}
+                  </Text>
+                  <Pill
+                    label={runLabels[run.status]}
+                    kind={
+                      run.status === 'failed'
+                        ? 'error'
+                        : run.status === 'waiting'
+                          ? 'attention'
+                          : 'quiet'
+                    }
+                  />
+                </View>
+                {typeof run.costUsd === 'number' ? (
+                  <Text style={[text.small, { color: theme.mutedForeground }]}>
+                    {money(run.costUsd)}
+                  </Text>
+                ) : null}
+                {run.error ? (
+                  <Text style={[text.small, { color: theme.error }]}>{run.error}</Text>
+                ) : null}
+                {run.messagePreview ? (
+                  <Text style={[text.small, { color: theme.secondary }]} numberOfLines={3}>
+                    {run.messagePreview}
+                  </Text>
+                ) : null}
+              </View>
+            ))}
           </View>
-          {typeof run.costUsd === 'number' ? (
-            <Text style={[text.small, { color: theme.mutedForeground }]}>{money(run.costUsd)}</Text>
-          ) : null}
-          {run.error ? <Text style={[text.small, { color: theme.error }]}>{run.error}</Text> : null}
-          {run.messagePreview ? (
-            <Text style={[text.small, { color: theme.secondary }]} numberOfLines={3}>
-              {run.messagePreview}
-            </Text>
-          ) : null}
-        </View>
-      ))}
-    </View>
+        )
+      }
+    </Loaded>
   );
 }
 
@@ -238,7 +250,8 @@ function ScheduleCard({
 }) {
   const theme = useTheme();
   const format = useDateFormat();
-  const { connection, ask } = useNod();
+  const { ask } = useNod();
+  const send = useRequest();
   const [open, setOpen] = useState(false);
   const [busy, setBusy] = useState<'pause' | 'delete'>();
   const [error, setError] = useState<string>();
@@ -266,13 +279,17 @@ function ScheduleCard({
     setBusy('pause');
     setError(undefined);
     try {
-      const saved = await request<Schedule>(connection, `/api/schedules/${schedule.id}`, 'PATCH', {
-        enabled: !schedule.enabled,
-        expectedRevision: schedule.revision,
-      });
+      const saved = await send<Schedule>(
+        `/api/schedules/${encodeURIComponent(schedule.id)}`,
+        'PATCH',
+        {
+          enabled: !schedule.enabled,
+          expectedRevision: schedule.revision,
+        },
+      );
       onChanged(saved);
     } catch (problem) {
-      setError(`${schedule.enabled ? 'Pause' : 'Resume'} failed: ${describe(problem)}`);
+      setError(`${schedule.enabled ? 'Pause' : 'Resume'} failed: ${errorText(problem)}`);
       onChanged();
     } finally {
       setBusy(undefined);
@@ -289,10 +306,10 @@ function ScheduleCard({
           setBusy('delete');
           setError(undefined);
           try {
-            await request(connection, `/api/schedules/${schedule.id}`, 'DELETE');
+            await send(`/api/schedules/${encodeURIComponent(schedule.id)}`, 'DELETE');
             onChanged(null);
           } catch (problem) {
-            setError(`Delete failed: ${describe(problem)}`);
+            setError(`Delete failed: ${errorText(problem)}`);
             onChanged();
           } finally {
             setBusy(undefined);
@@ -409,9 +426,6 @@ export function ScheduledScreen() {
         ) : null
       }
     >
-      {schedules.error ? (
-        <Notice text={`Schedules did not load: ${schedules.error}`} onRetry={schedules.reload} />
-      ) : null}
       {tasks.error ? (
         <Notice text={`Tasks did not load: ${tasks.error}`} onRetry={tasks.reload} />
       ) : null}
@@ -423,31 +437,31 @@ export function ScheduledScreen() {
           ))}
         </>
       ) : null}
-      {!schedules.data ? (
-        schedules.error ? null : (
-          <Loading />
-        )
-      ) : !all.length ? (
-        <Empty
-          fill
-          icon={CalendarClock}
-          title="Your first schedule"
-          body="Set up a reminder, a regular summary or a check-in. Nod will help you work out what to do and when."
-        >
-          <Button label="New schedule" icon={Plus} variant="primary" onPress={newSchedule} />
-        </Empty>
-      ) : (
-        <>
-          <SectionTitle count={upcoming.length}>Upcoming</SectionTitle>
-          {upcoming.length ? upcoming.map(card) : <Meta>No upcoming schedules.</Meta>}
-          {inactive.length ? (
+      <Loaded resource={schedules} label="Schedules">
+        {() =>
+          !all.length ? (
+            <Empty
+              fill
+              icon={CalendarClock}
+              title="Your first schedule"
+              body="Set up a reminder, a regular summary or a check-in. Nod will help you work out what to do and when."
+            >
+              <Button label="New schedule" icon={Plus} variant="primary" onPress={newSchedule} />
+            </Empty>
+          ) : (
             <>
-              <SectionTitle count={inactive.length}>Inactive</SectionTitle>
-              {inactive.map(card)}
+              <SectionTitle count={upcoming.length}>Upcoming</SectionTitle>
+              {upcoming.length ? upcoming.map(card) : <Meta>No upcoming schedules.</Meta>}
+              {inactive.length ? (
+                <>
+                  <SectionTitle count={inactive.length}>Inactive</SectionTitle>
+                  {inactive.map(card)}
+                </>
+              ) : null}
             </>
-          ) : null}
-        </>
-      )}
+          )
+        }
+      </Loaded>
     </Page>
   );
 }

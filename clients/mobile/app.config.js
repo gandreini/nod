@@ -10,6 +10,18 @@ module.exports = ({ config }) => {
     ...config,
     name: variant.name,
     android: { ...config.android, package: variant.package },
+    ios: {
+      ...config.ios,
+      bundleIdentifier: variant.package,
+      ...(variant.cleartext
+        ? {
+            infoPlist: {
+              ...config.ios?.infoPlist,
+              NSAppTransportSecurity: { NSAllowsLocalNetworking: true },
+            },
+          }
+        : {}),
+    },
     plugins: [
       ...(config.plugins ?? []),
       ...(variant.cleartext

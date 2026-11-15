@@ -1,13 +1,14 @@
-import { ChevronDown, RefreshCw, RotateCw } from 'lucide-react-native';
+import { ChevronDown, RefreshCw } from './icons';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import Svg, { Defs, LinearGradient, Rect, Stop } from 'react-native-svg';
-import { ChatMenu, floatingShadow } from './chat-menu';
-import { useEffect, useRef, useState } from 'react';
+import { ChatMenu } from './chat-menu';
+import { memo, useCallback, useEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Animated,
   FlatList,
   Keyboard,
+  Platform,
   KeyboardAvoidingView,
   Pressable,
   StyleSheet,
@@ -18,11 +19,14 @@ import {
 } from 'react-native';
 import { artifactSource } from './api';
 import { ApprovalCard, ChoiceCard, ConnectAppCard, connectLink, type Answer } from './cards';
-import type { Outgoing } from './chat-state';
+import type { LocalFile, Outgoing, Recording } from './chat-state';
 import type { Connection } from './connection';
-import { splitQuestion, type Activity, type Message } from './contracts';
+import { splitQuestion, type Activity, type Artifact, type Message } from './contracts';
 import { Markdown } from './markdown';
-import { NodMark } from './nod-mark';
+import { NodGlyph, NodMark } from './nod-mark';
+import { Loading } from './ui';
+import { ownedArtifact } from './links';
+import { useLiveLine } from './live-line';
 import { font, radius, useTheme, type Theme } from './theme';
 import { useNod } from './nod-context';
 import { AttachMenu, MessageAttachments } from './attachment-views';
@@ -32,37 +36,13 @@ import { useAttachments } from './use-attachments';
 import { AudioClip, useVoiceRecorder } from './voice';
 import { prepareTranscription } from './uploads';
 
-type Row =
-  | { kind: 'message'; key: string; message: Message }
-  | { kind: 'outgoing'; key: string; item: Outgoing }
-  | { kind: 'stream'; key: string; text: string };
+type Row = { key: string; message?: Message; outgoing?: Outgoing; stream?: string };
 
-export function ThinkingDots({ theme }: { theme: Theme }) {
-  const values = useRef([0, 1, 2].map(() => new Animated.Value(0.35))).current;
-  useEffect(() => {
-    const loops = values.map((value, index) =>
-      Animated.loop(
-        Animated.sequence([
-          Animated.delay(index * 150),
-          Animated.timing(value, { toValue: 1, duration: 400, useNativeDriver: true }),
-          Animated.timing(value, { toValue: 0.35, duration: 650, useNativeDriver: true }),
-        ]),
-      ),
-    );
-    loops.forEach((loop) => loop.start());
-    return () => loops.forEach((loop) => loop.stop());
-  }, [values]);
-  return (
-    <View style={styles.dots}>
-      {values.map((value, index) => (
-        <Animated.View
-          key={index}
-          style={[styles.dot, { backgroundColor: theme.accent, opacity: value }]}
-        />
-      ))}
-    </View>
-  );
-}
+const maxRecordingSeconds = 300;
+const offlineDelay = 3000;
+const awayOffset = 400;
+const initialComposerHeight = 76;
+const menuGap = 12;
 
 function Fade({
   theme,
@@ -106,13 +86,19 @@ export function ScrollToLatest({
   onPress(): void;
 }) {
   const shown = useRef(new Animated.Value(0)).current;
+  const [rested, setRested] = useState(false);
   useEffect(() => {
+    setRested(false);
     Animated.spring(shown, {
       toValue: visible ? 1 : 0,
       useNativeDriver: true,
       speed: 16,
       bounciness: visible ? 8 : 0,
-    }).start();
+    }).start(({ finished }) => {
+      if (!finished || !visible) return;
+      shown.setValue(1);
+      setRested(true);
+    });
   }, [shown, visible]);
   return (
     <Animated.View
@@ -120,11 +106,13 @@ export function ScrollToLatest({
       style={[
         styles.toBottom,
         {
-          opacity: shown,
-          transform: [
-            { translateY: shown.interpolate({ inputRange: [0, 1], outputRange: [52, 0] }) },
-            { scale: shown.interpolate({ inputRange: [0, 1], outputRange: [0.7, 1] }) },
-          ],
+          opacity: rested ? 1 : shown,
+          transform: rested
+            ? []
+            : [
+                { translateY: shown.interpolate({ inputRange: [0, 1], outputRange: [52, 0] }) },
+                { scale: shown.interpolate({ inputRange: [0, 1], outputRange: [0.7, 1] }) },
+              ],
         },
       ]}
     >
@@ -138,10 +126,8 @@ export function ScrollToLatest({
           styles.toBottomButton,
           {
             backgroundColor: pressed ? theme.controlActive : theme.surface,
-            borderColor: theme.dark ? 'rgba(250,250,250,0.08)' : 'rgba(25,25,25,0.06)',
-            boxShadow: theme.dark
-              ? '0 4px 16px rgba(0,0,0,0.45)'
-              : '0 4px 16px rgba(25,25,25,0.08), 0 1px 2px rgba(25,25,25,0.04)',
+            borderColor: theme.hairline,
+            boxShadow: theme.shadow.floating,
           },
         ]}
       >
@@ -151,17 +137,26 @@ export function ScrollToLatest({
   );
 }
 
-const maxRecordingSeconds = 300;
-
-function activityLabel(activity: Activity[]) {
-  const current =
-    activity.find((item) => !item.background && !item.taskId) ??
-    activity.find((item) => !item.background);
-  return current?.step ?? current?.title ?? 'Working…';
-}
-
-function audioOf(message: Message) {
-  return (message.attachments ?? []).find((item) => item.mimeType.startsWith('audio/'));
+function WorkingRow({ activity, theme }: { activity: Activity[]; theme: Theme }) {
+  const line = useLiveLine(activity);
+  return (
+    <View style={styles.thinking} accessibilityLiveRegion="polite" accessibilityLabel={line.spoken}>
+      <NodGlyph size={28} />
+      <View style={styles.workingDetails}>
+        <Text style={[styles.caption, { color: theme.mutedForeground }]} numberOfLines={1}>
+          {line.text}
+        </Text>
+        {line.task && (
+          <Text style={[styles.caption, { color: theme.mutedForeground }]} numberOfLines={1}>
+            {line.task}
+          </Text>
+        )}
+        {line.receipt && (
+          <Text style={[styles.caption, { color: theme.mutedForeground }]}>{line.receipt}</Text>
+        )}
+      </View>
+    </View>
+  );
 }
 
 function Transcript({ text, theme }: { text: string; theme: Theme }) {
@@ -225,6 +220,78 @@ export function UserBubble({
   );
 }
 
+function splitAudio(attachments: Artifact[] = []) {
+  return {
+    audio: attachments.find(
+      (item) => item.mimeType.startsWith('audio/') && ownedArtifact(item.url),
+    ),
+    files: attachments.filter((item) => !item.mimeType.startsWith('audio/')),
+  };
+}
+
+function UserMessage({
+  text,
+  transcript,
+  attachments,
+  local,
+  recording,
+  faded,
+  connection,
+  theme,
+  children,
+}: {
+  text: string;
+  transcript?: string;
+  attachments?: Artifact[];
+  local?: LocalFile[];
+  recording?: Recording;
+  faded?: boolean;
+  connection: Connection;
+  theme: Theme;
+  children?: React.ReactNode;
+}) {
+  const { audio, files } = splitAudio(attachments);
+  return (
+    <UserBubble
+      text={audio ? (transcript ?? text) : text}
+      theme={theme}
+      faded={faded}
+      files={
+        files.length || local?.length ? (
+          <MessageAttachments
+            attachments={files}
+            local={local}
+            connection={connection}
+            theme={theme}
+            alignEnd
+          />
+        ) : undefined
+      }
+      audio={
+        audio ? (
+          <AudioClip
+            source={artifactSource(connection, audio.url)}
+            mimeType={audio.mimeType}
+            size={audio.size}
+            theme={theme}
+            onBubble
+          />
+        ) : recording ? (
+          <AudioClip
+            source={recording.uri}
+            durationMillis={recording.durationMillis}
+            mimeType={recording.mimeType}
+            theme={theme}
+            onBubble
+          />
+        ) : undefined
+      }
+    >
+      {children}
+    </UserBubble>
+  );
+}
+
 export function AssistantMessage({
   message,
   connection,
@@ -238,52 +305,29 @@ export function AssistantMessage({
   pending: boolean;
   onAnswer: Answer;
 }) {
-  const text = message.text;
-  const audio = audioOf(message);
-  const others = (message.attachments ?? []).filter((item) => !item.mimeType.startsWith('audio/'));
-  const files = others.length ? (
-    <MessageAttachments attachments={others} connection={connection} theme={theme} />
-  ) : null;
-  if (audio)
-    return (
-      <View style={styles.stack}>
+  const { audio, files } = splitAudio(message.attachments);
+  const asking = Boolean(message.approval || (message.answerChoices && pending));
+  const { lead, question } = asking
+    ? splitQuestion(message.text)
+    : { lead: message.text, question: '' };
+  const links = [...lead.matchAll(connectLink)];
+  const text = links.length ? lead.replace(connectLink, '').trim() : lead;
+  return (
+    <View style={styles.stack}>
+      {audio ? (
         <AudioClip
           source={artifactSource(connection, audio.url)}
           mimeType={audio.mimeType}
           size={audio.size}
           theme={theme}
         />
-        {text ? <Markdown text={text} theme={theme} origin={connection.origin} /> : null}
-        {files}
-      </View>
-    );
-  if (message.approval || (message.answerChoices && pending)) {
-    const { lead, question } = splitQuestion(text);
-    return (
-      <View style={styles.stack}>
-        {lead ? <Markdown text={lead} theme={theme} origin={connection.origin} /> : null}
-        {message.approval ? (
-          <ApprovalCard message={message} question={question} theme={theme} onAnswer={onAnswer} />
-        ) : (
-          <ChoiceCard message={message} question={question} theme={theme} onAnswer={onAnswer} />
-        )}
-      </View>
-    );
-  }
-  const links = [...text.matchAll(connectLink)];
-  if (!links.length)
-    return files ? (
-      <View style={styles.stack}>
-        {text ? <Markdown text={text} theme={theme} origin={connection.origin} /> : null}
-        {files}
-      </View>
-    ) : (
-      <Markdown text={text} theme={theme} origin={connection.origin} />
-    );
-  const rest = text.replace(connectLink, '').trim();
-  return (
-    <View style={styles.stack}>
-      {rest ? <Markdown text={rest} theme={theme} origin={connection.origin} /> : null}
+      ) : null}
+      {text ? <Markdown text={text} theme={theme} /> : null}
+      {message.approval ? (
+        <ApprovalCard message={message} question={question} theme={theme} onAnswer={onAnswer} />
+      ) : asking ? (
+        <ChoiceCard message={message} question={question} theme={theme} onAnswer={onAnswer} />
+      ) : null}
       {links.map((link) => (
         <ConnectAppCard
           key={link[3]}
@@ -294,39 +338,132 @@ export function AssistantMessage({
           theme={theme}
         />
       ))}
+      {files.length ? (
+        <MessageAttachments attachments={files} connection={connection} theme={theme} />
+      ) : null}
     </View>
   );
 }
 
-export function ChatScreen() {
-  const theme = useTheme();
+const ChatRow = memo(function ChatRow({
+  message,
+  outgoing,
+  stream,
+  pending,
+  connection,
+  theme,
+  onAnswer,
+  onRetry,
+  onDiscard,
+}: {
+  message?: Message;
+  outgoing?: Outgoing;
+  stream?: string;
+  pending: boolean;
+  connection: Connection;
+  theme: Theme;
+  onAnswer: Answer;
+  onRetry(id: string): void;
+  onDiscard(id: string): void;
+}) {
+  if (stream !== undefined) return <Markdown text={stream} theme={theme} />;
+  if (outgoing)
+    return (
+      <UserMessage
+        text={outgoing.text}
+        local={outgoing.files}
+        recording={outgoing.audio}
+        faded={outgoing.status === 'sending'}
+        connection={connection}
+        theme={theme}
+      >
+        {outgoing.status === 'failed' ? (
+          <Pressable
+            onPress={() => onRetry(outgoing.id)}
+            onLongPress={() => onDiscard(outgoing.id)}
+            accessibilityRole="button"
+            accessibilityLabel={`Not sent yet. ${outgoing.error ?? ''}`}
+            accessibilityHint="Tap to try again, long-press to discard it"
+            style={styles.failed}
+          >
+            <View style={styles.statusLine}>
+              <RefreshCw size={12} color={theme.secondary} />
+              <Text style={[styles.caption, { color: theme.secondary }]}>
+                Not sent yet · Tap to try again
+              </Text>
+            </View>
+            {outgoing.error ? (
+              <Text numberOfLines={2} style={[styles.reason, { color: theme.mutedForeground }]}>
+                {outgoing.error}
+              </Text>
+            ) : null}
+          </Pressable>
+        ) : outgoing.status === 'sending' && outgoing.attempts ? (
+          <View style={[styles.failed, styles.statusLine]} accessibilityLiveRegion="polite">
+            <ActivityIndicator size="small" color={theme.mutedForeground} />
+            <Text style={[styles.caption, { color: theme.mutedForeground }]}>
+              Sending… waiting for the connection
+            </Text>
+          </View>
+        ) : null}
+      </UserMessage>
+    );
+  if (!message) return null;
+  if (message.role === 'user')
+    return (
+      <UserMessage
+        text={message.displayText ?? message.text}
+        transcript={message.text}
+        attachments={message.attachments}
+        connection={connection}
+        theme={theme}
+      />
+    );
+  return (
+    <AssistantMessage
+      message={message}
+      connection={connection}
+      theme={theme}
+      pending={pending}
+      onAnswer={onAnswer}
+    />
+  );
+});
+
+function ChatComposer({
+  theme,
+  height,
+  away,
+  onHeight,
+  onLatest,
+}: {
+  theme: Theme;
+  height: number;
+  away: boolean;
+  onHeight(height: number): void;
+  onLatest(): void;
+}) {
   const { connection, chat } = useNod();
   const [draft, setDraft] = useState('');
   const voice = useVoiceRecorder();
   const files = useAttachments(connection);
   const [attaching, setAttaching] = useState(false);
-  const insets = useSafeAreaInsets();
-  const list = useRef<FlatList<Row>>(null);
-  const [away, setAway] = useState(false);
-  const [composerHeight, setComposerHeight] = useState(76);
-  const [offline, setOffline] = useState(false);
-
-  useEffect(() => {
-    if (chat.live) return setOffline(false);
-    const timer = setTimeout(() => setOffline(true), 3000);
-    return () => clearTimeout(timer);
-  }, [chat.live]);
   const [keyboard, setKeyboard] = useState(false);
+  const insets = useSafeAreaInsets();
 
   useEffect(() => {
-    const shown = Keyboard.addListener('keyboardDidShow', () => setKeyboard(true));
-    const hidden = Keyboard.addListener('keyboardDidHide', () => setKeyboard(false));
+    const ios = Platform.OS === 'ios';
+    const shown = Keyboard.addListener(ios ? 'keyboardWillShow' : 'keyboardDidShow', () =>
+      setKeyboard(true),
+    );
+    const hidden = Keyboard.addListener(ios ? 'keyboardWillHide' : 'keyboardDidHide', () =>
+      setKeyboard(false),
+    );
     return () => {
       shown.remove();
       hidden.remove();
     };
   }, []);
-  const host = new URL(connection.origin).host;
 
   useEffect(() => {
     if (voice.active && voice.seconds >= maxRecordingSeconds) void finishVoice();
@@ -334,16 +471,10 @@ export function ChatScreen() {
 
   async function finishVoice() {
     const recording = await voice.finish();
-    if (recording) chat.sendVoice(recording);
+    if (!recording) return;
+    chat.sendVoice(recording);
+    onLatest();
   }
-
-  const rows: Row[] = [
-    ...chat.messages.map((message) => ({ kind: 'message' as const, key: message.id, message })),
-    ...chat.outgoing.map((item) => ({ kind: 'outgoing' as const, key: item.id, item })),
-    ...chat.streams
-      .filter((stream) => stream.text)
-      .map((stream) => ({ kind: 'stream' as const, key: stream.id, text: stream.text })),
-  ].reverse();
 
   function submit() {
     const text = draft.trim();
@@ -351,7 +482,104 @@ export function ChatScreen() {
     chat.send(text, files.drafts);
     setDraft('');
     files.clear();
+    onLatest();
   }
+
+  return (
+    <View
+      style={[styles.composerWrap, { paddingBottom: 12 + (keyboard ? 0 : insets.bottom) }]}
+      onLayout={(event) => onHeight(event.nativeEvent.layout.height)}
+    >
+      <Fade theme={theme} edge="bottom" style={styles.bottomFade} />
+      <ScrollToLatest visible={away} theme={theme} onPress={onLatest} />
+      {voice.error || files.error ? (
+        <Pressable
+          onPress={() => {
+            voice.clearError();
+            files.clearError();
+          }}
+          accessibilityRole="button"
+          style={styles.voiceError}
+        >
+          <Text style={[styles.caption, { color: theme.error }]}>{voice.error ?? files.error}</Text>
+        </Pressable>
+      ) : null}
+      <Composer
+        theme={theme}
+        draft={draft}
+        onDraft={setDraft}
+        ready={chat.ready}
+        working={chat.working}
+        recording={voice.active ? { seconds: voice.seconds, levels: voice.levels } : undefined}
+        onSubmit={submit}
+        onStop={chat.stop}
+        onRecord={() => {
+          void voice.start();
+          void prepareTranscription(connection).catch(() => {});
+        }}
+        onCancelRecording={voice.cancel}
+        onSendRecording={() => void finishVoice()}
+        drafts={files.drafts}
+        onAttach={() => setAttaching(true)}
+        onRemoveDraft={files.remove}
+        onRetryDraft={files.retry}
+      />
+      <AttachMenu
+        visible={attaching}
+        theme={theme}
+        above={height + menuGap}
+        onClose={() => setAttaching(false)}
+        onPick={(source) => void files.pick(source)}
+      />
+    </View>
+  );
+}
+
+export function ChatScreen() {
+  const theme = useTheme();
+  const { connection, chat } = useNod();
+  const insets = useSafeAreaInsets();
+  const list = useRef<FlatList<Row>>(null);
+  const [away, setAway] = useState(false);
+  const [composerHeight, setComposerHeight] = useState(initialComposerHeight);
+  const [offline, setOffline] = useState(false);
+
+  useEffect(() => {
+    if (chat.live) return setOffline(false);
+    const timer = setTimeout(() => setOffline(true), offlineDelay);
+    return () => clearTimeout(timer);
+  }, [chat.live]);
+  const host = new URL(connection.origin).host;
+
+  const toLatest = useCallback(() => {
+    list.current?.scrollToOffset({ offset: 0, animated: true });
+  }, []);
+
+  const rows: Row[] = [
+    ...chat.messages.map((message) => ({ key: message.id, message })),
+    ...chat.outgoing.map((outgoing) => ({ key: outgoing.id, outgoing })),
+    ...chat.streams
+      .filter((stream) => stream.text)
+      .map((stream) => ({ key: stream.id, stream: stream.text })),
+  ].reverse();
+
+  const { pendingQuestions, answer, retry, discard } = chat;
+  const renderItem = useCallback(
+    ({ item: row }: { item: Row }) => (
+      <ChatRow
+        message={row.message}
+        outgoing={row.outgoing}
+        stream={row.stream}
+        pending={row.message ? pendingQuestions.has(row.message.id) : false}
+        connection={connection}
+        theme={theme}
+        onAnswer={answer}
+        onRetry={retry}
+        onDiscard={discard}
+      />
+    ),
+    [answer, connection, discard, pendingQuestions, retry, theme],
+  );
 
   return (
     <KeyboardAvoidingView
@@ -360,7 +588,7 @@ export function ChatScreen() {
     >
       <View style={styles.fill}>
         {!chat.ready ? (
-          <ActivityIndicator style={styles.fill} color={theme.accent} />
+          <Loading />
         ) : rows.length === 0 ? (
           <View style={[styles.empty, { paddingBottom: composerHeight }]}>
             <NodMark size={56} />
@@ -378,139 +606,21 @@ export function ChatScreen() {
               styles.list,
               { paddingTop: composerHeight + 8, paddingBottom: insets.top + 72 },
             ]}
-            onScroll={(event) => setAway(event.nativeEvent.contentOffset.y > 400)}
+            onScroll={(event) => setAway(event.nativeEvent.contentOffset.y > awayOffset)}
             scrollEventThrottle={64}
             keyboardDismissMode="interactive"
             keyboardShouldPersistTaps="handled"
             onEndReached={chat.loadOlder}
             onEndReachedThreshold={0.4}
             ListHeaderComponent={
-              chat.thinking ? (
-                <View style={styles.thinking} accessibilityLiveRegion="polite">
-                  <ThinkingDots theme={theme} />
-                  <Text
-                    style={[styles.caption, { color: theme.mutedForeground }]}
-                    numberOfLines={1}
-                  >
-                    {activityLabel(chat.activity)}
-                  </Text>
-                </View>
-              ) : undefined
+              chat.thinking ? <WorkingRow activity={chat.activity} theme={theme} /> : undefined
             }
             ListFooterComponent={
               chat.loadingOlder ? (
                 <ActivityIndicator style={styles.olderSpinner} color={theme.mutedForeground} />
               ) : undefined
             }
-            renderItem={({ item: row }) => {
-              if (row.kind === 'stream')
-                return <Markdown text={row.text} theme={theme} origin={connection.origin} />;
-              if (row.kind === 'outgoing')
-                return (
-                  <UserBubble
-                    text={row.item.text}
-                    theme={theme}
-                    faded={row.item.status === 'sending'}
-                    files={
-                      row.item.files?.length ? (
-                        <MessageAttachments
-                          local={row.item.files}
-                          connection={connection}
-                          theme={theme}
-                          alignEnd
-                        />
-                      ) : undefined
-                    }
-                    audio={
-                      row.item.audio ? (
-                        <AudioClip
-                          source={row.item.audio.uri}
-                          durationMillis={row.item.audio.durationMillis}
-                          mimeType={row.item.audio.mimeType}
-                          theme={theme}
-                          onBubble
-                        />
-                      ) : undefined
-                    }
-                  >
-                    {row.item.status === 'failed' ? (
-                      <Pressable
-                        onPress={() => chat.retry(row.item.id)}
-                        onLongPress={() => chat.discard(row.item.id)}
-                        accessibilityRole="button"
-                        accessibilityLabel={`Not sent yet. ${row.item.error ?? ''}`}
-                        accessibilityHint="Tap to try again, long-press to discard it"
-                        style={styles.failed}
-                      >
-                        <View style={styles.statusLine}>
-                          <RotateCw size={12} color={theme.secondary} />
-                          <Text style={[styles.caption, { color: theme.secondary }]}>
-                            Not sent yet · Tap to try again
-                          </Text>
-                        </View>
-                        {row.item.error ? (
-                          <Text
-                            numberOfLines={2}
-                            style={[styles.reason, { color: theme.mutedForeground }]}
-                          >
-                            {row.item.error}
-                          </Text>
-                        ) : null}
-                      </Pressable>
-                    ) : row.item.status === 'sending' && row.item.attempts ? (
-                      <View
-                        style={[styles.failed, styles.statusLine]}
-                        accessibilityLiveRegion="polite"
-                      >
-                        <ActivityIndicator size="small" color={theme.mutedForeground} />
-                        <Text style={[styles.caption, { color: theme.mutedForeground }]}>
-                          Sending… waiting for the connection
-                        </Text>
-                      </View>
-                    ) : null}
-                  </UserBubble>
-                );
-              const text = row.message.displayText ?? row.message.text;
-              const clip = row.message.role === 'user' ? audioOf(row.message) : undefined;
-              const attached = row.message.attachments?.filter(
-                (item) => !item.mimeType.startsWith('audio/'),
-              );
-              return row.message.role === 'user' ? (
-                <UserBubble
-                  text={clip ? row.message.text : text}
-                  theme={theme}
-                  files={
-                    attached?.length ? (
-                      <MessageAttachments
-                        attachments={attached}
-                        connection={connection}
-                        theme={theme}
-                        alignEnd
-                      />
-                    ) : undefined
-                  }
-                  audio={
-                    clip ? (
-                      <AudioClip
-                        source={artifactSource(connection, clip.url)}
-                        mimeType={clip.mimeType}
-                        size={clip.size}
-                        theme={theme}
-                        onBubble
-                      />
-                    ) : undefined
-                  }
-                />
-              ) : (
-                <AssistantMessage
-                  message={row.message}
-                  connection={connection}
-                  theme={theme}
-                  pending={chat.pendingQuestions.has(row.message.id)}
-                  onAnswer={chat.answer}
-                />
-              );
-            }}
+            renderItem={renderItem}
           />
         )}
 
@@ -523,10 +633,10 @@ export function ChatScreen() {
               accessibilityLabel={chat.error ? `${chat.error}. Retry` : `Reconnecting to ${host}`}
               style={[
                 styles.statusPill,
-                floatingShadow(theme),
                 {
                   backgroundColor: chat.error ? theme.errorSoft : theme.surface,
                   borderColor: theme.border,
+                  boxShadow: theme.shadow.floating,
                 },
               ]}
             >
@@ -548,59 +658,14 @@ export function ChatScreen() {
             </Pressable>
           </View>
         ) : null}
-        <ChatMenu theme={theme} attention={chat.pendingQuestions.size > 0} />
-
-        <View
-          style={[styles.composerWrap, { paddingBottom: 12 + (keyboard ? 0 : insets.bottom) }]}
-          onLayout={(event) => setComposerHeight(event.nativeEvent.layout.height)}
-        >
-          <Fade theme={theme} edge="bottom" style={styles.bottomFade} />
-          <ScrollToLatest
-            visible={away}
-            theme={theme}
-            onPress={() => list.current?.scrollToOffset({ offset: 0, animated: true })}
-          />
-          {voice.error || files.error ? (
-            <Pressable
-              onPress={() => {
-                voice.clearError();
-                files.clearError();
-              }}
-              accessibilityRole="button"
-              style={styles.voiceError}
-            >
-              <Text style={[styles.caption, { color: theme.error }]}>
-                {voice.error ?? files.error}
-              </Text>
-            </Pressable>
-          ) : null}
-          <Composer
-            theme={theme}
-            draft={draft}
-            onDraft={setDraft}
-            ready={chat.ready}
-            working={chat.working}
-            recording={voice.active ? { seconds: voice.seconds, levels: voice.levels } : undefined}
-            onSubmit={submit}
-            onStop={chat.stop}
-            onRecord={() => {
-              void voice.start();
-              void prepareTranscription(connection).catch(() => {});
-            }}
-            onCancelRecording={voice.cancel}
-            onSendRecording={() => void finishVoice()}
-            drafts={files.drafts}
-            onAttach={() => setAttaching(true)}
-            onRemoveDraft={files.remove}
-            onRetryDraft={files.retry}
-          />
-          <AttachMenu
-            visible={attaching}
-            theme={theme}
-            onClose={() => setAttaching(false)}
-            onPick={(source) => void files.pick(source)}
-          />
-        </View>
+        <ChatMenu theme={theme} />
+        <ChatComposer
+          theme={theme}
+          height={composerHeight}
+          away={away}
+          onHeight={setComposerHeight}
+          onLatest={toLatest}
+        />
       </View>
     </KeyboardAvoidingView>
   );
@@ -633,8 +698,7 @@ const styles = StyleSheet.create({
     maxWidth: 280,
   },
   thinking: { flexDirection: 'row', alignItems: 'center', gap: 8, paddingVertical: 8 },
-  dots: { flexDirection: 'row', gap: 4 },
-  dot: { width: 4, height: 4, borderRadius: 2 },
+  workingDetails: { flex: 1, gap: 2 },
   olderSpinner: { paddingVertical: 16 },
   empty: { flex: 1, alignItems: 'center', justifyContent: 'center', gap: 16, padding: 24 },
   emptyTitle: { fontFamily: font.semibold, fontSize: 24, letterSpacing: -0.5 },

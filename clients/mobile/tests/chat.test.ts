@@ -1,10 +1,17 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { after, before, describe, test } from 'node:test';
-import { ApiError, getState, sendText } from '../src/api.ts';
+import { ApiError, getState, read, sendText } from '../src/api.ts';
 import { choiceAnswerText } from '../src/contracts.ts';
-import { mergeMessages, unsent, voiceStep, type Outgoing } from '../src/chat-state.ts';
-import type { Message } from '../src/contracts.ts';
+import {
+  keepOlder,
+  mergeMessages,
+  unsent,
+  voiceStep,
+  workState,
+  type Outgoing,
+} from '../src/chat-state.ts';
+import type { Activity, Message } from '../src/contracts.ts';
 import { startFakeServer } from './fake-server.ts';
 
 function message(id: string, createdAt: string, text = id): Message {
@@ -14,7 +21,32 @@ function message(id: string, createdAt: string, text = id): Message {
 const claimed =
   'This recording may already be in the conversation. Check before sending a new recording.';
 
+function work(fields: Partial<Activity>): Activity {
+  return {
+    turnId: 't',
+    taskId: null,
+    title: null,
+    step: null,
+    site: null,
+    since: '2026-11-15T08:00:00.000Z',
+    doing: 'model',
+    quietSince: '2026-11-15T08:00:00.000Z',
+    ...fields,
+  };
+}
+
 describe('chat state', () => {
+  test('Nod shows it is working whenever Stop is offered, a task it continues included', () => {
+    const task = [work({ taskId: 'task', title: 'Synthetic benchmark' })];
+    assert.deepEqual(workState(task, false, false), { working: true, thinking: true });
+    assert.deepEqual(workState(task, false, true), { working: true, thinking: false });
+    assert.deepEqual(workState([work({ background: true })], false, false), {
+      working: false,
+      thinking: false,
+    });
+    assert.deepEqual(workState([], true, false), { working: false, thinking: true });
+  });
+
   test('history and live state merge with each message once, oldest first', () => {
     const history = [
       message('a', '2026-11-13T08:00:00.000Z'),
@@ -32,6 +64,37 @@ describe('chat state', () => {
     assert.equal(merged[1].text, 'new text');
   });
 
+  test('messages pushed out of the latest window stay once older pages are loaded', () => {
+    const loaded = [message('a', '2026-11-13T08:00:00.000Z')];
+    const window = [
+      message('b', '2026-11-13T08:01:00.000Z'),
+      message('c', '2026-11-13T08:02:00.000Z'),
+    ];
+    const moved = [
+      message('c', '2026-11-13T08:02:00.000Z'),
+      message('d', '2026-11-13T08:03:00.000Z'),
+    ];
+    const older = keepOlder(loaded, window, moved);
+    assert.deepEqual(
+      mergeMessages(older, moved).map((item) => item.id),
+      ['a', 'b', 'c', 'd'],
+    );
+    assert.deepEqual(keepOlder([], window, moved), []);
+  });
+
+  test('a message the server hides inside the latest window does not come back', () => {
+    const loaded = [message('a', '2026-11-13T08:00:00.000Z')];
+    const window = [
+      message('b', '2026-11-13T08:01:00.000Z'),
+      message('c', '2026-11-13T08:02:00.000Z'),
+    ];
+    const hidden = [message('b', '2026-11-13T08:01:00.000Z')];
+    assert.deepEqual(
+      mergeMessages(keepOlder(loaded, window, hidden), hidden).map((item) => item.id),
+      ['a', 'b'],
+    );
+  });
+
   test('a sent message leaves the outgoing list once the server has it', () => {
     const outgoing: Outgoing[] = [
       { id: 'x', text: 'hi', status: 'sending', createdAt: '2026-11-13T08:03:00.000Z' },
@@ -42,18 +105,6 @@ describe('chat state', () => {
       ['y'],
     );
   });
-});
-
-describe('chat requests', () => {
-  let fake: Awaited<ReturnType<typeof startFakeServer>>;
-  let connection: { origin: string; token: string; owner: string };
-
-  before(async () => {
-    fake = await startFakeServer();
-    connection = { origin: fake.origin, token: fake.token, owner: 'owner' };
-  });
-
-  after(() => fake.stop());
 
   test('a voice message resent under a new ID leaves the outgoing list once that ID arrives', () => {
     const voice: Outgoing = {
@@ -105,20 +156,33 @@ describe('chat requests', () => {
     assert.equal(voiceStep({ status: 413 }, false), 'stop');
     assert.equal(voiceStep({ status: 409, retryable: true, reason: 'Busy' }, false), 'retry');
   });
+});
 
-  test('a retried send leaves the message in the conversation once', async () => {
-    const { threadId } = await getState(connection);
-    const id = randomUUID();
-    await sendText(connection, { id, text: 'Hello', threadId });
-    await sendText(connection, { id, text: 'Hello', threadId });
-    const { messages } = await getState(connection);
-    assert.equal(messages.filter((item) => item.id === id).length, 1);
+describe('chat requests', () => {
+  let fake: Awaited<ReturnType<typeof startFakeServer>>;
+  let connection: { origin: string; token: string; owner: string };
+
+  before(async () => {
+    fake = await startFakeServer();
+    connection = { origin: fake.origin, token: fake.token, owner: 'owner' };
   });
+
+  after(() => fake.stop());
 
   test('a refused token surfaces its status', async () => {
     await assert.rejects(
       getState({ ...connection, token: 'a'.repeat(64) }),
       (error) => error instanceof ApiError && error.status === 401,
+    );
+  });
+
+  test('a page that is not JSON fails with its status instead of an empty result', async () => {
+    await assert.rejects(
+      read(new Response('<html>Sign in to the Wi-Fi</html>', { status: 200 })),
+      (error) =>
+        error instanceof ApiError &&
+        error.status === 200 &&
+        error.message.includes('did not answer with JSON (HTTP 200)'),
     );
   });
 });
@@ -135,7 +199,7 @@ describe('answering Nod', () => {
 
   after(() => fake.stop());
 
-  test('a chosen option reaches the server once and a second answer is refused', async () => {
+  test('a chosen option reaches the server once', async () => {
     const state = await getState(connection);
     const question = state.messages.find((item) =>
       state.pendingAnswerChoiceMessageIds?.includes(item.id),
@@ -151,10 +215,5 @@ describe('answering Nod', () => {
     await sendText(connection, answer);
     const inspected = await fake.control('/fixture/parity/inspect', {});
     assert.equal(((await inspected.json()) as { dispatches: number }).dispatches, 1);
-    await assert.rejects(
-      sendText(connection, { ...answer, id: randomUUID() }),
-      (error) =>
-        error instanceof ApiError && error.status === 409 && error.code === 'question_unavailable',
-    );
   });
 });

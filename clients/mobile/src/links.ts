@@ -6,6 +6,10 @@ export type SafeLink =
 const artifact =
   /^\/api\/artifacts\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i;
 
+export function ownedArtifact(path: string) {
+  return artifact.test(path);
+}
+
 export function safeLink(href: string, origin: string): SafeLink | null {
   if (!href || /[\u0000-\u0020\u007f<>"'\\]/.test(href)) return null;
   let url: URL;

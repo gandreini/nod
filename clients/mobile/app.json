@@ -7,6 +7,14 @@
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "automatic",
+    "ios": {
+      "bundleIdentifier": "com.gandreini.nod",
+      "supportsTablet": false,
+      "infoPlist": {
+        "ITSAppUsesNonExemptEncryption": false
+      },
+      "buildNumber": "3"
+    },
     "android": {
       "package": "com.gandreini.nod",
       "adaptiveIcon": {
@@ -33,7 +41,12 @@
         }
       ],
       "expo-router",
-      "expo-audio",
+      [
+        "expo-audio",
+        {
+          "microphonePermission": "Nod uses the microphone when you record a voice message."
+        }
+      ],
       [
         "expo-image-picker",
         {

@@ -1,5 +1,6 @@
 import {
   CalendarClock,
+  CircleAlert,
   Clock,
   KeyRound,
   LogOut,
@@ -7,22 +8,34 @@ import {
   RefreshCw,
   Sparkles,
   Trash2,
-  TriangleAlert,
-} from 'lucide-react-native';
+} from '../icons';
 import { useState, type ReactNode } from 'react';
 import { Appearance, Pressable, StyleSheet, Text, View } from 'react-native';
-import { AppLogo, ApprovalCard, ChoiceCard, ConnectAppCard, type Answer } from '../cards';
+import { AppLogo } from '../app-logo';
+import { ApprovalCard, ChoiceCard, ConnectAppCard, type Answer } from '../cards';
 import { MessageAttachments } from '../attachment-views';
 import type { Draft } from '../attachments';
-import { AssistantMessage, ScrollToLatest, ThinkingDots, UserBubble } from '../chat-screen';
+import { AssistantMessage, ScrollToLatest, UserBubble } from '../chat-screen';
 import { Composer } from '../composer';
 import type { ApprovalState, Message } from '../contracts';
 import { useNod } from '../nod-context';
-import { NodMark } from '../nod-mark';
+import { NodGlyph, NodMark } from '../nod-mark';
 import { font, radius, useTheme } from '../theme';
-import { Button, Card, Empty, Loading, Meta, Notice, Page, Pill, SectionTitle, text } from '../ui';
+import {
+  Button,
+  Card,
+  Empty,
+  Group,
+  Loading,
+  Meta,
+  Notice,
+  Page,
+  Pill,
+  Row,
+  SectionTitle,
+  text,
+} from '../ui';
 import { AudioClip, Levels } from '../voice';
-import { Group, Row } from './server';
 
 const drafts: Draft[] = [
   {
@@ -76,6 +89,8 @@ You have **three meetings** tomorrow and one email that *needs an answer*.
 - Design review at 10:00
 - 1:1 with the team lead
 - Planning, moved to 15:30
+
+Text right after a list keeps the paragraph gap.
 
 > The supplier asked to confirm the order by Friday.
 
@@ -242,7 +257,7 @@ export function GalleryScreen() {
 
       <Section title="Pills">
         <View style={styles.wrap}>
-          <Pill label="Needs you" kind="attention" icon={TriangleAlert} />
+          <Pill label="Needs you" kind="attention" icon={CircleAlert} />
           <Pill label="Failed" kind="error" />
           <Pill label="Waiting" icon={Clock} />
           <Pill label="Recurring" kind="good" />
@@ -338,12 +353,30 @@ export function GalleryScreen() {
           onAnswer={answer}
         />
         <View style={styles.row}>
-          <ThinkingDots theme={theme} />
+          <NodGlyph size={28} />
           <Text style={[text.small, { color: theme.mutedForeground }]}>Reading your calendar…</Text>
         </View>
       </Section>
 
       <Section title="Attachments in messages">
+        <AssistantMessage
+          message={message({
+            text: 'Two offers are worth a look:\n\n- Fastweb Casa Start\n- Vodafone Casa Start',
+            attachments: [
+              {
+                id: '00000000-0000-4000-8000-0000000000aa',
+                name: 'Internet offers benchmark.md',
+                mimeType: 'text/markdown',
+                size: 9200,
+                url: '/api/artifacts/00000000-0000-4000-8000-0000000000aa',
+              },
+            ],
+          })}
+          connection={connection}
+          theme={theme}
+          pending={false}
+          onAnswer={answer}
+        />
         <MessageAttachments
           local={[
             {
@@ -426,6 +459,9 @@ export function GalleryScreen() {
           onRecord={noop}
           onCancelRecording={noop}
           onSendRecording={noop}
+          onAttach={noop}
+          onRemoveDraft={noop}
+          onRetryDraft={noop}
         />
         <Label>Typing (editable)</Label>
         <Composer
@@ -439,6 +475,9 @@ export function GalleryScreen() {
           onRecord={noop}
           onCancelRecording={noop}
           onSendRecording={noop}
+          onAttach={noop}
+          onRemoveDraft={noop}
+          onRetryDraft={noop}
         />
         <Label>Nod is working</Label>
         <Composer
@@ -452,6 +491,9 @@ export function GalleryScreen() {
           onRecord={noop}
           onCancelRecording={noop}
           onSendRecording={noop}
+          onAttach={noop}
+          onRemoveDraft={noop}
+          onRetryDraft={noop}
         />
         <Label>With attachments: ready, uploading, failed</Label>
         <Composer
@@ -461,14 +503,14 @@ export function GalleryScreen() {
           ready
           working={false}
           drafts={drafts}
-          onAttach={noop}
-          onRemoveDraft={noop}
-          onRetryDraft={noop}
           onSubmit={noop}
           onStop={noop}
           onRecord={noop}
           onCancelRecording={noop}
           onSendRecording={noop}
+          onAttach={noop}
+          onRemoveDraft={noop}
+          onRetryDraft={noop}
         />
         <Label>Recording</Label>
         <Composer
@@ -483,6 +525,9 @@ export function GalleryScreen() {
           onRecord={noop}
           onCancelRecording={noop}
           onSendRecording={noop}
+          onAttach={noop}
+          onRemoveDraft={noop}
+          onRetryDraft={noop}
         />
       </Section>
 
@@ -502,7 +547,7 @@ const styles = StyleSheet.create({
   sectionTitle: { fontFamily: font.semibold, fontSize: 20, letterSpacing: -0.4 },
   pageTitle: { fontFamily: font.semibold, fontSize: 28, lineHeight: 34, letterSpacing: -0.6 },
   emptyTitle: { fontFamily: font.semibold, fontSize: 20, letterSpacing: -0.4 },
-  mono: { fontFamily: 'GeistMono_400Regular', fontSize: 12 },
+  mono: { fontFamily: font.mono, fontSize: 12 },
   row: { flexDirection: 'row', alignItems: 'center', gap: 12 },
   wrap: { flexDirection: 'row', flexWrap: 'wrap', gap: 8 },
   swatches: { flexDirection: 'row', flexWrap: 'wrap', gap: 12 },

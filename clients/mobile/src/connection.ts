@@ -1,3 +1,5 @@
+import { ApiError, errorText, read } from './api';
+
 export type ConnectionProblemKind = 'address' | 'token' | 'unreachable' | 'rejected' | 'not-nod';
 
 export class ConnectionProblem extends Error {
@@ -71,38 +73,34 @@ export async function checkServer(input: { url: string; token: string }): Promis
       'This is not a server token. Copy NOD_AUTH_TOKEN from the server’s .env file.',
     );
   const response = await sessionRequest(origin, token);
-  const body = await response.text().catch(() => '');
   let session:
-    | {
-        user?: { id?: unknown };
-        settings?: { onboardingCompleted?: unknown };
-        error?: unknown;
-        message?: unknown;
-      }
-    | undefined;
+    { user?: { id?: unknown }; settings?: { onboardingCompleted?: unknown } } | undefined;
   try {
-    session = body ? JSON.parse(body) : undefined;
-  } catch {}
-  const reason =
-    typeof session?.error === 'string'
-      ? session.error
-      : typeof session?.message === 'string'
-        ? session.message
-        : body.slice(0, 200).trim();
-  const said = reason ? `: ${reason}` : '';
-  if (response.status === 401)
+    session = await read(response);
+  } catch (problem) {
+    if (!(problem instanceof ApiError))
+      throw new ConnectionProblem(
+        'unreachable',
+        `${origin} stopped answering (${errorText(problem)}). Check that the server is running.`,
+      );
+    const said = problem.reason ? `: ${problem.reason}` : '';
+    if (problem.status === 401)
+      throw new ConnectionProblem(
+        'rejected',
+        `The server refused this token${said} (HTTP 401). Nothing was saved.`,
+      );
+    if (problem.status === 403)
+      throw new ConnectionProblem(
+        'rejected',
+        `The server refused the request${said} (HTTP 403). Nothing was saved.`,
+      );
     throw new ConnectionProblem(
-      'rejected',
-      `The server refused this token${said} (HTTP 401). Nothing was saved.`,
+      'not-nod',
+      `${origin} did not answer as a Nod server${said} (HTTP ${problem.status}).`,
     );
-  if (response.status === 403)
-    throw new ConnectionProblem(
-      'rejected',
-      `The server refused the request${said} (HTTP 403). Nothing was saved.`,
-    );
+  }
   const owner = session?.user?.id;
   if (
-    !response.ok ||
     typeof owner !== 'string' ||
     !owner ||
     owner.length > 200 ||
@@ -110,9 +108,7 @@ export async function checkServer(input: { url: string; token: string }): Promis
   )
     throw new ConnectionProblem(
       'not-nod',
-      response.ok
-        ? `${origin} did not answer as a Nod server (HTTP ${response.status}).`
-        : `${origin} did not answer as a Nod server${said} (HTTP ${response.status}).`,
+      `${origin} did not answer as a Nod server (HTTP ${response.status}).`,
     );
   return { origin, token, owner };
 }

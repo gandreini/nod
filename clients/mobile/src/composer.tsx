@@ -1,4 +1,4 @@
-import { ArrowUp, Mic, Plus, Square, X } from 'lucide-react-native';
+import { ArrowUp, Mic, Plus, Square, X } from './icons';
 import { DraftStrip } from './attachment-views';
 import { sendable, type Draft } from './attachments';
 import { useState } from 'react';
@@ -35,13 +35,13 @@ export function Composer({
   onCancelRecording(): void;
   onSendRecording(): void;
   drafts?: Draft[];
-  onAttach?(): void;
-  onRemoveDraft?(id: string): void;
-  onRetryDraft?(id: string): void;
+  onAttach(): void;
+  onRemoveDraft(id: string): void;
+  onRetryDraft(id: string): void;
 }) {
-  const typed = draft.trim().length > 0 || drafts.length > 0;
+  const hasContent = draft.trim().length > 0 || drafts.length > 0;
   const canSend = sendable(draft, drafts);
-  const showStop = working && !typed;
+  const showStop = working && !hasContent;
   const [height, setHeight] = useState(52);
   return (
     <View
@@ -51,20 +51,13 @@ export function Composer({
         {
           borderRadius: height <= 60 ? height / 2 : 28,
           backgroundColor: theme.surface,
-          borderColor: theme.dark ? 'rgba(250,250,250,0.08)' : 'rgba(25,25,25,0.06)',
-          boxShadow: theme.dark
-            ? '0 8px 32px rgba(0,0,0,0.45), 0 1px 2px rgba(0,0,0,0.3)'
-            : '0 8px 32px rgba(25,25,25,0.07), 0 1px 3px rgba(25,25,25,0.04)',
+          borderColor: theme.hairline,
+          boxShadow: theme.shadow.raised,
         },
       ]}
     >
       {!recording && drafts.length ? (
-        <DraftStrip
-          drafts={drafts}
-          theme={theme}
-          onRemove={(id) => onRemoveDraft?.(id)}
-          onRetry={(id) => onRetryDraft?.(id)}
-        />
+        <DraftStrip drafts={drafts} theme={theme} onRemove={onRemoveDraft} onRetry={onRetryDraft} />
       ) : null}
       <View style={styles.row}>
         {recording ? (
@@ -81,7 +74,7 @@ export function Composer({
             >
               <X size={18} color={theme.foreground} />
             </Pressable>
-            <View style={styles.recording} accessibilityLiveRegion="polite">
+            <View style={styles.recording}>
               <Text style={[styles.timer, { color: theme.foreground }]}>
                 {clock(recording.seconds)}
               </Text>
@@ -104,20 +97,18 @@ export function Composer({
           </>
         ) : (
           <>
-            {onAttach ? (
-              <Pressable
-                onPress={onAttach}
-                disabled={!ready}
-                accessibilityRole="button"
-                accessibilityLabel="Add a photo or file"
-                style={({ pressed }) => [
-                  styles.sendButton,
-                  { backgroundColor: pressed ? theme.controlActive : 'transparent' },
-                ]}
-              >
-                <Plus size={22} color={theme.foreground} />
-              </Pressable>
-            ) : null}
+            <Pressable
+              onPress={onAttach}
+              disabled={!ready}
+              accessibilityRole="button"
+              accessibilityLabel="Add a photo or file"
+              style={({ pressed }) => [
+                styles.sendButton,
+                { backgroundColor: pressed ? theme.controlActive : 'transparent' },
+              ]}
+            >
+              <Plus size={22} color={theme.foreground} />
+            </Pressable>
             <TextInput
               value={draft}
               onChangeText={onDraft}
@@ -127,11 +118,11 @@ export function Composer({
               selectionColor={theme.primary}
               selectionHandleColor={theme.accent}
               multiline
-              style={[styles.input, { color: theme.foreground, marginLeft: onAttach ? 0 : 12 }]}
+              style={[styles.input, { color: theme.foreground }]}
               testID="composer-input"
               accessibilityLabel="Message"
             />
-            {!typed ? (
+            {!hasContent ? (
               <Pressable
                 onPress={onRecord}
                 disabled={!ready}
@@ -155,9 +146,9 @@ export function Composer({
                   { backgroundColor: pressed ? theme.controlActive : theme.control },
                 ]}
               >
-                <Square size={14} color={theme.foreground} fill={theme.foreground} />
+                <Square size={14} color={theme.foreground} solid />
               </Pressable>
-            ) : typed ? (
+            ) : hasContent ? (
               <Pressable
                 onPress={onSubmit}
                 disabled={!ready || !canSend}

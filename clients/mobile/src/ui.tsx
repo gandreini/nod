@@ -1,6 +1,6 @@
-import { ChevronLeft, RefreshCw } from 'lucide-react-native';
+import { ChevronLeft, ChevronRight, RefreshCw } from './icons';
 import { router } from 'expo-router';
-import type { ComponentType, ReactNode } from 'react';
+import { useEffect, useState, type ComponentType, type ReactNode } from 'react';
 import {
   ActivityIndicator,
   Pressable,
@@ -13,6 +13,7 @@ import {
   type ViewStyle,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
+import { NodGlyph } from './nod-mark';
 import { font, radius, useTheme, type Theme } from './theme';
 
 export type Icon = ComponentType<{ size?: number; color?: string; strokeWidth?: number }>;
@@ -33,6 +34,10 @@ export function Page({
   children: ReactNode;
 }) {
   const theme = useTheme();
+  const [pulled, setPulled] = useState(false);
+  useEffect(() => {
+    if (!refreshing) setPulled(false);
+  }, [refreshing]);
   return (
     <SafeAreaView edges={['top']} style={[styles.fill, { backgroundColor: theme.background }]}>
       <View style={styles.header}>
@@ -60,8 +65,11 @@ export function Page({
         refreshControl={
           onRefresh ? (
             <RefreshControl
-              refreshing={Boolean(refreshing)}
-              onRefresh={onRefresh}
+              refreshing={pulled && Boolean(refreshing)}
+              onRefresh={() => {
+                setPulled(true);
+                onRefresh();
+              }}
               tintColor={theme.accent}
               colors={[theme.accent]}
               progressBackgroundColor={theme.surface}
@@ -196,11 +204,33 @@ export function Empty({
 }
 
 export function Loading() {
-  const theme = useTheme();
-  return <ActivityIndicator style={styles.loading} color={theme.accent} />;
+  return (
+    <View style={styles.loading} accessibilityRole="progressbar" accessibilityLabel="Loading">
+      <NodGlyph size={32} />
+    </View>
+  );
 }
 
-export function tone(theme: Theme, kind: 'attention' | 'error' | 'quiet' | 'good') {
+export function Loaded<T>({
+  resource,
+  label,
+  children,
+}: {
+  resource: { data?: T; error?: string; reload(): unknown };
+  label: string;
+  children(data: T): ReactNode;
+}) {
+  return (
+    <>
+      {resource.error ? (
+        <Notice text={`${label} did not load: ${resource.error}`} onRetry={resource.reload} />
+      ) : null}
+      {resource.data !== undefined ? children(resource.data) : resource.error ? null : <Loading />}
+    </>
+  );
+}
+
+function tone(theme: Theme, kind: 'attention' | 'error' | 'quiet' | 'good') {
   return {
     attention: { background: theme.accentSoft, color: theme.accent },
     error: { background: theme.errorSoft, color: theme.error },
@@ -235,6 +265,62 @@ export function Meta({ icon: IconComponent, children }: { icon?: Icon; children:
       {IconComponent ? <IconComponent size={14} color={theme.mutedForeground} /> : null}
       <Text style={[styles.small, styles.fill, { color: theme.mutedForeground }]}>{children}</Text>
     </View>
+  );
+}
+
+export function Group({ children }: { children: ReactNode }) {
+  const theme = useTheme();
+  return (
+    <View style={[styles.group, { backgroundColor: theme.surface, borderColor: theme.border }]}>
+      {children}
+    </View>
+  );
+}
+
+export function Row({
+  icon: RowIcon,
+  title,
+  detail,
+  first,
+  danger,
+  onPress,
+}: {
+  icon: Icon;
+  title: string;
+  detail?: string;
+  first?: boolean;
+  danger?: boolean;
+  onPress?: () => void;
+}) {
+  const theme = useTheme();
+  const color = danger ? theme.error : theme.foreground;
+  return (
+    <Pressable
+      onPress={onPress}
+      disabled={!onPress}
+      accessibilityRole={onPress ? 'button' : undefined}
+      style={({ pressed }) => [
+        styles.row,
+        {
+          backgroundColor: pressed ? theme.controlActive : 'transparent',
+          borderTopColor: theme.border,
+          borderTopWidth: first ? 0 : StyleSheet.hairlineWidth,
+        },
+      ]}
+    >
+      <View style={[styles.glyph, { backgroundColor: danger ? theme.errorSoft : theme.muted }]}>
+        <RowIcon size={18} color={danger ? theme.error : theme.secondary} />
+      </View>
+      <View style={styles.fill}>
+        <Text style={[text.label, { color }]}>{title}</Text>
+        {detail ? (
+          <Text style={[text.small, { color: theme.mutedForeground }]} numberOfLines={1}>
+            {detail}
+          </Text>
+        ) : null}
+      </View>
+      {onPress && !danger ? <ChevronRight size={18} color={theme.mutedForeground} /> : null}
+    </Pressable>
   );
 }
 
@@ -310,7 +396,7 @@ const styles = StyleSheet.create({
     marginBottom: 4,
   },
   emptyTitle: { fontFamily: font.semibold, fontSize: 20, letterSpacing: -0.4 },
-  loading: { paddingVertical: 48 },
+  loading: { flexGrow: 1, alignItems: 'center', justifyContent: 'center', paddingVertical: 48 },
   pill: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -321,4 +407,20 @@ const styles = StyleSheet.create({
   },
   pillText: { fontFamily: font.medium, fontSize: 12 },
   meta: { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  group: { borderWidth: 1, borderRadius: radius.card, overflow: 'hidden' },
+  row: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+    minHeight: 56,
+    paddingHorizontal: 16,
+    paddingVertical: 12,
+  },
+  glyph: {
+    width: 32,
+    height: 32,
+    borderRadius: radius.control,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
 });

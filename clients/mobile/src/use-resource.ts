@@ -1,10 +1,25 @@
 import { useFocusEffect } from 'expo-router';
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { ApiError, request } from './api';
+import { ApiError, errorText, refusedAccess, request, tokenRefused } from './api';
 import { useNod } from './nod-context';
 
-export function describe(error: unknown) {
-  return error instanceof Error ? error.message : String(error);
+export function useRequest() {
+  const { connection, refused } = useNod();
+  return useCallback(
+    async <T = unknown>(path: string, method: Parameters<typeof request>[2], body?: unknown) => {
+      try {
+        return await request<T>(connection, path, method, body);
+      } catch (problem) {
+        if (problem instanceof ApiError && problem.status === 401) {
+          const notice = tokenRefused(connection.origin);
+          refused(notice);
+          throw new Error(notice);
+        }
+        throw new Error(refusedAccess(problem) ?? errorText(problem));
+      }
+    },
+    [connection, refused],
+  );
 }
 
 export function useResource<T>(path: string, options: { optional?: boolean } = {}) {
@@ -27,14 +42,8 @@ export function useResource<T>(path: string, options: { optional?: boolean } = {
       if (call !== latest.current) return;
       if (optional && problem instanceof ApiError && problem.status === 403) return;
       if (problem instanceof ApiError && problem.status === 401)
-        return refused(
-          `${new URL(connection.origin).host} no longer accepts the saved token (HTTP 401). Connect again with the current token.`,
-        );
-      setError(
-        problem instanceof ApiError && problem.status === 403
-          ? `The server refused the request: ${problem.message}`
-          : describe(problem),
-      );
+        return refused(tokenRefused(connection.origin));
+      setError(refusedAccess(problem) ?? errorText(problem));
     } finally {
       if (call === latest.current) setLoading(false);
     }

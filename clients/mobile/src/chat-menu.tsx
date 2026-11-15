@@ -1,17 +1,17 @@
 import { router, type Href } from 'expo-router';
+import { useState } from 'react';
+import { Modal, Pressable, StyleSheet, Text, View } from 'react-native';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import {
   Blocks,
   CalendarClock,
   Ellipsis,
   Gauge,
-  Palette,
+  LayoutGrid,
   Server,
   Settings,
   Vault,
-} from 'lucide-react-native';
-import { useState } from 'react';
-import { Modal, Pressable, StyleSheet, Text, View } from 'react-native';
-import { useSafeAreaInsets } from 'react-native-safe-area-context';
+} from './icons';
 import { font, radius, type Theme } from './theme';
 import type { Icon } from './ui';
 
@@ -22,20 +22,10 @@ const items: Array<{ icon: Icon; label: string; href: Href }> = [
   { icon: Vault, label: 'Vault', href: '/vault' },
   { icon: Settings, label: 'Settings', href: '/settings' },
   { icon: Server, label: 'Server', href: '/server' },
-  ...(__DEV__ ? [{ icon: Palette, label: 'UI gallery', href: '/gallery' as Href }] : []),
+  ...(__DEV__ ? [{ icon: LayoutGrid, label: 'UI gallery', href: '/gallery' as Href }] : []),
 ];
 
-export function floatingShadow(theme: Theme) {
-  return {
-    shadowColor: theme.shadow,
-    shadowOffset: { width: 0, height: 4 },
-    shadowOpacity: theme.dark ? 0.4 : 0.08,
-    shadowRadius: 16,
-    elevation: 4,
-  };
-}
-
-export function ChatMenu({ theme, attention }: { theme: Theme; attention?: boolean }) {
+export function ChatMenu({ theme }: { theme: Theme }) {
   const insets = useSafeAreaInsets();
   const [open, setOpen] = useState(false);
   const top = insets.top + 8;
@@ -55,34 +45,35 @@ export function ChatMenu({ theme, attention }: { theme: Theme; attention?: boole
         hitSlop={8}
         style={({ pressed }) => [
           styles.button,
-          floatingShadow(theme),
           {
             top,
+            boxShadow: theme.shadow.floating,
             backgroundColor: pressed ? theme.controlActive : theme.surface,
             borderColor: theme.border,
           },
         ]}
       >
         <Ellipsis size={22} color={theme.foreground} />
-        {attention ? (
-          <View
-            style={[styles.dot, { backgroundColor: theme.primary, borderColor: theme.surface }]}
-          />
-        ) : null}
       </Pressable>
       <Modal visible={open} transparent animationType="fade" onRequestClose={() => setOpen(false)}>
-        <Pressable
-          style={styles.backdrop}
-          onPress={() => setOpen(false)}
-          accessibilityLabel="Close menu"
-        >
+        <View style={styles.backdrop}>
+          <Pressable
+            style={StyleSheet.absoluteFill}
+            onPress={() => setOpen(false)}
+            accessible={false}
+          />
           <View
+            accessibilityViewIsModal
+            onAccessibilityEscape={() => setOpen(false)}
             style={[
               styles.menu,
-              floatingShadow(theme),
-              { top: top + 52, backgroundColor: theme.surface, borderColor: theme.border },
+              {
+                top: top + 52,
+                backgroundColor: theme.surface,
+                borderColor: theme.border,
+                boxShadow: theme.shadow.floating,
+              },
             ]}
-            onStartShouldSetResponder={() => true}
           >
             {items.map(({ icon: ItemIcon, label, href }, index) => (
               <Pressable
@@ -103,7 +94,7 @@ export function ChatMenu({ theme, attention }: { theme: Theme; attention?: boole
               </Pressable>
             ))}
           </View>
-        </Pressable>
+        </View>
       </Modal>
     </>
   );
@@ -120,15 +111,6 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
     zIndex: 3,
-  },
-  dot: {
-    position: 'absolute',
-    top: 8,
-    right: 8,
-    width: 10,
-    height: 10,
-    borderRadius: 5,
-    borderWidth: 2,
   },
   backdrop: { flex: 1 },
   menu: {

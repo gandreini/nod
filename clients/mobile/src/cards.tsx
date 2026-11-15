@@ -1,10 +1,9 @@
 import { CryptoDigestAlgorithm, digestStringAsync } from 'expo-crypto';
-import { Check, Link2, LoaderCircle, X } from 'lucide-react-native';
+import { Check, LoaderCircle, X } from './icons';
 import { useEffect, useState, type ReactNode } from 'react';
-import { ActivityIndicator, Image, Linking, Pressable, StyleSheet, Text, View } from 'react-native';
-import { integrationServiceIds } from '../../../src/shared/integrations';
-import { parse, SvgAst, type JsxAST } from 'react-native-svg';
-import { appSetupStatus } from './api';
+import { ActivityIndicator, Linking, Pressable, StyleSheet, Text, View } from 'react-native';
+import { appSetupStatus, errorText } from './api';
+import { AppLogo } from './app-logo';
 import type { Connection } from './connection';
 import {
   choiceAnswerText,
@@ -15,17 +14,13 @@ import {
 } from './contracts';
 import { font, radius, type Theme } from './theme';
 
-export type AnswerOutcome = 'sent' | 'unavailable';
+type AnswerOutcome = 'sent' | 'unavailable';
 export type Answer = (reply: {
   replyToMessageId: string;
   text: string;
   questionAnswer?: QuestionAnswer;
   approvalAnswer?: { approvalId: string; approved: boolean };
 }) => Promise<AnswerOutcome>;
-
-function describe(error: unknown) {
-  return error instanceof Error ? error.message : String(error);
-}
 
 function useAnswer(onAnswer: Answer) {
   const [busy, setBusy] = useState(false);
@@ -40,7 +35,7 @@ function useAnswer(onAnswer: Answer) {
       if (outcome === 'unavailable') setError('This can no longer be answered here.');
       else setSent(true);
     } catch (problem) {
-      setError(describe(problem));
+      setError(errorText(problem));
     } finally {
       setBusy(false);
     }
@@ -53,7 +48,7 @@ function Card({ theme, children }: { theme: Theme; children: ReactNode }) {
     <View
       style={[
         styles.card,
-        { backgroundColor: theme.surface, borderColor: theme.border, shadowColor: theme.shadow },
+        { backgroundColor: theme.surface, borderColor: theme.border, boxShadow: theme.shadow.card },
       ]}
     >
       {children}
@@ -78,6 +73,7 @@ function Row({
   theme,
   first,
   disabled,
+  selected,
   onPress,
   label,
   children,
@@ -85,6 +81,7 @@ function Row({
   theme: Theme;
   first?: boolean;
   disabled?: boolean;
+  selected?: boolean;
   onPress: () => void;
   label: string;
   children: ReactNode;
@@ -95,7 +92,7 @@ function Row({
       disabled={disabled}
       accessibilityRole="button"
       accessibilityLabel={label}
-      accessibilityState={{ disabled }}
+      accessibilityState={{ disabled, selected }}
       style={({ pressed }) => [
         styles.row,
         {
@@ -161,6 +158,7 @@ export function ChoiceCard({
             theme={theme}
             first={index === 0}
             disabled={locked}
+            selected={choices.multiple ? on : undefined}
             label={label}
             onPress={() =>
               choices.multiple
@@ -302,76 +300,6 @@ export function ApprovalCard({
 export const connectLink =
   /\[([^\]]+)\]\(<?(\/apps\?connect=([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}))>?\)/gi;
 
-type Logo = { kind: 'svg'; ast: JsxAST } | { kind: 'raster'; uri: string } | null;
-
-const logos = new Map<string, Promise<Logo>>();
-const rasterExtension = /\.(png|webp|jpe?g|ico|gif)(\?|$)/i;
-
-function loadLogo(uri: string): Promise<Logo> {
-  let pending = logos.get(uri);
-  if (!pending) {
-    pending = rasterExtension.test(uri)
-      ? Promise.resolve({ kind: 'raster', uri })
-      : fetch(uri)
-          .then(async (response): Promise<Logo> => {
-            if (!response.ok) return null;
-            const type = response.headers.get('content-type') ?? '';
-            if (type.startsWith('image/') && !type.includes('svg')) return { kind: 'raster', uri };
-            const ast = parse(await response.text());
-            return ast ? { kind: 'svg', ast } : null;
-          })
-          .catch(() => null);
-    logos.set(uri, pending);
-  }
-  return pending;
-}
-
-const bundled = new Set<string>(integrationServiceIds);
-
-export function AppLogo({
-  slug,
-  logoUrl,
-  origin,
-  theme,
-  size = 24,
-}: {
-  slug?: string;
-  logoUrl?: string;
-  origin: string;
-  theme: Theme;
-  size?: number;
-}) {
-  const base = slug?.replace(/_mcp$/, '');
-  const uri = base && bundled.has(base) ? `${origin}/logos/${base}.svg` : logoUrl;
-  const [logo, setLogo] = useState<Logo | undefined>();
-  const [failed, setFailed] = useState(false);
-  useEffect(() => {
-    let active = true;
-    setLogo(undefined);
-    setFailed(false);
-    if (uri)
-      void loadLogo(uri).then((value) => {
-        if (active) setLogo(value);
-      });
-    return () => {
-      active = false;
-    };
-  }, [uri]);
-  if (uri && logo === undefined) return <View style={{ width: size, height: size }} />;
-  if (logo?.kind === 'svg')
-    return <SvgAst ast={logo.ast} override={{ width: size, height: size }} />;
-  if (logo?.kind === 'raster' && !failed)
-    return (
-      <Image
-        source={{ uri: logo.uri }}
-        style={{ width: size, height: size }}
-        resizeMode="contain"
-        onError={() => setFailed(true)}
-      />
-    );
-  return <Link2 size={size} color={theme.mutedForeground} />;
-}
-
 export function ConnectAppCard({
   title,
   path,
@@ -387,10 +315,12 @@ export function ConnectAppCard({
 }) {
   const [app, setApp] = useState<AppSetupStatus['apps'][number]>();
   const [completed, setCompleted] = useState(false);
+  const [error, setError] = useState<string>();
 
   useEffect(() => {
     let active = true;
     const id = connectionId.toLowerCase();
+    setError(undefined);
     digestStringAsync(CryptoDigestAlgorithm.SHA256, `/apps?connect=${id}`)
       .then((hash) => appSetupStatus(connection, [hash], [id]).then((status) => ({ hash, status })))
       .then(({ hash, status }) => {
@@ -398,7 +328,9 @@ export function ConnectAppCard({
         setCompleted(status.completed.includes(hash));
         setApp(status.apps.find((item) => item.hash === hash));
       })
-      .catch(() => {});
+      .catch((problem) => {
+        if (active) setError(`Could not check this app: ${errorText(problem)}`);
+      });
     return () => {
       active = false;
     };
@@ -407,6 +339,7 @@ export function ConnectAppCard({
   const name = app?.name ?? 'App';
   const expired = !completed && app?.available === false;
   const label = completed ? 'Connected' : expired ? 'Expired' : 'Connect';
+  const off = completed || expired;
 
   return (
     <View style={[styles.connectWrap, { backgroundColor: theme.muted }]}>
@@ -418,30 +351,30 @@ export function ConnectAppCard({
         </Text>
         <Pressable
           onPress={() => void Linking.openURL(`${connection.origin}${path}`)}
-          disabled={completed || expired}
+          disabled={off}
           accessibilityRole="button"
           accessibilityLabel={`${label} ${name}`}
-          accessibilityState={{ disabled: completed || expired }}
+          accessibilityState={{ disabled: off }}
           style={({ pressed }) => [
             styles.pill,
-            {
-              backgroundColor:
-                completed || expired ? theme.muted : pressed ? theme.primaryPressed : theme.primary,
-            },
+            { backgroundColor: off ? theme.muted : pressed ? theme.primaryPressed : theme.primary },
           ]}
         >
           <Text
             style={[
               styles.pillText,
-              {
-                color: completed || expired ? theme.mutedForeground : theme.primaryForeground,
-              },
+              { color: off ? theme.mutedForeground : theme.primaryForeground },
             ]}
           >
             {label}
           </Text>
         </Pressable>
       </View>
+      {error ? (
+        <Text style={[styles.caption, { color: theme.error }]} accessibilityLiveRegion="polite">
+          {error}
+        </Text>
+      ) : null}
     </View>
   );
 }
@@ -452,10 +385,6 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderRadius: radius.bubble,
     overflow: 'hidden',
-    shadowOffset: { width: 0, height: 1 },
-    shadowOpacity: 0.04,
-    shadowRadius: 2,
-    elevation: 1,
   },
   heading: { paddingHorizontal: 16, paddingTop: 16, paddingBottom: 12, gap: 4 },
   title: { fontFamily: font.medium, fontSize: 16, lineHeight: 24 },

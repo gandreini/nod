@@ -1,4 +1,5 @@
 import type { Connection } from './connection';
+import { ownedArtifact } from './links';
 import type {
   Artifact,
   AppSetupStatus,
@@ -21,13 +22,29 @@ export class ApiError extends Error {
   }
 }
 
+export function errorText(error: unknown) {
+  return error instanceof Error ? error.message : String(error);
+}
+
+export function refusedAccess(problem: unknown) {
+  return problem instanceof ApiError && problem.status === 403
+    ? `The server refused the request: ${problem.message}`
+    : undefined;
+}
+
+export function tokenRefused(origin: string, status = 401) {
+  return `${new URL(origin).host} no longer accepts the saved token (HTTP ${status}). Connect again with the current token.`;
+}
+
 type Method = 'GET' | 'POST' | 'PATCH' | 'PUT' | 'DELETE';
 
 export async function read<T>(response: Response): Promise<T> {
   const text = await response.text();
   let data: unknown;
+  let parsed = false;
   try {
     data = text ? JSON.parse(text) : undefined;
+    parsed = true;
   } catch {}
   if (!response.ok) {
     const detail = data as
@@ -46,6 +63,11 @@ export async function read<T>(response: Response): Promise<T> {
       reason,
     );
   }
+  if (text && !parsed)
+    throw new ApiError(
+      response.status,
+      `${response.url ? new URL(response.url).host : 'The server'} did not answer with JSON (HTTP ${response.status})`,
+    );
   return data as T;
 }
 
@@ -58,16 +80,19 @@ export async function request<T>(
   path: string,
   method: Method = 'GET',
   body?: unknown,
+  signal?: AbortSignal,
 ): Promise<T> {
+  const form = body instanceof FormData;
   let response: Response;
   try {
     response = await fetch(`${connection.origin}${path}`, {
       method,
       headers: {
         Authorization: `Bearer ${connection.token}`,
-        ...(body === undefined ? {} : { 'Content-Type': 'application/json' }),
+        ...(body === undefined || form ? {} : { 'Content-Type': 'application/json' }),
       },
-      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+      ...(body === undefined ? {} : { body: form ? body : JSON.stringify(body) }),
+      signal,
     });
   } catch (error) {
     throw unreachable(connection, error);
@@ -119,34 +144,16 @@ export function appSetupStatus(connection: Connection, hashes: string[], connect
 }
 
 export function stopThread(connection: Connection) {
-  return api<{ ok: true }>(connection, '/api/thread/stop', {});
+  return request<{ ok: true }>(connection, '/api/thread/stop', 'POST');
 }
 
 export function artifactSource(connection: Connection, url: string) {
+  if (!ownedArtifact(url))
+    throw new Error(`${url} is not a Nod file address, so Nod did not send it your token.`);
   return {
     uri: `${connection.origin}${url}`,
     headers: { Authorization: `Bearer ${connection.token}` },
   };
-}
-
-async function postForm<T>(
-  connection: Connection,
-  path: string,
-  form: FormData,
-  signal?: AbortSignal,
-) {
-  let response: Response;
-  try {
-    response = await fetch(`${connection.origin}${path}`, {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${connection.token}` },
-      body: form,
-      signal,
-    });
-  } catch (error) {
-    throw unreachable(connection, error);
-  }
-  return read<T>(response);
 }
 
 export function postAudio(
@@ -161,11 +168,11 @@ export function postAudio(
     JSON.stringify({ clientMessageId: input.id, threadId: input.threadId, text: '' }),
   );
   form.append('file', file, name);
-  return postForm<SubmitMessageResponse>(connection, '/api/messages/audio', form);
+  return request<SubmitMessageResponse>(connection, '/api/messages/audio', 'POST', form);
 }
 
 export function postUpload(connection: Connection, file: Blob, name: string, signal?: AbortSignal) {
   const form = new FormData();
   form.append('file', file, name);
-  return postForm<Artifact>(connection, '/api/uploads', form, signal);
+  return request<Artifact>(connection, '/api/uploads', 'POST', form, signal);
 }

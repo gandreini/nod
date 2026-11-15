@@ -13,10 +13,8 @@ import { checkServer, type Connection } from './connection';
 import { NodMark } from './nod-mark';
 import { saveConnection } from './stored-connection';
 import { font, radius, useTheme } from './theme';
-
-function message(error: unknown) {
-  return error instanceof Error ? error.message : String(error);
-}
+import { errorText } from './api';
+import { Notice } from './ui';
 
 export function ConnectScreen({
   notice,
@@ -33,6 +31,7 @@ export function ConnectScreen({
   const [focused, setFocused] = useState<'url' | 'token' | null>(null);
 
   async function connect() {
+    if (disabled) return;
     setBusy(true);
     setError(undefined);
     try {
@@ -41,7 +40,7 @@ export function ConnectScreen({
       setToken('');
       onConnected(connection);
     } catch (problem) {
-      setError(message(problem));
+      setError(errorText(problem));
     } finally {
       setBusy(false);
     }
@@ -115,13 +114,7 @@ export function ConnectScreen({
             onSubmitEditing={connect}
           />
         </View>
-        {error ? (
-          <View style={[styles.notice, { backgroundColor: theme.errorSoft }]}>
-            <Text style={[styles.small, { color: theme.error }]} accessibilityLiveRegion="polite">
-              {error}
-            </Text>
-          </View>
-        ) : null}
+        {error ? <Notice text={error} /> : null}
         <Pressable
           testID="connect-submit"
           onPress={connect}
@@ -163,7 +156,6 @@ const styles = StyleSheet.create({
   form: { flexGrow: 1, justifyContent: 'center', padding: 24, gap: 16 },
   title: { fontFamily: font.semibold, fontSize: 28, lineHeight: 34, letterSpacing: -0.6 },
   body: { fontFamily: font.regular, fontSize: 16, lineHeight: 24 },
-  small: { fontFamily: font.regular, fontSize: 14, lineHeight: 20 },
   group: { gap: 8 },
   label: { fontFamily: font.medium, fontSize: 14 },
   field: {
@@ -174,7 +166,6 @@ const styles = StyleSheet.create({
     fontFamily: font.regular,
     fontSize: 16,
   },
-  notice: { borderRadius: radius.card, padding: 12 },
   button: {
     minHeight: 48,
     borderRadius: radius.full,

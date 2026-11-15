@@ -5,12 +5,27 @@ name: Send a message and see the answer arrive
 - extendedWaitUntil:
     visible: Synthetic history ready
     timeout: 15000
+- runScript:
+    file: ../scripts/counts.js
+- evalScript: ${output.before = output.counts.userMessages}
 - tapOn:
     id: composer-input
 - inputText: Hello from the end-to-end test
 - tapOn:
     id: composer-send
 - assertVisible: Hello from the end-to-end test
+- repeat:
+    times: 20
+    while:
+      true: ${output.counts.userMessages == output.before}
+    commands:
+      - extendedWaitUntil:
+          visible: Never shown on screen
+          timeout: 300
+          optional: true
+      - runScript:
+          file: ../scripts/counts.js
+- assertTrue: ${output.counts.userMessages == output.before + 1}
 - runScript:
     file: ../scripts/control.js
     env:
