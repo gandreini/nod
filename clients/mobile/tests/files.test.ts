@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
-import { conversationFiles, fileView } from '../src/files.ts';
+import { conversationFiles, fileView } from '../src/files/files.ts';
 
 const id = (n: number) => `00000000-0000-4000-8000-00000000000${n}`;
 const file = (n: number, name: string, mimeType: string, size = 100) => ({

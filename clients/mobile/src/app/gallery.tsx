@@ -1,5 +1,5 @@
 import { Redirect } from 'expo-router';
-import { GalleryScreen } from '../screens/gallery';
+import { GalleryScreen } from '../sections/gallery';
 
 export default function Gallery() {
   return __DEV__ ? <GalleryScreen /> : <Redirect href="/" />;

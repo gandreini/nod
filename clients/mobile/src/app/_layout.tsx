@@ -10,16 +10,16 @@ import { StatusBar } from 'expo-status-bar';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { View } from 'react-native';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
-import { ConnectScreen } from '../connect-screen';
-import type { Connection } from '../connection';
-import { clearDownloads } from '../downloads';
-import { FileViewerProvider } from '../file-viewer';
-import { NodGlyph } from '../nod-mark';
-import { NodProvider } from '../nod-context';
-import { forgetPending } from '../pending-voice';
-import { forgetConnection, loadConnection } from '../stored-connection';
-import { useTheme } from '../theme';
-import { errorText } from '../api';
+import { ConnectScreen } from '../connection/connect-screen';
+import type { Connection } from '../connection/connection';
+import { clearDownloads } from '../files/downloads';
+import { FileViewerProvider } from '../files/file-viewer';
+import { NodGlyph } from '../ui/nod-mark';
+import { NodProvider } from '../connection/nod-context';
+import { forgetPending } from '../voice/pending-voice';
+import { forgetConnection, loadConnection } from '../connection/stored-connection';
+import { useTheme } from '../ui/theme';
+import { errorText } from '../connection/api';
 
 type State =
   | { name: 'loading' }

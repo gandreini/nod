@@ -1,3 +1,3 @@
-import { UsageScreen } from '../screens/usage';
+import { UsageScreen } from '../sections/usage';
 
 export default UsageScreen;

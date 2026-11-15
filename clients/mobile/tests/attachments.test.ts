@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
 import { fileBytes } from '../../../src/shared/files.ts';
-import { attachmentIds, checkSize, sendable, type Draft } from '../src/attachments.ts';
+import { attachmentIds, checkSize, sendable, type Draft } from '../src/files/attachments.ts';
 
 function draft(id: string, state: Draft['state']): Draft {
   return {

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
-import { imageArtifact, safeLink } from '../src/links.ts';
+import { imageArtifact, safeLink } from '../src/connection/links.ts';
 
 const origin = 'https://nod.example.com';
 const id = '0b6f8c1e-2a3d-4e5f-8a9b-0c1d2e3f4a5b';

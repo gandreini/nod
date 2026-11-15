@@ -1,10 +1,10 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { describe, test } from 'node:test';
-import { getState, postAudio, postUpload, sendText } from '../src/api.ts';
-import type { Outgoing } from '../src/chat-state.ts';
-import type { Connection } from '../src/connection.ts';
-import { createOutbox } from '../src/outbox.ts';
+import { getState, postAudio, postUpload, sendText } from '../src/connection/api.ts';
+import type { Outgoing } from '../src/chat/chat-state.ts';
+import type { Connection } from '../src/connection/connection.ts';
+import { createOutbox } from '../src/chat/outbox.ts';
 import { startFakeServer } from './fake-server.ts';
 
 const threadId = '00000000-0000-4000-8000-000000000001';

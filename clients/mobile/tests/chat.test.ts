@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { after, before, describe, test } from 'node:test';
-import { ApiError, getState, read, sendText } from '../src/api.ts';
-import { choiceAnswerText } from '../src/contracts.ts';
+import { ApiError, getState, read, sendText } from '../src/connection/api.ts';
+import { choiceAnswerText } from '../src/connection/contracts.ts';
 import {
   keepOlder,
   mergeMessages,
@@ -10,8 +10,8 @@ import {
   voiceStep,
   workState,
   type Outgoing,
-} from '../src/chat-state.ts';
-import type { Activity, Message } from '../src/contracts.ts';
+} from '../src/chat/chat-state.ts';
+import type { Activity, Message } from '../src/connection/contracts.ts';
 import { startFakeServer } from './fake-server.ts';
 
 function message(id: string, createdAt: string, text = id): Message {

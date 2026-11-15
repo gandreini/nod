@@ -3,8 +3,8 @@ import { randomBytes } from 'node:crypto';
 import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { after, before, describe, test } from 'node:test';
-import { ConnectionProblem, checkServer, serverOrigin } from '../src/connection.ts';
-import { monthlyLimit } from '../src/money.ts';
+import { ConnectionProblem, checkServer, serverOrigin } from '../src/connection/connection.ts';
+import { monthlyLimit } from '../src/sections/money.ts';
 import { startFakeServer } from './fake-server.ts';
 
 function problem(kind: ConnectionProblem['kind']) {

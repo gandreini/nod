@@ -1,3 +1,3 @@
-import { ScheduledScreen } from '../screens/scheduled';
+import { ScheduledScreen } from '../sections/scheduled';
 
 export default ScheduledScreen;

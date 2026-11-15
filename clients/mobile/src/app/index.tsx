@@ -1,3 +1,3 @@
-import { ChatScreen } from '../chat-screen';
+import { ChatScreen } from '../chat/chat-screen';
 
 export default ChatScreen;

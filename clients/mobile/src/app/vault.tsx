@@ -1,3 +1,3 @@
-import { VaultScreen } from '../screens/vault';
+import { VaultScreen } from '../sections/vault';
 
 export default VaultScreen;

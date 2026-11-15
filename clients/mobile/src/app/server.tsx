@@ -1,3 +1,3 @@
-import { ServerScreen } from '../screens/server';
+import { ServerScreen } from '../sections/server';
 
 export default ServerScreen;

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
-import { wavBars } from '../src/waveform.ts';
+import { wavBars } from '../src/voice/waveform.ts';
 
 function wav(samples: number[], rate = 16000) {
   const data = new Int16Array(samples.map((value) => Math.round(value * 32767)));
