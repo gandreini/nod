@@ -1,0 +1,87 @@
+appId: com.gandreini.nod.e2e
+name: Use Nod's browser in the bottom panel
+---
+- launchApp
+- extendedWaitUntil:
+    visible: Synthetic history ready
+    timeout: 15000
+- runScript:
+    file: ../scripts/control.js
+    env:
+      ROUTE: /fixture/handoff
+      BODY: '{"open":true,"text":"Synthetic page needs you"}'
+- extendedWaitUntil:
+    visible: Return to Nod
+    timeout: 10000
+- extendedWaitUntil:
+    visible:
+      id: browser-frame
+    timeout: 15000
+- extendedWaitUntil:
+    visible: You have control
+    timeout: 10000
+- tapOn:
+    id: browser-frame
+- runScript:
+    file: ../scripts/counts.js
+- repeat:
+    times: 20
+    while:
+      true: ${!(output.counts.browser.mouse >= 3)}
+    commands:
+      - extendedWaitUntil:
+          visible: Never shown on screen
+          timeout: 300
+          optional: true
+      - runScript:
+          file: ../scripts/counts.js
+- assertTrue: ${output.counts.browser.mouse >= 3}
+- tapOn: Type on the page
+- inputText: hi
+- pressKey: Enter
+- runScript:
+    file: ../scripts/counts.js
+- repeat:
+    times: 20
+    while:
+      true: ${!(output.counts.browser.text >= 1 && output.counts.browser.key >= 1)}
+    commands:
+      - extendedWaitUntil:
+          visible: Never shown on screen
+          timeout: 300
+          optional: true
+      - runScript:
+          file: ../scripts/counts.js
+- assertTrue: ${output.counts.browser.text >= 1 && output.counts.browser.key >= 1}
+- assertVisible: Return to Nod
+- tapOn: Close the browser
+- extendedWaitUntil:
+    notVisible: Return to Nod
+    timeout: 5000
+- assertVisible: Synthetic page needs you
+- tapOn: Open browser
+- extendedWaitUntil:
+    visible: You have control
+    timeout: 15000
+- tapOn: Return to Nod
+- runScript:
+    file: ../scripts/counts.js
+- repeat:
+    times: 20
+    while:
+      true: ${!(output.counts.browser.done >= 1)}
+    commands:
+      - extendedWaitUntil:
+          visible: Never shown on screen
+          timeout: 300
+          optional: true
+      - runScript:
+          file: ../scripts/counts.js
+- assertTrue: ${output.counts.browser.done == 1}
+- extendedWaitUntil:
+    notVisible: Return to Nod
+    timeout: 5000
+- extendedWaitUntil:
+    visible: Control returned to Nod.*
+    timeout: 5000
+- assertNotVisible: Open browser

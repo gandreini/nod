@@ -4,6 +4,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { readFile, writeFile } from 'node:fs/promises';
 import type { ServerResponse } from 'node:http';
 import { registerLocalAccess } from '../../../src/server/access.ts';
+import { browserHandoffInputs } from '../../../src/shared/browser-handoff.ts';
 
 interface FixtureMessage {
   id: string;
@@ -40,6 +41,8 @@ interface FixtureStore {
     dispatches: number;
     refusals: number;
   };
+  handoff?: { messageId: string; open: boolean };
+  browser?: Record<string, number>;
 }
 
 const port = Number(process.env.NOD_VALIDATION_PORT);
@@ -51,6 +54,17 @@ const threadId = '00000000-0000-4000-8000-000000000001';
 const questionId = '00000000-0000-4000-8000-000000000101';
 const choiceId = '00000000-0000-4000-8000-000000000102';
 const taskId = '00000000-0000-4000-8000-000000000104';
+const handoffTurnId = '00000000-0000-4000-8000-000000000105';
+const jpegHeader =
+  '/9j/4AAQSkZJRgABAQAASABIAAD/wAARCABkAKADASIAAhEBAxEB/8QAHwAAAQUBAQEBAQEAAAAAAAAAAAECAwQFBgcICQoL/8QAtRAAAgEDAwIEAwUFBAQAAAF9AQIDAAQRBRIhMUEGE1FhByJxFDKBkaEII0KxwRVS0fAkM2JyggkKFhcYGRolJicoKSo0NTY3ODk6Q0RFRkdISUpTVFVWV1hZWmNkZWZnaGlqc3R1dnd4eXqDhIWGh4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uHi4+Tl5ufo6erx8vP09fb3+Pn6/8QAHwEAAwEBAQEBAQEBAQAAAAAAAAECAwQFBgcICQoL/8QAtREAAgECBAQDBAcFBAQAAQJ3AAECAxEEBSExBhJBUQdhcRMiMoEIFEKRobHBCSMzUvAVYnLRChYkNOEl8RcYGRomJygpKjU2Nzg5OkNERUZHSElKU1RVVldYWVpjZGVmZ2hpanN0dXZ3eHl6goOEhYaHiImKkpOUlZaXmJmaoqOkpaanqKmqsrO0tba3uLm6wsPExcbHyMnK0tPU1dbX2Nna4uPk5ebn6Onq8vP09fb3+Pn6/9sAQwAJCQkJCQkQCQkQFhAQEBYeFhYWFh4mHh4eHh4mLiYmJiYmJi4uLi4uLi4uNzc3Nzc3QEBAQEBISEhISEhISEhI/9sAQwELDAwSERIfEREfSzMqM0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tL/90ABAAK';
+const jpegScans = [
+  '/9oADAMBAAIRAxEAPwDpKKKK90+RCiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKAP//Q6SiiivdPkQooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigD//0ekooor3T5EKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooA//9LpKKKK90+RCiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKAP//T6SiiivdPkQooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigD//1Okooor3T5EKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooA//9XpKKKK90+RCiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKAP//Z',
+  '/9oADAMBAAIRAxEAPwDoaKKK+cPpwooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigD//Q6GiiivnD6cKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooA//0ehooor5w+nCiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKAP/9LoaKKK+cPpwooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigD//T6GiiivnD6cKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooA//1Ohooor5w+nCiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKAP/9XoaKKK+cPpwooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigD//Z',
+];
+const jpegFrames = jpegScans.map((scan) =>
+  Buffer.concat([Buffer.from(jpegHeader, 'base64'), Buffer.from(scan, 'base64')]),
+);
+const handoffClosed = 'The browser opens here when Nod hands it to you.';
 const initialStore: FixtureStore = {
   turn: 'idle',
   messages: [
@@ -78,6 +92,7 @@ const persist = () => {
 };
 const app = Fastify({ logger: false, trustProxy: false, forceCloseConnections: true });
 const streams = new Set<ServerResponse>();
+const views = new Set<ServerResponse>();
 const frame = (payload: object) => `data: ${JSON.stringify(payload)}\n\n`;
 const emit = (payload: object) => {
   const event = frame(payload);
@@ -98,6 +113,17 @@ const view = () => ({
       status: store.turn,
       createdAt: '2026-11-06T12:00:00.000Z',
     },
+    ...(store.handoff
+      ? [
+          {
+            id: handoffTurnId,
+            status: store.handoff.open ? 'waiting' : 'completed',
+            source: 'user',
+            handoffMessageId: store.handoff.open ? store.handoff.messageId : null,
+            createdAt: '2026-11-06T12:03:00.000Z',
+          },
+        ]
+      : []),
   ],
   turn: store.turn,
 });
@@ -105,7 +131,7 @@ const view = () => ({
 registerLocalAccess(app, port, { key: token, origin, bearer: true });
 await app.register(multipart, { limits: { fileSize: 25 * 1024 * 1024, files: 1, fields: 2 } });
 app.addHook('preClose', async () => {
-  for (const stream of streams) stream.end();
+  for (const stream of [...streams, ...views]) stream.end();
 });
 app.get('/api/session', async () => ({
   threadId,
@@ -119,6 +145,7 @@ app.get('/fixture/counts', async (request, reply) => {
     userMessages: store.messages.filter((message) => message.role === 'user').length,
     answers: store.parity?.dispatches ?? 0,
     refusals: store.parity?.refusals ?? 0,
+    browser: store.browser ?? {},
   };
 });
 app.get('/api/schedules', async () => []);
@@ -335,6 +362,89 @@ app.post<{ Params: { action: string } }>('/fixture/parity/:action', async (reque
   await persist();
   if (action !== 'inspect') emitRefresh();
   return store.parity;
+});
+const handoffOpen = (turnId: unknown) => turnId === handoffTurnId && store.handoff?.open === true;
+const countBrowser = (kind: string) => {
+  store.browser = { ...store.browser, [kind]: (store.browser?.[kind] ?? 0) + 1 };
+};
+const closeHandoff = async () => {
+  if (store.handoff) store.handoff.open = false;
+  for (const view of [...views]) view.end();
+  await persist();
+  emitRefresh();
+};
+app.post('/fixture/handoff', async (request, reply) => {
+  if (!controlled(request.headers)) return reply.code(401).send({ error: 'Unauthorized.' });
+  const body = request.body as { open?: unknown; messageId?: unknown; text?: unknown };
+  if (typeof body?.open !== 'boolean') return reply.code(400).send({ error: 'Send open.' });
+  if (!body.open) {
+    await closeHandoff();
+    return { ok: true };
+  }
+  const messageId =
+    typeof body.messageId === 'string' ? body.messageId : '00000000-0000-4000-8000-000000000106';
+  if (!store.messages.some((message) => message.id === messageId))
+    store.messages.push({
+      id: messageId,
+      role: 'assistant',
+      text: typeof body.text === 'string' ? body.text : 'Synthetic page needs you',
+      turnId: handoffTurnId,
+      createdAt: new Date(Date.UTC(2026, 10, 6, 12, 0, store.messages.length)).toISOString(),
+    });
+  store.handoff = { messageId, open: true };
+  await persist();
+  emitRefresh();
+  return { ok: true };
+});
+app.get('/api/browser-handoff/stream', async (request, reply) => {
+  const query = request.query as { turnId?: unknown; view?: unknown };
+  if (typeof query.view !== 'string') return reply.code(400).send({ error: 'Name the view.' });
+  if (!handoffOpen(query.turnId)) return reply.code(423).send({ error: handoffClosed });
+  reply.hijack();
+  views.add(reply.raw);
+  reply.raw.writeHead(200, {
+    'Content-Type': 'application/octet-stream',
+    'Cache-Control': 'no-store',
+  });
+  let index = 0;
+  const send = () => {
+    const bytes = jpegFrames[index++ % jpegFrames.length];
+    const length = Buffer.alloc(4);
+    length.writeUInt32BE(bytes.length);
+    reply.raw.write(Buffer.concat([length, bytes]));
+  };
+  send();
+  const timer = setInterval(send, 500);
+  reply.raw.on('close', () => {
+    clearInterval(timer);
+    views.delete(reply.raw);
+  });
+});
+app.post('/api/browser-handoff', async (request, reply) => {
+  const body = request.body as { turnId?: unknown; inputs?: unknown };
+  const inputs = browserHandoffInputs.safeParse(body?.inputs);
+  if (!inputs.success)
+    return reply.code(400).send({ error: 'Send pointer, wheel, key, text or copy input.' });
+  if (!handoffOpen(body.turnId)) return reply.code(423).send({ error: handoffClosed });
+  for (const input of inputs.data) countBrowser(input.type);
+  await persist();
+  return { ok: true };
+});
+app.post('/api/browser-handoff/navigate', async (request, reply) => {
+  const body = request.body as { turnId?: unknown; action?: unknown };
+  if (body?.action !== 'back' && body?.action !== 'reload')
+    return reply.code(400).send({ error: 'Choose back or reload.' });
+  if (!handoffOpen(body.turnId)) return reply.code(423).send({ error: handoffClosed });
+  countBrowser(body.action);
+  await persist();
+  return { ok: true };
+});
+app.post('/api/browser-handoff/done', async (request, reply) => {
+  const body = request.body as { turnId?: unknown };
+  if (!handoffOpen(body?.turnId)) return reply.code(423).send({ error: handoffClosed });
+  countBrowser('done');
+  await closeHandoff();
+  return { ok: true };
 });
 app.get('/api/preferences', async () => ({
   hourCycle: 'auto',

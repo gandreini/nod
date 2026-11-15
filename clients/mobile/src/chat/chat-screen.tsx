@@ -35,6 +35,12 @@ import { Composer } from './composer';
 import { useAttachments } from '../files/use-attachments';
 import { AudioClip, useVoiceRecorder } from '../voice/voice';
 import { prepareTranscription } from '../files/uploads';
+import {
+  BrowserCard,
+  BrowserSheet,
+  useHandoffs,
+  type HandoffState,
+} from '../browser/browser-sheet';
 
 type Row = { key: string; message?: Message; outgoing?: Outgoing; stream?: string };
 
@@ -298,12 +304,16 @@ export function AssistantMessage({
   theme,
   pending,
   onAnswer,
+  handoff,
+  onOpenBrowser,
 }: {
   message: Message;
   connection: Connection;
   theme: Theme;
   pending: boolean;
   onAnswer: Answer;
+  handoff?: HandoffState;
+  onOpenBrowser?(messageId: string): void;
 }) {
   const { audio, files } = splitAudio(message.attachments);
   const asking = Boolean(message.approval || (message.answerChoices && pending));
@@ -341,6 +351,9 @@ export function AssistantMessage({
       {files.length ? (
         <MessageAttachments attachments={files} connection={connection} theme={theme} />
       ) : null}
+      {handoff ? (
+        <BrowserCard state={handoff} theme={theme} onOpen={() => onOpenBrowser?.(message.id)} />
+      ) : null}
     </View>
   );
 }
@@ -352,9 +365,11 @@ const ChatRow = memo(function ChatRow({
   pending,
   connection,
   theme,
+  handoff,
   onAnswer,
   onRetry,
   onDiscard,
+  onOpenBrowser,
 }: {
   message?: Message;
   outgoing?: Outgoing;
@@ -362,9 +377,11 @@ const ChatRow = memo(function ChatRow({
   pending: boolean;
   connection: Connection;
   theme: Theme;
+  handoff?: HandoffState;
   onAnswer: Answer;
   onRetry(id: string): void;
   onDiscard(id: string): void;
+  onOpenBrowser(messageId: string): void;
 }) {
   if (stream !== undefined) return <Markdown text={stream} theme={theme} />;
   if (outgoing)
@@ -426,6 +443,8 @@ const ChatRow = memo(function ChatRow({
       theme={theme}
       pending={pending}
       onAnswer={onAnswer}
+      handoff={handoff}
+      onOpenBrowser={onOpenBrowser}
     />
   );
 });
@@ -564,6 +583,8 @@ export function ChatScreen() {
   ].reverse();
 
   const { pendingQuestions, answer, retry, discard } = chat;
+  const handoffs = useHandoffs(chat.turns);
+  const { status: handoffStatus, show: showBrowser } = handoffs;
   const renderItem = useCallback(
     ({ item: row }: { item: Row }) => (
       <ChatRow
@@ -573,12 +594,14 @@ export function ChatScreen() {
         pending={row.message ? pendingQuestions.has(row.message.id) : false}
         connection={connection}
         theme={theme}
+        handoff={row.message?.role === 'assistant' ? handoffStatus(row.message.id) : undefined}
         onAnswer={answer}
         onRetry={retry}
         onDiscard={discard}
+        onOpenBrowser={showBrowser}
       />
     ),
-    [answer, connection, discard, pendingQuestions, retry, theme],
+    [answer, connection, discard, handoffStatus, pendingQuestions, retry, showBrowser, theme],
   );
 
   return (
@@ -667,6 +690,16 @@ export function ChatScreen() {
           onLatest={toLatest}
         />
       </View>
+      {handoffs.open ? (
+        <BrowserSheet
+          key={handoffs.open.turnId}
+          turnId={handoffs.open.turnId}
+          connection={connection}
+          theme={theme}
+          onClose={handoffs.close}
+          onReturned={() => handoffs.markReturned(handoffs.open!.messageId)}
+        />
+      ) : null}
     </KeyboardAvoidingView>
   );
 }

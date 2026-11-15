@@ -29,6 +29,7 @@ function n8n(slug: keyof typeof iconDrawings) {
   };
 }
 
+export const ArrowLeft = n8n('arrow-left');
 export const ArrowUp = n8n('arrow-up');
 export const Blocks = n8n('blocks');
 export const CalendarClock = n8n('calendar');

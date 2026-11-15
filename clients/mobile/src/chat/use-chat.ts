@@ -330,6 +330,7 @@ export function useChat(connection: Connection, onRefused: (notice: string) => v
     }
   }, [connection, hasEarlier, loadingOlder, messages]);
 
+  const turns = useMemo(() => state?.turns ?? [], [state]);
   const activity = state?.activity ?? [];
   const active = Object.entries(streams.active).map(([id, stream]) => ({ id, ...stream }));
   const writing = active.some((stream) => stream.text);
@@ -342,6 +343,7 @@ export function useChat(connection: Connection, onRefused: (notice: string) => v
   return {
     ready: state !== null,
     messages,
+    turns,
     outgoing,
     streams: active,
     activity,

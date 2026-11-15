@@ -9,6 +9,8 @@ The Android and iOS app in `clients/mobile` is an Expo client for a Nod server. 
 
 The phone keeps the address and token in the system keychain and voice messages that haven't reached the server yet. A file Nod sent is downloaded again each time it's opened in another app, and those downloads are deleted when the app starts, when the owner disconnects and when the server refuses the token. Disconnecting also deletes the waiting voice messages; a refused token keeps them, so they still go out after reconnecting to the same server.
 
+When Nod hands the owner its browser, the app opens the live page in a bottom panel and leaves an **Open browser** card under Nod's message. A tap on the page clicks it, a drag scrolls it, and the text bar types into it. Closing the panel keeps the handoff open; **Return to Nod** ends it.
+
 The short version: `pnpm test` runs the fast tests against a fake Nod server, and `pnpm e2e` and `pnpm e2e:ios` run the app itself on an Android emulator or an iPhone simulator against the same fake server. Neither ever touches a real server, a real phone or a live model.
 
 ## Build the app
@@ -55,17 +57,20 @@ The first Android run needs the Android command-line tools, the `system-images;a
 
 It can also fail on purpose. `/fixture/audio-faults` makes the next voice messages lose their answer on the way back, stop after the server claimed them, be cancelled like a Stop, or meet a busy server. That is how the tests check that a voice message is never sent twice and never lost.
 
+`/fixture/handoff` opens or closes a browser handoff. While it is open, the fake server streams two small synthetic page images and counts the clicks, scrolls and keys it receives.
+
 ## What the tests cover
 
-| Area             | Test                                                  | What it would catch                                                                                                                                                     |
-| ---------------- | ----------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Connecting       | `tests/connection.test.ts`, flow 1                    | A token sent to a plain-HTTP or credentialed address, a refused token treated as accepted.                                                                              |
-| Messages         | `tests/chat.test.ts`, flow 2                          | A message shown twice or lost when history and live updates overlap.                                                                                                    |
-| Voice delivery   | `tests/delivery.test.ts`                              | A voice message sent twice after a lost answer, a Stop ignored, a delivered message resent after a restart.                                                             |
-| Attachments      | `tests/attachments.test.ts`, `tests/delivery.test.ts` | A file over 90 MB uploaded, a message sent before its files finished uploading.                                                                                         |
-| Links and images | `tests/links.test.ts`                                 | A reply loading an image from another site, or opening a `tel:` or other app link.                                                                                      |
-| Files            | `tests/files.test.ts`, flow 6                         | An HTML or SVG file rendered as a page instead of shown as text, a file missing from the panel or listed twice, or a panel that dragging its handle down doesn't close. |
-| Working line     | `tests/chat.test.ts`, flow 4                          | Nod working with the Stop button showing but no working line, as when it continues a task after you answer a question.                                                  |
-| Live updates     | flow 3                                                | The app not reconnecting after the live connection drops.                                                                                                               |
-| Questions        | flow 4                                                | A choice answered twice.                                                                                                                                                |
-| Screens          | flow 5                                                | A screen in the menu that no longer opens.                                                                                                                              |
+| Area             | Test                                                  | What it would catch                                                                                                                                                                      |
+| ---------------- | ----------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Connecting       | `tests/connection.test.ts`, flow 1                    | A token sent to a plain-HTTP or credentialed address, a refused token treated as accepted.                                                                                               |
+| Messages         | `tests/chat.test.ts`, flow 2                          | A message shown twice or lost when history and live updates overlap.                                                                                                                     |
+| Voice delivery   | `tests/delivery.test.ts`                              | A voice message sent twice after a lost answer, a Stop ignored, a delivered message resent after a restart.                                                                              |
+| Attachments      | `tests/attachments.test.ts`, `tests/delivery.test.ts` | A file over 90 MB uploaded, a message sent before its files finished uploading.                                                                                                          |
+| Links and images | `tests/links.test.ts`                                 | A reply loading an image from another site, or opening a `tel:` or other app link.                                                                                                       |
+| Files            | `tests/files.test.ts`, flow 6                         | An HTML or SVG file rendered as a page instead of shown as text, a file missing from the panel or listed twice, or a panel that dragging its handle down doesn't close.                  |
+| Working line     | `tests/chat.test.ts`, flow 4                          | Nod working with the Stop button showing but no working line, as when it continues a task after you answer a question.                                                                   |
+| Browser handoff  | `tests/browser.test.ts`, flow 7                       | A page image lost when the stream splits it, a tap on the empty space around the page sent as a click, a handoff that closing the panel ends, or a Return to Nod the server never hears. |
+| Live updates     | flow 3                                                | The app not reconnecting after the live connection drops.                                                                                                                                |
+| Questions        | flow 4                                                | A choice answered twice.                                                                                                                                                                 |
+| Screens          | flow 5                                                | A screen in the menu that no longer opens.                                                                                                                                               |
