@@ -5,6 +5,17 @@ import { readFile, writeFile } from 'node:fs/promises';
 import type { ServerResponse } from 'node:http';
 import { registerLocalAccess } from '../../../src/server/access.ts';
 import { browserHandoffInputs } from '../../../src/shared/browser-handoff.ts';
+import { fileBytes } from '../../../src/shared/files.ts';
+import {
+  answerReply,
+  browserPage,
+  demoConversation,
+  demoSections,
+  returnReply,
+  scriptReply,
+  type DemoReply,
+  type DemoState,
+} from './demo.mts';
 
 interface FixtureMessage {
   id: string;
@@ -17,6 +28,7 @@ interface FixtureMessage {
   answerChoices?: { multiple: boolean; options: { id: string; label: string }[] };
   answerChoicesPending?: boolean;
   attachments?: FixtureArtifact[];
+  streamId?: string;
 }
 
 interface FixtureArtifact {
@@ -41,15 +53,18 @@ interface FixtureStore {
     dispatches: number;
     refusals: number;
   };
-  handoff?: { messageId: string; open: boolean };
+  handoff?: { messageId: string; open: boolean; turnId?: string };
   browser?: Record<string, number>;
+  demo?: DemoState;
 }
 
 const port = Number(process.env.NOD_VALIDATION_PORT);
 const token = process.env.NOD_VALIDATION_TOKEN ?? '';
 const controlToken = process.env.NOD_VALIDATION_CONTROL_TOKEN ?? '';
 const dataPath = process.env.NOD_VALIDATION_DATA ?? '';
-const origin = `http://127.0.0.1:${port}`;
+const demo = process.env.NOD_DEMO === '1';
+const host = process.env.NOD_VALIDATION_HOST ?? '127.0.0.1';
+const origin = process.env.NOD_VALIDATION_ORIGIN ?? `http://127.0.0.1:${port}`;
 const threadId = '00000000-0000-4000-8000-000000000001';
 const questionId = '00000000-0000-4000-8000-000000000101';
 const choiceId = '00000000-0000-4000-8000-000000000102';
@@ -78,14 +93,40 @@ const initialStore: FixtureStore = {
   ],
 };
 
-if (!Number.isInteger(port) || port < 1 || port > 65535 || !token || !controlToken || !dataPath)
+if (
+  !Number.isInteger(port) ||
+  port < 1 ||
+  port > 65535 ||
+  !token ||
+  (!controlToken && !demo) ||
+  !dataPath
+)
   throw new Error('Invalid validation fixture configuration.');
+if (demo && !/^[A-Za-z0-9_-]{43,}$/.test(token))
+  throw new Error(
+    'NOD_VALIDATION_TOKEN must be at least 43 letters, digits, - or _ in demo mode, as the app requires.',
+  );
 
-const store = JSON.parse(
-  await readFile(dataPath, 'utf8').catch(() => JSON.stringify(initialStore)),
+const saved = await readFile(dataPath, 'utf8').catch(() => undefined);
+const store = (
+  saved ? JSON.parse(saved) : demo ? { turn: 'idle', messages: [] } : initialStore
 ) as FixtureStore;
+const trim = () => {
+  store.messages = store.messages.slice(-200);
+  const used = new Set(
+    store.messages.flatMap((message) => (message.attachments ?? []).map((item) => item.id)),
+  );
+  const loose = (store.artifacts ?? []).filter((item) => !used.has(item.id)).slice(-10);
+  const keep = new Set([...used, ...loose.map((item) => item.id)]);
+  store.artifacts = store.artifacts?.filter((item) => keep.has(item.id));
+  store.files = Object.fromEntries(
+    Object.entries(store.files ?? {}).filter(([id]) => keep.has(id)),
+  );
+  store.audioClaims = Object.fromEntries(Object.entries(store.audioClaims ?? {}).slice(-200));
+};
 let persistence = Promise.resolve();
 const persist = () => {
+  if (demo) trim();
   const snapshot = JSON.stringify(store);
   persistence = persistence.then(() => writeFile(dataPath, snapshot));
   return persistence;
@@ -100,11 +141,26 @@ const emit = (payload: object) => {
 };
 const emitRefresh = () => emit({ type: 'refresh' });
 const controlled = (headers: Record<string, unknown>) =>
-  headers['x-fixture-control'] === controlToken;
+  controlToken !== '' && headers['x-fixture-control'] === controlToken;
+const stamp = () =>
+  demo
+    ? new Date().toISOString()
+    : new Date(Date.UTC(2026, 10, 6, 12, 0, store.messages.length)).toISOString();
+const choices = (options: string[], pending: boolean) => ({
+  answerChoices: {
+    multiple: false,
+    options: options.map((label) => ({ id: randomUUID(), label })),
+  },
+  answerChoicesPending: pending,
+});
+let activity: object[] = [];
+let pending: { timers: NodeJS.Timeout[]; turnId: string; streamId: string } | null = null;
 const view = () => ({
   threadId,
   revision: `${store.messages.length}:${store.turn}:${JSON.stringify(store.parity)}`,
-  pendingAnswerChoiceMessageIds: store.parity?.question === 'pending' ? [questionId] : [],
+  pendingAnswerChoiceMessageIds: store.messages
+    .filter((message) => message.answerChoicesPending)
+    .map((message) => message.id),
   configuration: { conversationResetEnabled: false },
   messages: store.messages,
   turns: [
@@ -116,7 +172,7 @@ const view = () => ({
     ...(store.handoff
       ? [
           {
-            id: handoffTurnId,
+            id: store.handoff.turnId ?? handoffTurnId,
             status: store.handoff.open ? 'waiting' : 'completed',
             source: 'user',
             handoffMessageId: store.handoff.open ? store.handoff.messageId : null,
@@ -126,10 +182,85 @@ const view = () => ({
       : []),
   ],
   turn: store.turn,
+  ...(demo ? { activity } : {}),
 });
 
+const cancelReply = () => {
+  if (!pending) return;
+  pending.timers.forEach(clearTimeout);
+  const { turnId, streamId } = pending;
+  emit({ type: 'delta', threadId, turnId, streamId, text: '', done: true });
+  pending = null;
+  activity = [];
+  emit({ type: 'activity', items: activity });
+};
+const respond = (next: DemoReply, turnId: string, advance: boolean) => {
+  cancelReply();
+  const streamId = randomUUID();
+  const since = new Date().toISOString();
+  const timers: NodeJS.Timeout[] = [];
+  pending = { timers, turnId, streamId };
+  activity = [
+    {
+      turnId,
+      taskId: null,
+      title: null,
+      step: next.step,
+      site: next.site ?? null,
+      since,
+      doing: next.site ? 'tool' : 'model',
+      quietSince: since,
+    },
+  ];
+  emit({ type: 'activity', items: activity });
+  const words = next.text.split(/(?<=\s)/);
+  const size = Math.ceil(words.length / 8);
+  for (let index = 0; index * size < words.length; index++)
+    timers.push(
+      setTimeout(
+        () =>
+          emit({
+            type: 'delta',
+            threadId,
+            turnId,
+            streamId,
+            text: words.slice(index * size, (index + 1) * size).join(''),
+            done: false,
+          }),
+        1500 + index * 120,
+      ),
+    );
+  timers.push(
+    setTimeout(async () => {
+      pending = null;
+      activity = [];
+      const message: FixtureMessage = {
+        id: randomUUID(),
+        role: 'assistant',
+        text: next.text,
+        turnId,
+        streamId,
+        createdAt: stamp(),
+        ...(next.file
+          ? { attachments: [artifact(next.file.bytes, next.file.name, next.file.mimeType)] }
+          : {}),
+        ...(next.options ? choices(next.options, true) : {}),
+      };
+      store.messages.push(message);
+      if (next.handoff) store.handoff = { messageId: message.id, open: true, turnId };
+      if (advance) store.demo!.step++;
+      store.turn = 'idle';
+      emit({ type: 'activity', items: activity });
+      await persist();
+      emitRefresh();
+    }, 2600),
+  );
+};
+
 registerLocalAccess(app, port, { key: token, origin, bearer: true });
-await app.register(multipart, { limits: { fileSize: 25 * 1024 * 1024, files: 1, fields: 2 } });
+await app.register(multipart, {
+  limits: { fileSize: demo ? fileBytes : 25 * 1024 * 1024, files: 1, fields: 2 },
+});
 app.addHook('preClose', async () => {
   for (const stream of [...streams, ...views]) stream.end();
 });
@@ -148,27 +279,32 @@ app.get('/fixture/counts', async (request, reply) => {
     browser: store.browser ?? {},
   };
 });
-app.get('/api/schedules', async () => []);
-app.get('/api/trust', async () => ({
-  month: {
-    start: '2026-11-01T00:00:00.000Z',
-    days: 30,
-    elapsedDays: 9,
-    spentUsd: 0,
-    forecastUsd: 0,
-    planUsd: 0,
-    planUsage: false,
-    unpriced: false,
-    daily: [0],
-    backgroundUsd: 0,
-    outside: [],
-  },
-  week: { things: 3, actions: 1, spentUsd: 0, planUsd: 0 },
-  entries: [],
-  next: null,
-  limit: null,
-  taskUsd: null,
-}));
+const sections = () => demoSections(Date.now(), store.demo!);
+app.get('/api/schedules', async () => (demo ? sections().schedules : []));
+app.get('/api/trust', async () =>
+  demo
+    ? sections().trust
+    : {
+        month: {
+          start: '2026-11-01T00:00:00.000Z',
+          days: 30,
+          elapsedDays: 9,
+          spentUsd: 0,
+          forecastUsd: 0,
+          planUsd: 0,
+          planUsage: false,
+          unpriced: false,
+          daily: [0],
+          backgroundUsd: 0,
+          outside: [],
+        },
+        week: { things: 3, actions: 1, spentUsd: 0, planUsd: 0 },
+        entries: [],
+        next: null,
+        limit: null,
+        taskUsd: null,
+      },
+);
 app.get('/api/state', async () => view());
 app.get('/api/messages', async () => ({ messages: store.messages, hasMore: false }));
 app.post('/api/messages', async (request, reply) => {
@@ -190,6 +326,19 @@ app.post('/api/messages', async (request, reply) => {
       message.clientMessageId === body.clientMessageId || message.id === body.clientMessageId,
   );
   if (existing) return { messageId: existing.id, turnId: existing.turnId };
+  const question = store.messages.find(
+    (message) => body.questionAnswer && message.id === body.replyToMessageId,
+  );
+  const chosen = question?.answerChoices?.options.filter(
+    (option) =>
+      Array.isArray(body.questionAnswer?.choiceIds) &&
+      body.questionAnswer.choiceIds.includes(option.id),
+  );
+  if (demo && body.questionAnswer && (!question?.answerChoicesPending || !chosen?.length))
+    return reply.code(409).send({
+      code: 'question_unavailable',
+      error: 'This question is no longer waiting for an answer.',
+    });
   const parity = store.parity;
   if (parity) {
     const allowed =
@@ -223,15 +372,23 @@ app.post('/api/messages', async (request, reply) => {
       ? { replyToMessageId: body.replyToMessageId }
       : {}),
     turnId: randomUUID(),
-    createdAt: new Date(Date.UTC(2026, 10, 6, 12, 0, store.messages.length)).toISOString(),
+    createdAt: stamp(),
   };
   store.messages.push(message);
   store.turn = parity ? 'idle' : 'running';
+  if (demo) {
+    if (store.handoff?.open) endHandoff();
+    if (question && chosen) {
+      question.answerChoicesPending = false;
+      respond(answerReply(chosen.map((option) => option.label).join(', ')), message.turnId, false);
+    } else respond(scriptReply(store.demo!.step), message.turnId, true);
+  }
   await persist();
   emitRefresh();
   return { messageId: message.id, turnId: message.turnId };
 });
 app.post('/api/thread/stop', async () => {
+  cancelReply();
   store.turn = 'cancelled';
   await persist();
   emitRefresh();
@@ -244,9 +401,14 @@ app.get('/api/events', async (_request, reply) => {
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-store',
     Connection: 'keep-alive',
+    'X-Accel-Buffering': 'no',
   });
   reply.raw.write(frame({ type: 'refresh' }));
-  reply.raw.on('close', () => streams.delete(reply.raw));
+  const keepalive = setInterval(() => reply.raw.write(': keepalive\n\n'), 15000);
+  reply.raw.on('close', () => {
+    clearInterval(keepalive);
+    streams.delete(reply.raw);
+  });
 });
 app.post('/fixture/stream', async (request, reply) => {
   if (!controlled(request.headers)) return reply.code(401).send({ error: 'Unauthorized.' });
@@ -363,13 +525,17 @@ app.post<{ Params: { action: string } }>('/fixture/parity/:action', async (reque
   if (action !== 'inspect') emitRefresh();
   return store.parity;
 });
-const handoffOpen = (turnId: unknown) => turnId === handoffTurnId && store.handoff?.open === true;
+const handoffOpen = (turnId: unknown) =>
+  turnId === (store.handoff?.turnId ?? handoffTurnId) && store.handoff?.open === true;
 const countBrowser = (kind: string) => {
   store.browser = { ...store.browser, [kind]: (store.browser?.[kind] ?? 0) + 1 };
 };
-const closeHandoff = async () => {
+const endHandoff = () => {
   if (store.handoff) store.handoff.open = false;
   for (const view of [...views]) view.end();
+};
+const closeHandoff = async () => {
+  endHandoff();
   await persist();
   emitRefresh();
 };
@@ -405,16 +571,18 @@ app.get('/api/browser-handoff/stream', async (request, reply) => {
   reply.raw.writeHead(200, {
     'Content-Type': 'application/octet-stream',
     'Cache-Control': 'no-store',
+    'X-Accel-Buffering': 'no',
   });
   let index = 0;
+  const frames = demo ? [browserPage] : jpegFrames;
   const send = () => {
-    const bytes = jpegFrames[index++ % jpegFrames.length];
+    const bytes = frames[index++ % frames.length]!;
     const length = Buffer.alloc(4);
     length.writeUInt32BE(bytes.length);
     reply.raw.write(Buffer.concat([length, bytes]));
   };
   send();
-  const timer = setInterval(send, 500);
+  const timer = setInterval(send, demo ? 1000 : 500);
   reply.raw.on('close', () => {
     clearInterval(timer);
     views.delete(reply.raw);
@@ -444,9 +612,10 @@ app.post('/api/browser-handoff/done', async (request, reply) => {
   if (!handoffOpen(body?.turnId)) return reply.code(423).send({ error: handoffClosed });
   countBrowser('done');
   await closeHandoff();
+  if (demo) respond(returnReply, randomUUID(), false);
   return { ok: true };
 });
-app.get('/api/preferences', async () => ({
+const preferences: Record<string, unknown> = {
   hourCycle: 'auto',
   rules: '',
   locale: null,
@@ -456,8 +625,8 @@ app.get('/api/preferences', async () => ({
   quietStart: '22:00',
   quietEnd: '08:00',
   proactivePaused: false,
-}));
-app.get('/api/models', async () => ({
+};
+const models = {
   connections: [
     {
       id: '00000000-0000-4000-8000-000000000201',
@@ -489,7 +658,13 @@ app.get('/api/models', async () => ({
     modelId: 'synthetic-large',
     effort: 'low',
   },
-}));
+};
+app.get('/api/preferences', async () =>
+  demo ? { ...preferences, ...store.demo!.preferences } : preferences,
+);
+app.get('/api/models', async () =>
+  demo ? { ...models, selection: store.demo!.selection ?? models.selection } : models,
+);
 const taskView = () => ({
   id: taskId,
   title: 'Synthetic saved task',
@@ -502,25 +677,102 @@ const taskView = () => ({
   messageId: questionId,
   createdAt: '2026-11-06T11:00:00.000Z',
 });
-app.get('/api/tasks', async () => (store.parity ? [taskView()] : []));
-app.get('/api/apps', async () => [
-  {
-    slug: 'gmail',
-    name: 'Gmail',
-    status: 'connected',
-    connectionId: '00000000-0000-4000-8000-000000000301',
-    accountId: 'synthetic-account',
-    accountEmail: 'owner@example.com',
-    triggersEnabled: false,
-  },
-]);
-app.get('/api/apps/catalog', async () => [
-  { slug: 'gmail', name: 'Gmail', status: 'disconnected', triggersEnabled: false },
-  { slug: 'notion', name: 'Notion', status: 'disconnected', triggersEnabled: false },
-  { slug: 'slack', name: 'Slack', status: 'disconnected', triggersEnabled: false },
-]);
-app.get('/api/vault', async () => []);
-app.get('/api/vault/sessions', async () => []);
+app.get('/api/tasks', async () => (demo ? sections().tasks : store.parity ? [taskView()] : []));
+app.get('/api/apps', async () =>
+  demo
+    ? sections().apps
+    : [
+        {
+          slug: 'gmail',
+          name: 'Gmail',
+          status: 'connected',
+          connectionId: '00000000-0000-4000-8000-000000000301',
+          accountId: 'synthetic-account',
+          accountEmail: 'owner@example.com',
+          triggersEnabled: false,
+        },
+      ],
+);
+app.get('/api/apps/catalog', async () =>
+  demo
+    ? sections().catalog
+    : [
+        { slug: 'gmail', name: 'Gmail', status: 'disconnected', triggersEnabled: false },
+        { slug: 'notion', name: 'Notion', status: 'disconnected', triggersEnabled: false },
+        { slug: 'slack', name: 'Slack', status: 'disconnected', triggersEnabled: false },
+      ],
+);
+app.get('/api/vault', async () => (demo ? sections().vault : []));
+app.get('/api/vault/sessions', async () => (demo ? sections().sessions : []));
+if (demo) {
+  const remove = async (id: string) => {
+    store.demo!.removed = [...new Set([...store.demo!.removed, id])];
+    await persist();
+    return { ok: true };
+  };
+  app.get('/api/schedule-runs', async (request) =>
+    sections().runs(String((request.query as { scheduleId?: unknown }).scheduleId ?? '')),
+  );
+  app.patch<{ Params: { id: string } }>('/api/schedules/:id', async (request, reply) => {
+    const enabled = (request.body as { enabled?: unknown })?.enabled;
+    if (typeof enabled !== 'boolean') return reply.code(400).send({ error: 'Send enabled.' });
+    const state = store.demo!;
+    state.paused = state.paused.filter((id) => id !== request.params.id);
+    if (!enabled) state.paused.push(request.params.id);
+    await persist();
+    const schedule = sections().schedules.find((item) => item.id === request.params.id);
+    return schedule ?? reply.code(404).send({ error: 'Schedule not found.' });
+  });
+  app.delete<{ Params: { id: string } }>('/api/schedules/:id', (request) =>
+    remove(request.params.id),
+  );
+  app.delete<{ Params: { id: string } }>('/api/vault/:id', (request) => remove(request.params.id));
+  app.delete<{ Params: { id: string } }>('/api/vault/sessions/:id', (request) =>
+    remove(request.params.id),
+  );
+  app.post<{ Params: { id: string } }>('/api/apps/:slug/accounts/:id/disconnect', (request) =>
+    remove(request.params.id),
+  );
+  app.post<{ Params: { id: string } }>('/api/tasks/:id/stop', async (request) => {
+    store.demo!.stopped = [...new Set([...store.demo!.stopped, request.params.id])];
+    await persist();
+    return { ok: true };
+  });
+  app.patch('/api/preferences', async (request) => {
+    const body = (request.body ?? {}) as Record<string, unknown>;
+    for (const [key, value] of Object.entries(body))
+      if (
+        key in preferences &&
+        (preferences[key] === null || typeof value === typeof preferences[key])
+      )
+        store.demo!.preferences[key] = value;
+    await persist();
+    return { ...preferences, ...store.demo!.preferences };
+  });
+  app.put('/api/models/selection', async (request, reply) => {
+    const body = request.body as { connectionId?: unknown; modelId?: unknown; effort?: unknown };
+    const connection = models.connections.find((item) => item.id === body?.connectionId);
+    const model = connection?.models.find((item) => item.id === body?.modelId);
+    if (
+      !connection ||
+      !model ||
+      typeof body.effort !== 'string' ||
+      !model.efforts.includes(body.effort)
+    )
+      return reply.code(400).send({ error: 'Choose a listed model and one of its efforts.' });
+    store.demo!.selection = { connectionId: connection.id, modelId: model.id, effort: body.effort };
+    await persist();
+    return { ...models, selection: store.demo!.selection };
+  });
+  app.put('/api/trust/limit', async (request, reply) => {
+    const monthlyUsd = (request.body as { monthlyUsd?: unknown })?.monthlyUsd;
+    if (monthlyUsd !== null && (typeof monthlyUsd !== 'number' || !(monthlyUsd > 0)))
+      return reply.code(400).send({ error: 'Send a positive monthly limit or null.' });
+    store.demo!.limit = monthlyUsd;
+    await persist();
+    return { ok: true };
+  });
+}
 
 function artifact(bytes: Buffer, name: string, mimeType: string) {
   const id = randomUUID();
@@ -591,17 +843,24 @@ app.post('/api/messages/audio', async (request, reply) => {
   }
   const clip = artifact(recording.bytes, recording.name, recording.mimeType);
   const turnId = randomUUID();
+  const transcript = demo
+    ? "Voice message (the demo doesn't transcribe audio)"
+    : 'Synthetic transcript';
   store.messages.push({
     id,
     clientMessageId: id,
     role: 'user',
-    text: 'Synthetic transcript',
+    text: transcript,
     turnId,
     attachments: [clip],
-    createdAt: new Date(Date.UTC(2026, 10, 6, 12, 0, store.messages.length)).toISOString(),
+    createdAt: stamp(),
   });
-  const response = { threadId, turnId, messageId: id, messageText: 'Synthetic transcript' };
+  const response = { threadId, turnId, messageId: id, messageText: transcript };
   claims[id].response = response;
+  if (demo) {
+    store.turn = 'running';
+    respond(scriptReply(store.demo!.step), turnId, true);
+  }
   await persist();
   emitRefresh();
   if (fault === 'drop-response') {
@@ -621,7 +880,29 @@ app.post('/fixture/audio-faults', async (request, reply) => {
   return { ok: true };
 });
 
-await app.listen({ host: '127.0.0.1', port });
+if (demo && !store.demo) {
+  const now = Date.now();
+  let previous: FixtureMessage | undefined;
+  for (const entry of demoConversation) {
+    const message: FixtureMessage = {
+      id: randomUUID(),
+      role: entry.role,
+      text: entry.text,
+      turnId: randomUUID(),
+      createdAt: new Date(now - entry.minutesAgo * 60_000).toISOString(),
+      ...(entry.files
+        ? { attachments: entry.files.map((file) => artifact(file.bytes, file.name, file.mimeType)) }
+        : {}),
+      ...(entry.options ? choices(entry.options, !entry.answered) : {}),
+      ...(entry.replyToPrevious && previous ? { replyToMessageId: previous.id } : {}),
+    };
+    store.messages.push(message);
+    previous = message;
+  }
+  store.demo = { step: 0, removed: [], paused: [], stopped: [], preferences: {}, limit: 20 };
+  await persist();
+}
+await app.listen({ host, port });
 process.stdout.write(`${JSON.stringify({ ready: true })}\n`);
 
 const close = async () => {

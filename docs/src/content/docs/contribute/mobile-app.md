@@ -59,6 +59,27 @@ It can also fail on purpose. `/fixture/audio-faults` makes the next voice messag
 
 `/fixture/handoff` opens or closes a browser handoff. While it is open, the fake server streams two small synthetic page images and counts the clicks, scrolls and keys it receives.
 
+### Demo mode
+
+`pnpm demo:server` runs the fake server as a public demo, for App Store review. Everything in it is synthetic: on first start it seeds an English sample conversation (Markdown, questions, files, an image and a voice note) and sample apps, schedules, usage and vault entries. Every message gets a scripted reply after about 1.5 seconds that walks through a question card, a file and Nod's browser, and Stop cancels it. It never calls a model or any other service.
+
+| Variable                       | Meaning                                                                                                                                          |
+| ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `NOD_VALIDATION_PORT`          | Port to listen on.                                                                                                                               |
+| `NOD_VALIDATION_TOKEN`         | The token the reviewer types on the connect screen, so treat it as their password. At least 43 letters, digits, `-` or `_`, as the app requires. |
+| `NOD_VALIDATION_DATA`          | JSON file that keeps the conversation across restarts, capped at the last 200 messages. Delete it and restart to reset the demo.                 |
+| `NOD_VALIDATION_HOST`          | Address to bind, `127.0.0.1` by default. Keep it behind an HTTPS reverse proxy.                                                                  |
+| `NOD_VALIDATION_ORIGIN`        | The public address the app connects to, such as `https://demo.example.com`. Requests for any other host are refused.                             |
+| `NOD_VALIDATION_CONTROL_TOKEN` | Optional. Without it every `/fixture/*` route answers 401.                                                                                       |
+
+```sh
+NOD_VALIDATION_PORT=4400 NOD_VALIDATION_TOKEN="$(openssl rand -hex 32)" \
+  NOD_VALIDATION_DATA=/srv/nod-demo/store.json NOD_VALIDATION_ORIGIN=https://demo.example.com \
+  pnpm demo:server
+```
+
+The proxy must pass the original `Host` and not buffer `/api/events` or `/api/browser-handoff/stream`. Uploaded files stay on the demo server and are served only with the token.
+
 ## What the tests cover
 
 | Area             | Test                                                  | What it would catch                                                                                                                                                                      |
