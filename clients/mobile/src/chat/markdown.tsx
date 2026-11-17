@@ -4,7 +4,6 @@ import {
   Image,
   Linking,
   Pressable,
-  ScrollView,
   Text,
   View,
   type ImageStyle,
@@ -18,6 +17,7 @@ import type { Artifact } from '../connection/contracts';
 import { useFileViewer } from '../files/file-viewer-context';
 import { imageArtifact, safeLink } from '../connection/links';
 import { useNod } from '../connection/nod-context';
+import { ScrollFade } from '../ui/scroll-fade';
 import { font, radius, type Theme } from '../ui/theme';
 
 function open(connection: Connection, href: string, show: (file: Artifact) => void) {
@@ -42,13 +42,16 @@ class NodRenderer extends Renderer {
 
   code(text: string, _language?: string, containerStyle?: ViewStyle, textStyle?: TextStyle) {
     return (
-      <View key={this.getKey()} style={containerStyle}>
-        <ScrollView horizontal style={{ flexGrow: 0 }} showsHorizontalScrollIndicator={false}>
-          <Text selectable style={textStyle}>
-            {text}
-          </Text>
-        </ScrollView>
-      </View>
+      <ScrollFade
+        key={this.getKey()}
+        color={this.theme.inset}
+        style={containerStyle}
+        contentContainerStyle={{ paddingHorizontal: 16 }}
+      >
+        <Text selectable style={textStyle}>
+          {text}
+        </Text>
+      </ScrollFade>
     );
   }
 
@@ -199,7 +202,9 @@ function markdownStyles(theme: Theme) {
       code: {
         backgroundColor: theme.inset,
         borderRadius: radius.control,
-        padding: 12,
+        overflow: 'hidden' as const,
+        paddingHorizontal: 0,
+        paddingVertical: 12,
         marginBottom: 12,
       },
       codeText: {

@@ -9,7 +9,6 @@ import {
   Modal,
   Platform,
   Pressable,
-  ScrollView,
   StyleSheet,
   Text,
   View,
@@ -17,6 +16,7 @@ import {
 import { artifactSource, request, errorText } from '../connection/api';
 import { fileSize, isImage, type AttachSource, type Draft } from './attachments';
 import { downloadsFolder } from './downloads';
+import { ScrollFade } from '../ui/scroll-fade';
 import { useFileViewer } from './file-viewer-context';
 import { fileType } from './files';
 import { ownedArtifact } from '../connection/links';
@@ -150,9 +150,8 @@ export function DraftStrip({
 }) {
   if (!drafts.length) return null;
   return (
-    <ScrollView
-      horizontal
-      showsHorizontalScrollIndicator={false}
+    <ScrollFade
+      color={theme.surface}
       contentContainerStyle={styles.strip}
       keyboardShouldPersistTaps="handled"
     >
@@ -233,7 +232,7 @@ export function DraftStrip({
           </View>
         );
       })}
-    </ScrollView>
+    </ScrollFade>
   );
 }
 

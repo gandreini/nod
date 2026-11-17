@@ -324,17 +324,24 @@ export function AssistantMessage({
   const text = links.length ? lead.replace(connectLink, '').trim() : lead;
   return (
     <View style={styles.stack}>
-      {audio ? (
-        <AudioClip
-          source={artifactSource(connection, audio.url)}
-          mimeType={audio.mimeType}
-          size={audio.size}
-          theme={theme}
-        />
-      ) : null}
-      {text ? (
-        <View style={[styles.assistantBubble, { backgroundColor: theme.chatReceived }]}>
-          <Markdown text={text} theme={theme} />
+      {audio || text ? (
+        <View
+          style={[
+            styles.assistantBubble,
+            audio ? styles.audioBubble : null,
+            { backgroundColor: theme.chatReceived },
+          ]}
+        >
+          {audio ? (
+            <AudioClip
+              source={artifactSource(connection, audio.url)}
+              mimeType={audio.mimeType}
+              size={audio.size}
+              theme={theme}
+              onBubble
+            />
+          ) : null}
+          {text ? <Markdown text={text} theme={theme} /> : null}
         </View>
       ) : null}
       {message.approval ? (

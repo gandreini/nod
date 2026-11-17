@@ -282,13 +282,13 @@ export function AudioClip({
           accessibilityLabel={status.playing ? 'Pause voice message' : 'Play voice message'}
           style={({ pressed }) => [
             styles.play,
-            { backgroundColor: pressed ? theme.primaryPressed : theme.primary },
+            { backgroundColor: pressed ? theme.playPressed : theme.play },
           ]}
         >
           {status.playing ? (
-            <Pause size={16} color={theme.primaryForeground} fill={theme.primaryForeground} />
+            <Pause size={16} color={theme.foreground} fill={theme.foreground} />
           ) : (
-            <Play size={16} color={theme.primaryForeground} solid />
+            <Play size={16} color={theme.foreground} solid />
           )}
         </Pressable>
         <View style={styles.fill}>
