@@ -9,7 +9,7 @@ import {
   useDateFormat,
 } from '../../../../src/web/lib/date-format';
 import { money, monthlyLimit } from './money';
-import { becauseText } from '../../../../src/web/lib/trust-because';
+import { becauseText } from '../../../../src/shared/trust';
 import { errorText } from '../connection/api';
 import { font, radius, useTheme } from '../ui/theme';
 import { Button, Card, Group, Loaded, Notice, Page, SectionTitle, text, type Icon } from '../ui/ui';
