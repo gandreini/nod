@@ -18,6 +18,8 @@ finish-args:
   - --filesystem=/media
   - --filesystem=/run/media
   - --talk-name=org.freedesktop.Notifications
+  - --talk-name=org.gnome.SessionManager
+  - --talk-name=org.freedesktop.PowerManagement
   - --talk-name=org.freedesktop.secrets
   - --talk-name=org.kde.kwalletd5
   - --talk-name=org.kde.kwalletd6

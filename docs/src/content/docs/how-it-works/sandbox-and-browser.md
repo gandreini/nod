@@ -45,18 +45,22 @@ flowchart LR
 
 Pi's native tools (`read`, `bash`, `edit`, `write`, `find` and `ls`) run inside the workspace through `WorkspaceSession.exec`. Each thread works in `/workspace/<thread ID>`. A source install mounts `NOD_DATA_ROOT/workspaces`; self-hosted and desktop runtimes use a persistent workspace volume. `/home/node` is a separate volume, so tools Pi installs persist.
 
+The tools use the thread's Linux workspace path on every host, including Windows. The runtime converts Windows file paths before it sends file operations to the container.
+
 - Commands run as the unprivileged `node` user, without sudo.
 - Bash gets no host environment. It sets the owner's `TZ` when known.
 - No workspace file is loaded as instructions.
 
 Both the workspace and browser containers drop all capabilities, set `no-new-privileges` and have these limits:
 
-| Container | Source install (`compose.yaml`)                      | Local desktop runtime                              | Self-hosted server defaults                                |
-| --------- | ---------------------------------------------------- | -------------------------------------------------- | ---------------------------------------------------------- |
-| Workspace | 8 GB memory, 4 CPUs, 4,096 processes                 | 2 GB memory, 2 CPUs, 1,024 processes               | 2 GB memory, no CPU limit, 512 processes                   |
-| Browser   | 8 GB memory, 6 CPUs, 4,096 processes, read-only root | 2 GB memory, 2 CPUs, 768 processes, read-only root | 3 GB memory, no CPU limit, 1,024 processes, read-only root |
+| Container | Source install (`compose.yaml`)                            | Local desktop runtime                              | Self-hosted server defaults                                |
+| --------- | ---------------------------------------------------------- | -------------------------------------------------- | ---------------------------------------------------------- |
+| Workspace | 8 GB memory, up to 4 CPUs, 4,096 processes                 | 2 GB memory, 2 CPUs, 1,024 processes               | 2 GB memory, no CPU limit, 512 processes                   |
+| Browser   | 8 GB memory, up to 6 CPUs, 4,096 processes, read-only root | 2 GB memory, 2 CPUs, 768 processes, read-only root | 3 GB memory, no CPU limit, 1,024 processes, read-only root |
 
-The self-hosted server reaches Docker through a restricted proxy for its workspace and browser containers. Its Compose configuration allows separate memory limits through `NOD_WORKSPACE_MEMORY` and `NOD_BROWSER_MEMORY`.
+For source installs, `pnpm start` uses the Docker daemon's CPU count when it is lower than these caps. It also respects lower `NOD_WORKSPACE_CPUS` and `NOD_BROWSER_CPUS` values from the shell or `.env`. Direct Compose commands keep the listed defaults; set those variables when using a smaller Docker VM.
+
+The self-hosted server reaches Docker through a restricted proxy for its workspace and browser containers. The proxy hands each running command's stream over as a raw connection, so its HTTP time limits don't close commands that run longer. Its Compose configuration allows separate memory limits through `NOD_WORKSPACE_MEMORY` and `NOD_BROWSER_MEMORY`.
 
 ## The command supervisor
 
@@ -65,11 +69,13 @@ Every command goes through a small supervisor inside the container, in [`src/pro
 - It owns the command's session and signals every process in it, even ones that left the process group.
 - A command also ends the processes it detached, when the command itself ends, so work it left behind never outlives it. Stop ends the whole tree the same way, and escalates to `SIGKILL` for a process that ignores the first signal.
 - It enforces the timeout: 59 minutes for `bash` by default. The model can ask for longer.
-- It acknowledges when the command ends. If that acknowledgement is lost, the server fences the workspace: no more commands run until Nod restarts.
+- It acknowledges when the command ends. If that acknowledgement is lost, the command fails as uncertain with the specific reason, such as the command stream closing early, and never runs again. The server cancels the other running commands, and new commands wait. From `/var/tmp`, a folder the command can't remove, a check then stops every process owned by the command's Linux user, `node` or the connected CLI's own user, including background processes earlier commands started. It spares only the container's init process, the check's own chain of parent processes, and, when init is `docker-init` or `tini`, the container's main process: the earliest started child of init. When the check confirms none remain, the workspace reopens. When it can't prove that, for example because it can't read a running process's owner or parent, the server fences the workspace with the reason: no more commands run until Nod restarts.
 
 ## Command output
 
 Up to 1 MiB of output reaches Pi. Pi shows the model the tail, and codemode scripts get the whole output and the exit code. Larger output keeps its first and last 512 KiB and names the complete log in the workspace.
+
+For the task's command view, the runtime also saves each `bash` command. It saves the exit code when available and up to the last 16,000 characters of the redacted command output. It removes known secrets and secret-shaped text from the full output before taking the tail, and records nothing when no command redactor is set. The record sits on the call's `tool_start` and `tool_complete` or `tool_failed` rows in `turn_events`, and the owner's task and Usage routes read it. Usage lists each recorded command once and loads its output on request. The CSV export includes the command, exit code, status and saved output. These records remain in the local database until all data is removed. See [Watch Nod's commands](/use/workspace/#watch-nods-commands).
 
 Pi writes truncated output, codemode files and images, and extracted web PDFs to the server's temp folder. The runtime moves each file into the workspace's `.nod/outputs` folder and rewrites its path before the result is recorded. See [`src/providers/pi/sandbox.ts`](https://github.com/n8n-io/nod/blob/main/src/providers/pi/sandbox.ts).
 
@@ -94,6 +100,8 @@ The browser is a separate trusted container. It doesn't share mounts or a networ
 Pi reads the page from agent-browser's accessibility snapshot, with `@eN` references, as plain text after the page URL. A snapshot returns up to 40,000 characters, and Pi reads the rest with an offset. Pi interprets the page and chooses controls. The server also reads the selected control's form method and destination for the trust check, and the page's visible text when it prepares a confirmation question.
 
 Every browser command has a deadline: 60 seconds, or a wait's own timeout plus 30 seconds. That leaves room for agent-browser's own 30-second limit on each browser call, so only a browser that has stopped answering misses it. A browser that misses its deadline, is interrupted or doesn't close within 5 seconds is killed with all its Chromium processes. A cancelled action requires an explicit open or saved-session selection before that browser can continue. Once cancellation is acknowledged, other sessions keep their browsers and can continue. A lost bridge response still requires recovery of the application namespace because the worker may have closed it. Nod never repeats the interrupted action during recovery. While a dialog is open, the observation is the dialog, and every action except open is refused until Pi accepts or dismisses it.
+
+Profiles stay on the browser container's volume when Nod replaces the container, for example after a restart. Chromium's profile lock from the old container names a host that no longer exists. Before Chromium starts, Nod removes a lock whose `<host>-<pid>` target names another host, so the profile opens again. A lock from the current container, or one Nod can't read, stays. When a browser command exceeds Nod's time limit, Pi sees that fixed reason. Any other failure outside the browser's own errors shows only the generic "The workspace browser could not complete this action. Try again." message.
 
 Known secret values (passwords, codes, card numbers and security codes) are removed from tool output and masked in screenshots; usernames and the cardholder name aren't secrets and stay visible. URL parameters that carry credentials, such as tokens and signatures, are hidden; other query parameters stay. When an action fails, Pi sees the browser's own error with known secrets removed. Pi uses saved profiles through `browser_session` and never reads their files. The code is in [`src/providers/agent-browser/`](https://github.com/n8n-io/nod/tree/main/src/providers/agent-browser).
 

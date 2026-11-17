@@ -2,6 +2,7 @@ import type { Presentation } from './presentation';
 import type { TaskSuggestions } from './onboarding';
 import type { TrustBecause } from './trust';
 import type { AnswerChoices } from './answer-choices';
+import type { ModelIssue, ModelSelection, WorkKind } from './models';
 export type TurnStatus = 'queued' | 'running' | 'succeeded' | 'waiting' | 'failed' | 'cancelled';
 export interface Artifact {
   id: string;
@@ -39,6 +40,7 @@ export interface Message {
   choiceAnswer?: { choiceIds: string[]; text?: string };
   approval?: MessageApproval;
   cardAnswer?: true;
+  work?: { kind: 'task' | 'schedule'; id: string; title: string };
 }
 export type ApprovalState = 'pending' | 'working' | 'done' | 'declined' | 'expired' | 'uncertain';
 export interface MessageApproval {
@@ -83,8 +85,11 @@ export interface Activity {
   since: string;
   doing: 'queued' | 'model' | 'tool';
   quietSince: string;
+  tool?: string;
+  model?: string;
   received?: true;
   background?: true;
+  runId?: string;
 }
 export interface VaultLoginEntry {
   kind: 'login';
@@ -250,6 +255,8 @@ export interface Configuration {
   model: string;
   llmReady: boolean;
   modelReconnect: boolean;
+  modelIssue?: ModelIssue;
+  modelAlternative?: ModelSelection & { label: string };
   integrationsReady: boolean;
   conversationResetEnabled: boolean;
 }
@@ -304,6 +311,9 @@ export interface Task {
   stepIndex?: number;
   revision?: number;
   appliedRevision?: number;
+  model?: ModelSelection | null;
+  work?: WorkKind;
+  scheduleModel?: ModelSelection;
 }
 export interface TaskDetail {
   task: Task;
@@ -317,6 +327,16 @@ export interface TaskDetail {
     createdAt: string;
   }>;
 }
+export interface WorkspaceCommand {
+  id: string;
+  command: string;
+  state: 'running' | 'finished' | 'failed' | 'interrupted';
+  exitCode: number | null;
+  output: string;
+  helper: boolean;
+  startedAt: string;
+  finishedAt: string | null;
+}
 export interface Schedule {
   id: string;
   title: string;
@@ -329,8 +349,10 @@ export interface Schedule {
   revision: number;
   nextRun: string | null;
   lastRun: ScheduleRun | null;
+  activeRun: { turnId: string; status: 'queued' | 'running' | 'waiting' } | null;
   baselineObservation: ScheduleObservation | null;
   watch: string[] | null;
+  model: ModelSelection | null;
   monthlyUsd: number | null;
 }
 export type ScheduleObservation = {
@@ -372,6 +394,7 @@ export interface Preferences {
   quietStart: string;
   quietEnd: string;
   proactivePaused: boolean;
+  localFilesEnabled: boolean;
 }
 export type ChannelProvider = 'telegram' | 'whatsapp';
 export interface ChannelLinkStatus {
@@ -388,6 +411,7 @@ export interface ChannelLinkStatus {
   expiresAt?: string;
   accountHandle?: string;
   accountName?: string;
+  error?: string;
 }
 export interface ChannelSetupSummary {
   provider: ChannelProvider;

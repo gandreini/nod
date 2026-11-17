@@ -40,7 +40,17 @@ export function environmentSecrets(environment: Record<string, string | undefine
 export function redactSecretText(value: string): string {
   return value
     .replace(/-----BEGIN [^-]*PRIVATE KEY-----[\s\S]*?-----END [^-]*PRIVATE KEY-----/g, hidden)
-    .replace(/\b(?:Bearer|Basic)\s+[A-Za-z0-9+/_.=:-]+/gi, hidden)
+    .replace(
+      /\b(Bearer|Basic)\s+([A-Za-z0-9+/_.=:-]+)/gi,
+      (match, scheme: string, token: string) => {
+        if (scheme.toLowerCase() !== 'basic') return hidden;
+        const decoded = Buffer.from(token, 'base64');
+        const encoded = decoded.toString('base64');
+        return decoded.includes(58) && (token === encoded || token === encoded.replace(/=+$/u, ''))
+          ? hidden
+          : match;
+      },
+    )
     .replace(
       /\b(?:authorization|proxy-authorization|cookie|set-cookie|x-api-key|x-auth-token)\s*:\s*[^\r\n]+/gi,
       hidden,
@@ -63,7 +73,7 @@ function secretText(secrets: string[], minimumSecretLength = 8) {
   const values = [
     ...new Set(
       secrets
-        .flatMap((value) => [value, value.trim()])
+        .flatMap((value) => (typeof value === 'string' ? [value, value.trim()] : []))
         .filter((value) => value.length >= minimumSecretLength),
     ),
   ].sort((a, b) => b.length - a.length);
@@ -222,6 +232,12 @@ export function createErrorRedactor(secrets: string[]) {
     const safe = redact(text);
     return typeof safe === 'string' ? safe : JSON.stringify(safe);
   };
+}
+
+export function createCommandRedactor(secrets: string[]) {
+  const text = createTextRedactor(secrets);
+  const structured = createErrorRedactor(secrets);
+  return (value: string) => structured(text(value).slice(-64_000));
 }
 
 export function withoutSecretKeys(value: unknown): unknown {

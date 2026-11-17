@@ -3,7 +3,10 @@ import type { Pool, PoolClient } from 'pg';
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import type { Task, TaskDetail, TaskStatus } from '../shared/contracts.ts';
-import { actionTitle, toolTitle } from './action-presentation.ts';
+import type { ModelSelection, WorkKind } from '../shared/models.ts';
+import { modelSelectionInput } from './models.ts';
+import { recordedAction, toolTitle } from './action-presentation.ts';
+import { workspaceCommandsSql, workspaceCommand } from './workspace-commands.ts';
 import type { ChannelPresentation } from './channels.ts';
 import { classifyVerificationReply } from '../shared/verification-code.ts';
 import {
@@ -24,7 +27,8 @@ import { snapshotAnalytics, type CaptureAnalytics } from './analytics.ts';
 import { createPreferencesStore, deliveryTime, isQuietTime } from './preferences.ts';
 import { personalSecret } from './memory-tree.ts';
 import { texts as codeTexts } from './chat-verification.ts';
-import { waitingTurnSql, withdrawnSql } from './turn-chain.ts';
+import { waitingTurnSql, withdrawnSql, workKindSql, workOriginSql } from './turn-chain.ts';
+import { resemblesTaskAcknowledgement } from '../shared/task-ack.ts';
 
 const now = z.string().trim().min(1);
 const waits = z.array(
@@ -48,6 +52,7 @@ const input = z.discriminatedUnion('action', [
       steps: z.array(now).optional(),
       waitingFor: waits.optional(),
       nextCheck: nextCheck.optional(),
+      model: modelSelectionInput.optional(),
     })
     .strict(),
   z
@@ -92,6 +97,9 @@ type Row = {
   question: string | null;
   question_message_id: string | null;
   handoff: boolean;
+  model: ModelSelection | null;
+  work: WorkKind | null;
+  schedule_model: ModelSelection | null;
 };
 
 function failure(message: string, statusCode = 400) {
@@ -137,9 +145,14 @@ export function createTasks(options: {
   analytics?: CaptureAnalytics;
   refresh?: () => void;
   clearBrowser?: (id: string) => Promise<void>;
+  validateModel?: (choice: ModelSelection) => ModelSelection;
 }) {
   const { pool, ownerId } = options;
   const refresh = options.refresh ?? (() => {});
+  const validateModel = (choice: ModelSelection) => {
+    if (!options.validateModel) throw failure('Model choices are unavailable.');
+    return options.validateModel(choice);
+  };
   const preferences = createPreferencesStore(pool, ownerId);
 
   async function read(
@@ -161,8 +174,11 @@ export function createTasks(options: {
              AND n.session_id=u.session_id AND n.parent_turn_id=u.id) AS answered,
            COALESCE(${activeHandoffSql},false) AS handoff,
            COALESCE(q.text,CASE WHEN u.status='cancelled' THEN continuation.text END) AS question,
-           COALESCE(q.id,CASE WHEN u.status='cancelled' THEN continuation.id END) AS question_message_id
+           COALESCE(q.id,CASE WHEN u.status='cancelled' THEN continuation.id END) AS question_message_id,
+           t.model,CASE WHEN t.session_id=t.id THEN ${workKindSql('t', 'NULL')} END AS work,
+           work_schedule.model AS schedule_model
          FROM ranked t LEFT JOIN turns u ON u.id=t.turn_id AND u.owner_id=t.owner_id
+         ${workOriginSql('t')}
          LEFT JOIN LATERAL (SELECT m.id,m.text FROM messages m
            WHERE u.status='waiting' AND m.owner_id=u.owner_id AND m.turn_id=u.id AND m.role='assistant' AND m.text<>'' AND m.hidden_at IS NULL
            ORDER BY m.created_at DESC,m.id DESC LIMIT 1) q ON true
@@ -209,8 +225,71 @@ export function createTasks(options: {
         createdAt: row.created_at.toISOString(),
         updatedAt: row.updated_at.toISOString(),
         closedAt: row.closed_at?.toISOString() ?? null,
+        ...(row.work
+          ? {
+              model: row.model,
+              work: row.work,
+              ...(row.work === 'schedule' && row.schedule_model
+                ? { scheduleModel: row.schedule_model }
+                : {}),
+            }
+          : {}),
       };
     });
+  }
+
+  async function ownModels() {
+    return (
+      await pool.query<{ id: string; title: string; model: ModelSelection }>(
+        `SELECT id,title,model FROM tasks WHERE owner_id=$1 AND session_id=id AND model IS NOT NULL
+         AND state='open' ORDER BY updated_at DESC`,
+        [ownerId],
+      )
+    ).rows;
+  }
+
+  async function modelTask(id: string) {
+    const task = (
+      await pool.query<{ title: string }>(
+        'SELECT title FROM tasks WHERE id=$1 AND owner_id=$2 AND session_id=id',
+        [z.uuid().parse(id), ownerId],
+      )
+    ).rows[0];
+    if (!task) throw failure('This task has no model of its own to change.', 404);
+    return task.title;
+  }
+
+  async function workOf(id: string) {
+    const task = (await read(pool, { id, closed: true }))[0];
+    return task?.work ? { kind: task.work, schedule: task.scheduleModel ?? null } : undefined;
+  }
+
+  async function setModel(
+    client: Pick<PoolClient, 'query'>,
+    id: string,
+    model: ModelSelection | null,
+    actor: 'owner' | 'agent',
+  ) {
+    const { rowCount } = await client.query(
+      `UPDATE tasks SET model=$3::jsonb,updated_at=now() WHERE id=$1 AND owner_id=$2 AND session_id=id
+         AND model IS DISTINCT FROM $3::jsonb`,
+      [z.uuid().parse(id), ownerId, model ? JSON.stringify(model) : null],
+    );
+    if (!rowCount) {
+      const exists = await client.query(
+        'SELECT 1 FROM tasks WHERE id=$1 AND owner_id=$2 AND session_id=id',
+        [id, ownerId],
+      );
+      if (!exists.rowCount) throw failure('This task has no model of its own to change.', 404);
+      return false;
+    }
+    afterCommit(client, () =>
+      options.analytics?.({
+        event: 'setting_changed',
+        properties: { setting: 'task_model', actor, state: model ? 'configured' : 'default' },
+      }),
+    );
+    return true;
   }
 
   async function link(client: Pick<PoolClient, 'query'>, turnId: string, taskId: string) {
@@ -357,6 +436,8 @@ export function createTasks(options: {
     raw: unknown,
     sourceMessageId?: string | null,
     capture?: CaptureAnalytics,
+    priorMessageId?: string,
+    priorHandoff = false,
   ) {
     const request = input.parse(raw);
     if (request.action === 'list') return { tasks: await read(client) };
@@ -418,15 +499,32 @@ export function createTasks(options: {
       }
       id = randomUUID();
       const independent = current.proactive || current.session_id === turn.threadId;
+      if (request.model && (current.proactive || !independent || !sourceMessageId))
+        throw failure('Only a task you start from chat can have its own model.');
+      const model = request.model && validateModel(request.model);
       if (independent && !current.proactive && !sourceMessageId)
         throw failure('A new task needs an owner request.');
+      const prior =
+        priorMessageId && sourceMessageId
+          ? (
+              await client.query<{ id: string; text: string }>(
+                `SELECT m.id,m.text FROM messages m WHERE m.id=$1 AND m.owner_id=$2 AND m.thread_id=$3
+                 AND m.turn_id=$4 AND m.role='assistant' AND m.hidden_at IS NULL
+                 AND m.attachments='[]'::jsonb AND m.presentation IS NULL AND m.answer_choices IS NULL
+                 AND NOT EXISTS(SELECT 1 FROM tasks t WHERE t.owner_id=m.owner_id AND t.message_id=m.id)`,
+                [priorMessageId, ownerId, turn.threadId, turn.turnId],
+              )
+            ).rows[0]
+          : undefined;
       const messageId = current.proactive
         ? null
-        : await insertAssistantMessage(client, turn, request.message);
+        : prior && resemblesTaskAcknowledgement(prior.text, request.message, priorHandoff)
+          ? prior.id
+          : await insertAssistantMessage(client, turn, request.message);
       const sessionId = independent ? id : current.session_id;
       await client.query(
-        `INSERT INTO tasks(id,owner_id,turn_id,session_id,source_message_id,message_id,title,done_when,brief,now_text,steps,waiting_for,next_check,applied_revision,activity_key)
-         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
+        `INSERT INTO tasks(id,owner_id,turn_id,session_id,source_message_id,message_id,title,done_when,brief,now_text,steps,waiting_for,next_check,applied_revision,activity_key,model)
+         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`,
         [
           id,
           ownerId,
@@ -443,6 +541,7 @@ export function createTasks(options: {
           request.nextCheck ?? null,
           independent ? 0 : 1,
           current.proactive ? `${turn.threadId}:${request.key}` : null,
+          model ? JSON.stringify(model) : null,
         ],
       );
       if (independent) {
@@ -634,6 +733,7 @@ export function createTasks(options: {
       ALTER TABLE tasks ADD COLUMN IF NOT EXISTS continuation_message_id uuid REFERENCES messages(id);
       ALTER TABLE tasks ADD COLUMN IF NOT EXISTS brief text NOT NULL DEFAULT '';
       ALTER TABLE tasks ADD COLUMN IF NOT EXISTS activity_key text;
+      ALTER TABLE tasks ADD COLUMN IF NOT EXISTS model jsonb;
       CREATE UNIQUE INDEX IF NOT EXISTS tasks_activity ON tasks(owner_id,activity_key) WHERE activity_key IS NOT NULL;
       ALTER TABLE tasks ADD COLUMN IF NOT EXISTS steps jsonb NOT NULL DEFAULT '[]';
       ALTER TABLE tasks ADD COLUMN IF NOT EXISTS step_index integer NOT NULL DEFAULT 0;
@@ -673,7 +773,7 @@ export function createTasks(options: {
     const requests = messages.filter(
       (message) =>
         !placeholders.has(message.text) &&
-        !personalSecret.test(message.text) &&
+        !personalSecret(message.text) &&
         !credentialUrl.test(message.text) &&
         classifyVerificationReply(message.text).kind === 'ordinary',
     );
@@ -701,6 +801,15 @@ export function createTasks(options: {
       refresh();
       return { ok: true };
     });
+    app.put<{ Params: { id: string } }>('/api/tasks/:id/model', async (request) => {
+      const id = z.uuid().parse(request.params.id);
+      const { model } = z
+        .object({ model: modelSelectionInput.nullable() })
+        .strict()
+        .parse(request.body);
+      if (await setModel(pool, id, model && validateModel(model), 'owner')) refresh();
+      return (await read(pool, { id, closed: true }))[0];
+    });
     app.get<{ Params: { id: string } }>('/api/tasks/:id', async (request) => {
       const id = z.uuid().parse(request.params.id);
       const task = (await read(pool, { id, closed: true }))[0];
@@ -712,7 +821,7 @@ export function createTasks(options: {
          WHERE u.task_id=$1 AND u.owner_id=$2 AND e.type IN ('step','tool_complete','tool_failed')
            AND NOT (e.type='tool_complete' AND e.summary='apps')
          UNION ALL
-         SELECT a.id,'action',a.action,NULL,NULL,NULL,a.created_at
+         SELECT a.id,'action',a.action,a.target,NULL,NULL,a.created_at
          FROM app_actions a JOIN turns u ON u.id=a.turn_id
          WHERE u.task_id=$1 AND u.owner_id=$2 AND a.owner_id=$2
          UNION ALL
@@ -724,14 +833,31 @@ export function createTasks(options: {
         )
       ).rows.map((event) => {
         if (event.type === 'action') {
-          const { app, label } = actionTitle(event.summary);
-          return { ...event, type: 'tool_complete', summary: app ? `${app}: ${label}` : label };
+          const { label, target } = recordedAction(event.summary, event.site);
+          return { ...event, type: 'tool_complete', summary: label, site: target ?? null };
         }
         return event.type === 'message' || event.type === 'step'
           ? event
           : { ...event, summary: toolTitle(event.summary) };
       });
       return { task, events };
+    });
+    app.get<{ Params: { id: string } }>('/api/tasks/:id/commands', async (request) => {
+      const id = z.uuid().parse(request.params.id);
+      const task = await pool.query('SELECT 1 FROM tasks WHERE id=$1 AND owner_id=$2', [
+        id,
+        ownerId,
+      ]);
+      if (!task.rowCount) throw failure('Task not found.', 404);
+      const { rows } = await pool.query(
+        `SELECT * FROM (
+           SELECT * FROM (${workspaceCommandsSql}) commands
+           WHERE task_id=$1 AND owner_id=$2
+           ORDER BY "startedAt" DESC,id DESC LIMIT 200
+         ) recent ORDER BY "startedAt",id`,
+        [id, ownerId],
+      );
+      return { commands: rows.map(workspaceCommand) };
     });
     app.post<{ Params: { id: string } }>('/api/tasks/:id/stop', async (request) => {
       const capture = snapshotAnalytics(options.analytics);
@@ -813,13 +939,19 @@ export function createTasks(options: {
     };
   }
 
-  async function execute(turn: TurnRef, raw: unknown, sourceMessageId: string | null) {
+  async function execute(
+    turn: TurnRef,
+    raw: unknown,
+    sourceMessageId: string | null,
+    priorMessageId?: string,
+    priorHandoff?: boolean,
+  ) {
     const capture = snapshotAnalytics(options.analytics);
     const result = await transaction(async (client) => {
       await lockThread(client);
       return withTurnLock(
         turn.turnId,
-        () => act(client, turn, raw, sourceMessageId, capture),
+        () => act(client, turn, raw, sourceMessageId, capture, priorMessageId, priorHandoff),
         client,
       );
     }, pool);
@@ -835,6 +967,10 @@ export function createTasks(options: {
   return {
     initialize,
     execute,
+    setModel,
+    ownModels,
+    modelTask,
+    workOf,
     inherit,
     settle,
     context,

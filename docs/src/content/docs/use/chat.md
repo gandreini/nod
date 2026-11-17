@@ -17,6 +17,8 @@ Type in the message box and press Enter. Press Shift+Enter for a new line.
 
 Pasted text stays literal. Nod uses the clipboard's plain text even when the source also offers formatting. Line breaks, indentation and Markdown-looking characters such as `*priority*`, `# call` and `<u>text</u>` stay as written in the composer, the sent message and Nod's request. An unsent pasted draft keeps them after a reload.
 
+Messages can contain up to 100,000 characters. Some emoji and symbols count as two characters toward this limit. If your text is longer, the composer keeps your draft and asks you to shorten it or attach the content as a file.
+
 Web and desktop chat limit text message attempts to 120 per minute and audio message attempts to 120 per minute. If you reach either limit, wait and send again.
 
 Use the formatting toolbar when you want formatted text, including underline. Code stays literal, including text that looks like a link or a code fence.
@@ -100,16 +102,19 @@ For large files or formats whose waveform your browser can't read, the player sh
 
 The message box stays open while Nod works, so you can send another message at any time. A status line beside the animated Nod mark always shows what's happening:
 
-| The line says                                  | What it means                                                                                                                                                             |
-| ---------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| A rotating word, such as **Joining the dots…** | Nod is working but hasn't named a step yet. It appears the moment you send; Nod may be preparing your request or waiting on your model. Screen readers hear **Working…**. |
-| A step, such as "Comparing flight prices"      | What Nod is doing now. A label after it, such as **· skyscanner.net**, names the app, website, MCP server, or local files involved.                                       |
-| **Using Gmail** or **Using Slack**             | A tool is active without a more specific step. Nod names the app, website, MCP server, or local files it is using.                                                        |
-| **· 3 min** at the end                         | Nothing new has happened for that long. Slow models and websites can take minutes; **Stop** ends it.                                                                      |
+| The line says                                    | What it means                                                                                                                                                                                 |
+| ------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| A rotating word, such as **Joining the dots…**   | Nod is working but hasn't named a step yet. It appears the moment you send, while Nod prepares your request or for the first minute it waits on your model. Screen readers hear **Working…**. |
+| A step, such as "Comparing flight prices"        | What Nod is doing now. A label after it, such as **· skyscanner.net** or **· Running code**, names the app, website, MCP server, local files or kind of work involved.                        |
+| **Using Gmail** or **Using Slack**               | A tool is active without a more specific step. Nod names the app, website, MCP server, or local files it is using.                                                                            |
+| **Running code** or **Searching the web**        | Nod is running code or a command, reading or writing files, searching or reading the web, using its browser, or working with helpers.                                                         |
+| **Waiting for** and your model's name            | Your model has sent nothing for a minute or more. Slow and local models can take minutes.                                                                                                     |
+| "Gemini 3.8 Flash failed, trying again (1 of 3)" | Your model returned an error, such as being overloaded, and Nod is sending the same request again. The line moves on when the model answers; if the last try fails, Nod says so.              |
+| **· 3 min** at the end                           | Nothing new has happened for that long. Slow models and websites can take minutes; **Stop** ends it.                                                                                          |
 
-The line describes the work instead of showing internal tool names. Its **Using ...** fallback shows the active tool's label when Nod hasn't named a step. It never counts seconds or guesses when Nod will finish. When Nod answers, the answer takes its place. It clears when Nod asks you something or stops, and hides while the app reconnects. A failed send clears the line and shows an error. Steps come from Nod's own short descriptions and, when your model shares a summary of its reasoning, from that summary's heading, such as "Researching Málaga travel ideas".
+The line describes the work instead of showing internal tool names. When Nod hasn't named a step, it names the app, website or kind of work that's active, or the model Nod is waiting for. It never counts seconds or guesses when Nod will finish. When Nod answers, the answer takes its place. It clears when Nod asks you something or stops, and hides while the app reconnects. A failed send clears the line and shows an error. Steps come from Nod's own short descriptions, which appear as soon as Nod starts the tool they describe, and, when your model shares a summary of its reasoning, from that summary's heading, such as "Researching Málaga travel ideas".
 
-The line follows only the work on your messages. A task shows its progress on its own card, so a step never appears twice. While anything works, the message box says **Send another message to Nod…**. While a task works, a small dot pulses just above the top-right corner of the message box. A task that needs your answer shows a slightly larger pink dot with a question mark. Hover over a dot or focus it to see which task it is. Select it to open the task's card with a soft highlight: if the card is already on screen, the chat stays where it is; otherwise the chat scrolls to it.
+The line follows only the work on your messages. A task shows its progress on its own card, and a question from a task or schedule shows it on the small line above that question. While anything works, the message box says **Send another message to Nod…**. While a task works, a small dot pulses just above the top-right corner of the message box. A task that needs your answer shows a slightly larger pink dot with a question mark. Hover over a dot or focus it to see which task it is. Select it to open the task's card with a soft highlight: if the card is already on screen, the chat stays where it is; otherwise the chat scrolls to it.
 
 ### Send more while Nod works
 
@@ -117,9 +122,17 @@ When you send a message while Nod works, a second line says **Got your message. 
 
 ![Nod's status line reads "Comparing flight prices · skyscanner.net · 2 min", with "Got your message. I'll read it after this step." below it, after a follow-up message.](../../../assets/screens/chat-live-line.png)
 
+### Feedback during long tasks
+
+For longer tasks you request, Nod looks for a small useful part it can check before collecting everything or preparing the final output. This rule applies with any tool or source. A partial result must help you act or decide on its own and be worth an interruption. Nod weighs urgency, missing context, and recent messages. If related checks could change the result's meaning, Nod finishes those checks first.
+
+Nod sends the first result that meets these conditions as soon as it is ready, then continues the full request. It follows your delivery instructions. Later related findings arrive together. Each partial result states material limits and checked coverage.
+
+Routine activity stays in the live line. Time passing alone does not trigger another message. If no useful result is supported, Nod keeps checking. The status line continues while work remains.
+
 ### When Nod stops
 
-Work ends with an answer, a question, or a short message saying what stopped it. A schedule, or a task Nod started on its own, also tells you by name when it fails. When you only share context, such as a routine, Nod can save it without replying. Nod can send a useful, verified partial result before it finishes; the status line continues while work remains.
+Work ends with an answer, a question, or a short message saying what stopped it. A schedule, or a task Nod started on its own, also tells you by name when it fails. When you only share context, such as a routine, Nod can save it without replying.
 
 In the sidebar, the Chat item shows a moving dot while Nod works and a solid dot when it's waiting for you.
 
@@ -127,7 +140,7 @@ In the sidebar, the Chat item shows a moving dot while Nod works and a solid dot
 
 - **typing…** shows while Nod works on something you asked for, and stays on during slow steps.
 - A message you send while Nod works gets a 👀 reaction until Nod reads it.
-- Telegram also shows a quoted progress section when its first message [supports live updates](/use/channels/#while-nod-works). Named steps use your conversation language; the **Using** fallback is in English. A longer request has one short opening message so the progress has a place to update; a saved task uses its start message.
+- Telegram also shows a quoted progress section when its first message [supports live updates](/use/channels/#while-nod-works). Named steps use your conversation language; fallbacks such as **Using Gmail** or **Running code**, and retry notes, are in English. Telegram doesn't show the **Waiting for** line. A longer request has one short opening message so the progress has a place to update; a saved task uses its start message.
 - WhatsApp Business Cloud connections stop typing when the 24-hour reply window closes. QR connections have no such limit.
 
 None of these send a notification. See [Message cadence](/how-it-works/agent-runtime/#message-cadence). A file Nod shares is attached to its next answer, or sent on its own when none follows.
@@ -160,7 +173,7 @@ macOS controls whether badges appear. In **System Settings > Notifications > Nod
 
 ## Answer Nod's questions
 
-When a task needs a decision, an approval or your help in its browser, it asks and waits. Reply to its question to continue the session that asked. Other tasks can keep working. For actions that need a yes or no, see [Approvals](/trust/approvals/).
+When a task needs a decision, an approval or your help in its browser, it asks and waits. Reply to its question to continue the session that asked. Other tasks can keep working. A question from a task or a scheduled run has a small line above it with the name of that work: a pink dot while it waits for you, then a pulsing dot and the current step while the work continues after your answer. For a task, select the line to go to its card. For actions that need a yes or no, see [Approvals](/trust/approvals/).
 
 For a question with a few useful answers, Nod shows the question as a card with its choices, each marked A, B, C, one line each. Select a choice to send it as a reply to that question, even when a newer question appears below it. When Nod says you can pick one or more, select every choice that fits, add your own in **Type your own answer** if you like, then select **Done** or press Enter.
 
@@ -174,7 +187,7 @@ Nod doesn't ask for passwords or card numbers in chat. It uses a saved login or 
 
 While Nod works, the status line under the chat shows its work on your messages, and each task shows its progress on its card and as a dot above the message box.
 
-While the message box is empty, the send button becomes **Stop**. Select it to stop Nod. Typing a message restores **Send**.
+While the message box is empty, **Stop** appears beside the send button while Nod is working. Select it to stop Nod. The send button stays in place and becomes available when you type a message.
 
 The main Stop control ends active work, cancels queued messages and open questions, and closes all open tasks. To stop only one task, open its preview and select **Stop**. Your schedules stay configured. Stop can't undo something that already happened, such as an email that was already sent.
 
@@ -183,6 +196,10 @@ A request you stop, or one you started whose model request fails at the provider
 You can also tell Nod in the main chat, from any app, for example "stop everything" or "stop the flight search". Nod stops every task, scheduled run and app check, or only the task you name, and tells you what it stopped. Nod reads your message after its current step, or after its current reply if you write from another app. For an immediate stop, use the Stop control, or `/stop` in Telegram.
 
 When a run you started stops on an error or on your spending limit, Nod tells you what failed in the main chat or as a reply to the affected task. For a failed agent model request, Nod shows the provider and model that handled it, the service's specific reason and status, and useful details after removing secrets.
+
+The failure links to **Settings > Models**. You can check the connection or choose another model there. A connection or stream failure also keeps the available cause and request phase. It does not establish whether a provider outage or your network caused the failure. When Nod records a failure for your model, the provider's reason also shows above the message box, and automatic work on that model waits. Failures Nod retries on its own, such as an overload, aren't recorded. After your message fails at the model, and while a failure is recorded, a notice above the message box lets you switch to another connected model or try again with the same model. Both buttons send your last message again when it failed at the model and was plain text. A message with attachments, a reply or a card answer isn't sent again for you, so send it again yourself. You can still start a new request yourself. See [Models](/connect/models/) for recovery details.
+
+Nod can also end a run after five repeated failures for the same tool. These include invalid input, unavailable tools, and failed sign-in or action review checks. A successful call resets that tool's count. Nod keeps the last specific cause, so you can see what stopped the work. Approval and sign-in checks still apply when you ask again.
 
 If the service reports an oversized tokens-per-minute request, the error keeps its requested and allowed token counts and suggests shortening the conversation or choosing a model with a higher limit. If a daily quota error includes a retry delay, Nod gives you an approximate wait time. For an account or workspace usage cap, wait for the limit to reset or check its settings; a workspace admin may need to raise it. Nod's next turn knows what went wrong.
 
@@ -204,7 +221,7 @@ In the desktop app, hold Command on a Mac or Ctrl on Windows and Linux to reveal
 
 ## React to messages
 
-To react to one of Nod's replies, hover over the bubble and select its reaction icon, or hold or right-click the bubble and choose **React**. Pick a quick reaction, or choose **More emoji** to search and scroll through the full picker. Your reaction appears at the bottom of the bubble and is sent as a reply to that message for Nod to interpret. A thumbs-up can answer a question. On an action confirmation, 👍 or 👎 confirms or declines the exact action Nod asked about. For other reactions, Nod asks for confirmation before acting outside chat. Select the reaction to remove it from the bubble. Removing or changing it does not undo a reply or action already sent.
+To react to one of Nod's replies, hover over the bubble and select its reaction icon, or hold or right-click the bubble and choose **React**. Pick a quick reaction, or choose **More emoji** to search and scroll through the full picker. Your reaction appears at the bottom of the bubble without adding another chat message, and Nod can interpret it as a response to that message. A thumbs-up can answer a question. On an action confirmation, 👍 or 👎 confirms or declines the exact action Nod asked about. For other reactions, Nod asks for confirmation before acting outside chat. Select the reaction to remove it from the bubble. Removing or changing it does not undo a response or action already sent.
 
 Nod sometimes reacts to your messages too, such as ✅ when you say yes to something it offered or ❤️ when you thank it. It reacts only now and then, and a reaction never replaces its reply.
 
@@ -226,9 +243,9 @@ Links to Nod screens open in the current window. A link to **Settings > Models**
 
 In Telegram and WhatsApp, a screen link opens a public page. Select **Open in Nod** on the computer where Nod is installed. On a phone, use the location on that page to continue in Nod on your computer. The link contains only the screen name. It cannot change settings or approve an action.
 
-You can also ask Nod to change supported settings from any channel. For example, ask it to use a connected model, set quiet hours, change the time zone or clock format, or set a spending limit. Nod uses its tools and reports the saved result. It asks when your request does not identify the target or value. Model sign-in and device settings, such as launch at login, still need the app.
+You can also ask Nod to change supported settings from any channel. For example, ask it to use a connected model, for chat, schedules, one schedule, one task or its own work, set quiet hours, change the time zone or clock format, or set a spending limit. Nod uses its tools and reports the saved result. It asks when your request does not identify the target or value. Model sign-in and device settings, such as launch at login, still need the app.
 
-Links stay inline in the reply. Hover over a link, or focus it with the keyboard, to see its full address. Select a link, or press Enter while it is focused, to open its page. Nod sends Telegram and WhatsApp replies with link previews turned off.
+Links stay inline in the reply. Hover over a link, or focus it with the keyboard, to see its full address. Select a link, or press Enter while it is focused, to open its page. In the desktop app, right-click a link and choose **Copy link address** to copy its destination. Nod sends Telegram and WhatsApp replies with link previews turned off.
 
 ## Replies go back where you wrote
 

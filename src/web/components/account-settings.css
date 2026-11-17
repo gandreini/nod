@@ -286,11 +286,35 @@
   gap: 28px;
   margin-top: 18px;
 }
+.account-quiet-times[data-cycle='h12'] {
+  grid-template-columns: repeat(2, minmax(0, 176px));
+}
 .account-theme-previews {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 12px;
   max-width: 620px;
+}
+.account-font-size {
+  margin-top: 16px;
+}
+.account-font-size-actions {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: 8px;
+}
+.account-font-size-stepper .button {
+  width: 32px;
+  min-height: 32px;
+  padding: 6px;
+  color: var(--foreground);
+}
+.account-font-size-stepper output {
+  min-width: 52px;
+  text-align: center;
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
 }
 .account-theme-previews > button {
   min-width: 0;
@@ -621,6 +645,9 @@
   .account-quiet-times {
     grid-template-columns: repeat(2, minmax(0, 1fr));
     gap: 16px;
+  }
+  .account-quiet-times[data-cycle='h12'] {
+    grid-template-columns: minmax(0, 176px);
   }
 }
 @media (prefers-reduced-motion: reduce) {

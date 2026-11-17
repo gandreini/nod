@@ -1,6 +1,10 @@
 {
-  "version": "0.7.1",
-  "previousTag": "nod-v0.7.0",
-  "source": "e28a6e9fac34f9f352a48c4ad39ee2ccf8d5d4ca",
-  "highlights": "## 🩹 Chats and tasks keep going\n\nSome chats and tasks stopped with “Cannot read properties of undefined (reading 'trim')”, often in the middle of longer work. Nod now repairs an incomplete earlier reply before each model request, so the work continues. If a task stopped with this error, reply to it to continue.\n\n## 🇪🇺 OpenAI projects with a data region\n\nOpenAI connections now have an **API region**. Set it to your OpenAI project's region, such as the EU, when you connect with an API key. Existing connections stay on **Global**. [Connect OpenAI](https://nod.n8n.io/docs/connect/models/)\n\n## Also in this release\n\n- **Model errors:** When a provider refuses a request, Nod keeps its specific reason, such as a request that's too large or a used-up daily quota, and suggests a next step only when one helps.\n- **Shortcuts:** Command/Ctrl+1–6 switch sections in the desktop app even while you type in chat.\n- **Activity:** Live status says what Nod is doing, such as “Using Gmail”.\n- **Sign-in:** After you connect an app, the page shows one clear way back to Nod."
+  "version": "0.8.2",
+  "previousTag": "nod-v0.8.1",
+  "source": "60598bd3cac73a5ea6bc3814cf28faf46e7aaf18",
+  "highlights": "## 🛠️ Give first setup another try\n\nLinux setup now checks the private computer image before it starts. Its new copy method avoids the image-copy failure on eCryptfs home folders.\n\nNew Mac and Linux setups also record their progress before the first start. If that start fails or is stopped, retry can rebuild the unfinished computer. Completed computers keep their data. An older interrupted Mac setup may still need help; send its startup log in feedback.\n\n## 📂 File permission, without a detour\n\nAsk Nod to list Downloads, read an invoice, or save a report. If local file access is off, Nod can now ask to turn it on in chat, save your choice, and continue your request.\n\nThis setting covers allowed locations in your home folder and on external drives. Your excluded folders and the checks for each file action still apply. Change the setting in **Settings → Privacy & data**, or ask Nod to turn it off.\n\n## Also in this release\n\n- **Long requests:** Nod checks request size before sending it to a model. Large content stays available in workspace files, with shorter previews in the request.\n- **Setup:** A retry after account setup no longer repeats the account save when only the local device check failed.\n- **Contacts:** Shared contact previews now read quoted vCard parameters, including values with colons or semicolons.",
+  "video": {
+    "url": "https://github.com/user-attachments/assets/36162631-867d-441b-b77d-ce43ec06c4bd",
+    "releaseSha256": "53c9cae5bdda3cc273de5e38105af524fb6bb1b8b43818ebe7e339f47a1cb524"
+  }
 }

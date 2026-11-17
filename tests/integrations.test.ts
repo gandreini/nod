@@ -33,7 +33,9 @@ import type { Agent, AgentEvent, AgentToolResult, RuntimeContext } from '../src/
 import { type DiscoveredOAuthState } from '../src/ports/discovered.ts';
 import {
   IntegrationCatalogAccessDenied,
+  IntegrationCatalogFailure,
   IntegrationConnectionError,
+  IntegrationInboxTransientError,
   IntegrationPermissionError,
   type IntegrationFile,
   type IntegrationProvider,
@@ -42,6 +44,7 @@ import {
 } from '../src/ports/integrations.ts';
 import { createComposioProvider } from '../src/providers/composio/integrations.ts';
 import { createComposioProxy } from '../src/providers/composio/proxy.ts';
+import { logFailure } from '../src/server/failure-log.ts';
 import { serviceEnvironment } from '../src/providers/process.ts';
 import { createIntegrationIdentityCheckpoint } from '../src/server/integration-identity.ts';
 import { createIntegrationBrowser } from '../src/server/integration-browser.ts';
@@ -52,9 +55,12 @@ import { registerLocalAccess } from '../src/server/access.ts';
 import { createIntegrations, initializeIntegrationSchema } from '../src/server/integrations.ts';
 import { cachedIcons } from '../src/server/link-previews.ts';
 import { createErrorRedactor } from '../src/server/redaction.ts';
+import { createFeedbackRedactor } from '../src/server/feedback-redaction.ts';
 import { createLedger } from '../src/server/ledger.ts';
+import { createActivityLog } from '../src/server/activity-log.ts';
+import { createVaultAccess } from '../src/server/vault-access.ts';
 import { usagePdf } from '../src/server/usage-report.ts';
-import type { TrustEntry } from '../src/shared/trust.ts';
+import type { TrustEntry, TrustPage, TrustStep } from '../src/shared/trust.ts';
 import { createAppGrantVault } from '../src/server/vault-app-grants.ts';
 import { createWorkAdmission } from '../src/server/work-admission.ts';
 import { integrationServiceIds, integrationServices } from '../src/shared/integrations.ts';
@@ -1208,6 +1214,277 @@ test('managed integration requests bind SDK calls to a private persisted install
   }
 });
 
+test('a refused broker request keeps the broker status and only known codes', async (t) => {
+  const refusingProxy = async (
+    t: TestContext,
+    respond: (path: string, body: Record<string, unknown>, signal: AbortSignal) => Response,
+  ) => {
+    const root = await mkdtemp(join(tmpdir(), 'nod-connect-refusal-'));
+    t.after(() => rm(root, { recursive: true, force: true }));
+    const proxy = createComposioProxy({
+      dataRoot: root,
+      ownerId: 'fixture-owner',
+      keyStore: installationKeyStore,
+      checkpoint: fixtureIdentityCheckpoint,
+      url: 'https://proxy.example.test',
+      browser: eagerConnectionBrowser(),
+      request: async (input, init) => {
+        const request = new Request(input, init);
+        const path = new URL(request.url).pathname;
+        if (path === '/v2/access/enroll')
+          return Response.json({ state: 'enabled', userId: proxy.userId });
+        return respond(path, JSON.parse(await request.text()), request.signal);
+      },
+    });
+    await proxy.initialize();
+    return proxy;
+  };
+  const start = (proxy: ReturnType<typeof createComposioProxy>) =>
+    proxy.authorize(
+      'gmail',
+      `http://localhost:4310/api/apps/callback?state=${randomBytes(32).toString('base64url')}`,
+    );
+  const refusal = (proxy: ReturnType<typeof createComposioProxy>) =>
+    start(proxy).then(
+      () => assert.fail('The refused connection start resolved.'),
+      (error: unknown) => error,
+    );
+  for (const [status, body, reason, code] of [
+    [429, '{"error":"rate_limited"}', 'rate_limit', 'rate_limited'],
+    [429, '{"error":"public_budget_exceeded"}', 'rate_limit', 'public_budget_exceeded'],
+    [429, '{"error":"provider_rate_limited"}', 'rate_limit', 'provider_rate_limited'],
+    [503, '{"error":"service_unavailable"}', 'unavailable', 'service_unavailable'],
+    [503, '{"error":"provider_unavailable"}', 'unavailable', 'provider_unavailable'],
+    [502, '{"error":"provider_request_failed"}', 'unavailable', 'provider_request_failed'],
+    [503, '{"error":"connections_unavailable"}', 'unavailable', 'connections_unavailable'],
+    [403, '{"error":"installation_revoked"}', 'permission', 'installation_revoked'],
+    [409, '{"error":"account_revoking"}', 'invalid_request', 'account_revoking'],
+    [400, '{"error":"invalid_callback"}', 'invalid_request', 'invalid_callback'],
+    [401, '{"error":"expired_authentication"}', 'authorization', 'expired_authentication'],
+    [415, '{"error":"json_required"}', 'invalid_request', 'json_required'],
+    [413, '{"error":"request_too_large"}', 'invalid_request', 'request_too_large'],
+    [408, '{"error":"request_timeout"}', 'timeout', 'request_timeout'],
+    [403, '{"error":"synthetic-private-detail"}', 'permission', undefined],
+    [500, 'synthetic upstream page', 'unavailable', undefined],
+  ] as const) {
+    await t.test(`HTTP ${status}`, async (t) => {
+      const proxy = await refusingProxy(t, (path) => {
+        assert.equal(path, '/v2/connect/start');
+        return new Response(body, {
+          status,
+          headers: { 'Content-Type': body.startsWith('{') ? 'application/json' : 'text/html' },
+        });
+      });
+      const error = await refusal(proxy);
+      assert.ok(error instanceof IntegrationConnectionError);
+      assert.equal(error.status, status);
+      assert.equal(error.reason, reason);
+      assert.equal(error.code, code);
+      assert.equal(error.phase, 'link');
+      assert.doesNotMatch(error.message, /synthetic/);
+    });
+  }
+  for (const variant of ['declared', 'streamed'] as const) {
+    await t.test(`${variant} refusal body over the size limit`, async (t) => {
+      let pulled = 0;
+      let cancelled = false;
+      const chunk = new TextEncoder().encode(
+        `{"error":"public_budget_exceeded","padding":"${'x'.repeat(8_000)}`,
+      );
+      const proxy = await refusingProxy(
+        t,
+        () =>
+          new Response(
+            new ReadableStream<Uint8Array>(
+              {
+                pull(controller) {
+                  pulled += chunk.byteLength;
+                  controller.enqueue(chunk);
+                },
+                cancel() {
+                  cancelled = true;
+                },
+              },
+              { highWaterMark: 0 },
+            ),
+            {
+              status: 503,
+              headers: {
+                'Content-Type': 'application/json',
+                ...(variant === 'declared' ? { 'Content-Length': '40000' } : {}),
+              },
+            },
+          ),
+      );
+      const error = await refusal(proxy);
+      assert.ok(error instanceof IntegrationConnectionError);
+      assert.equal(error.status, 503);
+      assert.equal(error.code, undefined);
+      assert.equal(cancelled, true);
+      if (variant === 'declared') assert.equal(pulled, 0);
+      else assert.ok(pulled <= 32_768 + chunk.byteLength, `read ${pulled} bytes`);
+    });
+  }
+  await t.test('a caller cancellation while the refusal is read', async (t) => {
+    const controller = new AbortController();
+    const cancellation = new Error('Synthetic caller cancellation.');
+    const proxy = await refusingProxy(t, (path, body) => {
+      if (path === '/v2/connect/start')
+        return Response.json({
+          redirectUrl: 'https://proxy.example.test/v2/connect/pair?ticket=synthetic',
+          transactionId: body.transactionId,
+        });
+      assert.equal(path, '/v2/connect/status');
+      controller.abort(cancellation);
+      return Response.json({ error: 'service_unavailable' }, { status: 503 });
+    });
+    const attempt = await start(proxy);
+    await assert.rejects(proxy.connectionStatus(attempt.url, controller.signal), (error) => {
+      assert.equal(error, cancellation);
+      return true;
+    });
+  });
+  await t.test('an internal timeout while the refusal is read', async (t) => {
+    const timeout = new AbortController();
+    const expired = new DOMException('Synthetic deadline.', 'TimeoutError');
+    let pulls = 0;
+    const proxy = await refusingProxy(t, (path, body) => {
+      if (path === '/v2/connect/start')
+        return Response.json({
+          redirectUrl: 'https://proxy.example.test/v2/connect/pair?ticket=synthetic',
+          transactionId: body.transactionId,
+        });
+      assert.equal(path, '/v2/connect/status');
+      return new Response(
+        new ReadableStream<Uint8Array>(
+          {
+            pull(controller) {
+              pulls++;
+              timeout.abort(expired);
+              controller.error(expired);
+            },
+          },
+          { highWaterMark: 0 },
+        ),
+        { status: 503 },
+      );
+    });
+    const attempt = await start(proxy);
+    t.mock.method(AbortSignal, 'timeout', () => timeout.signal);
+    await assert.rejects(proxy.connectionStatus(attempt.url), (error) => {
+      assert.equal(error, expired);
+      return true;
+    });
+    assert.equal(pulls, 1);
+  });
+  await t.test('failure logging keeps only numeric HTTP status', (t) => {
+    const entries: Array<{ status?: number }> = [];
+    t.mock.method(console, 'error', (line: string) => {
+      entries.push(JSON.parse(line));
+    });
+    for (const status of [429, 'synthetic-private-status', 0, 600, 429.5])
+      logFailure('app_connection_start', { status });
+    assert.deepEqual(
+      entries.map((entry) => entry.status),
+      [429, undefined, undefined, undefined, undefined],
+    );
+  });
+  await t.test('enrollment during an app catalog request', async (t) => {
+    const root = await mkdtemp(join(tmpdir(), 'nod-enroll-refusal-'));
+    t.after(() => rm(root, { recursive: true, force: true }));
+    const proxy = createComposioProxy({
+      dataRoot: root,
+      ownerId: 'fixture-owner',
+      keyStore: installationKeyStore,
+      checkpoint: fixtureIdentityCheckpoint,
+      url: 'https://proxy.example.test',
+      request: async (input, init) => {
+        assert.equal(new URL(new Request(input, init).url).pathname, '/v2/access/enroll');
+        return Response.json({ error: 'public_budget_exceeded' }, { status: 429 });
+      },
+    });
+    await proxy.initialize();
+    await assert.rejects(
+      createComposioProvider({ proxy }).listServices!(),
+      (error: unknown) =>
+        error instanceof IntegrationCatalogFailure &&
+        error.status === 429 &&
+        error.code === 'public_budget_exceeded',
+    );
+  });
+  for (const [skew, accepted] of [
+    [-30_000, true],
+    [10 * 60_000, true],
+    [-30_000, false],
+  ] as const) {
+    await t.test(
+      `a computer clock ${Math.abs(skew / 1000)}s ${skew < 0 ? 'fast' : 'slow'} ${accepted ? 'connects' : 'keeps a repeated refusal'}`,
+      async (t) => {
+        const root = await mkdtemp(join(tmpdir(), 'nod-clock-skew-'));
+        t.after(() => rm(root, { recursive: true, force: true }));
+        const signed: Array<{ path: string; current: boolean }> = [];
+        const requestIds: string[] = [];
+        const proxy = createComposioProxy({
+          dataRoot: root,
+          ownerId: 'fixture-owner',
+          keyStore: installationKeyStore,
+          checkpoint: fixtureIdentityCheckpoint,
+          url: 'https://proxy.example.test',
+          browser: eagerConnectionBrowser(),
+          request: async (input, init) => {
+            const request = new Request(input, init);
+            const path = new URL(request.url).pathname;
+            const service = Date.now() + skew;
+            const issuedAt = Number(request.headers.get('x-nod-timestamp')) * 1000;
+            requestIds.push(request.headers.get('x-nod-request-id') ?? '');
+            const current = accepted && issuedAt >= service - 60_000 && issuedAt <= service + 5_000;
+            signed.push({ path, current });
+            const headers = { Date: new Date(service).toUTCString() };
+            if (!current)
+              return Response.json({ error: 'expired_authentication' }, { status: 401, headers });
+            if (path === '/v2/access/enroll')
+              return Response.json({ state: 'enabled', userId: proxy.userId }, { headers });
+            assert.equal(path, '/v2/connect/start');
+            return Response.json(
+              {
+                redirectUrl: 'https://proxy.example.test/v2/connect/pair?ticket=synthetic',
+                transactionId: JSON.parse(await request.text()).transactionId,
+              },
+              { headers },
+            );
+          },
+        });
+        await proxy.initialize();
+        const attempt = proxy.authorize(
+          'gmail',
+          `http://localhost:4310/api/apps/callback?state=${randomBytes(32).toString('base64url')}`,
+        );
+        if (accepted) {
+          await attempt;
+          assert.deepEqual(signed, [
+            { path: '/v2/access/enroll', current: false },
+            { path: '/v2/access/enroll', current: true },
+            { path: '/v2/connect/start', current: true },
+          ]);
+          assert.equal(new Set(requestIds).size, requestIds.length);
+          return;
+        }
+        await assert.rejects(attempt, (error: unknown) => {
+          assert.ok(error instanceof IntegrationConnectionError);
+          assert.equal(error.status, 401);
+          assert.equal(error.code, 'expired_authentication');
+          return true;
+        });
+        assert.deepEqual(signed, [
+          { path: '/v2/access/enroll', current: false },
+          { path: '/v2/access/enroll', current: false },
+        ]);
+        assert.equal(new Set(requestIds).size, requestIds.length);
+      },
+    );
+  }
+});
+
 test('hosted app connection bridge keeps browser proof on the configured origin', async (t) => {
   for (const [origin, service] of [
     ['https://nod.customer.example', 'gmail'],
@@ -1373,6 +1650,7 @@ test('hosted connection attempts fail closed after expiry or invalid startup', a
   for (const variant of [
     'expired',
     'broker-failure',
+    'broker-refusal',
     'foreign-broker',
     'invalid-key',
     'cancelled-start',
@@ -1396,6 +1674,13 @@ test('hosted connection attempts fail closed after expiry or invalid startup', a
             await continueStart;
           }
           if (variant === 'broker-failure') throw new Error('Synthetic broker failure.');
+          if (variant === 'broker-refusal')
+            throw new IntegrationConnectionError(
+              'rate_limit',
+              'link',
+              429,
+              'public_budget_exceeded',
+            );
           return variant === 'foreign-broker'
             ? 'https://attacker.example.test/v2/connect/pair?ticket=synthetic'
             : brokerOrigin + '/v2/connect/pair?ticket=synthetic';
@@ -1429,6 +1714,11 @@ test('hosted connection attempts fail closed after expiry or invalid startup', a
         }
         const started = await pending;
         assert.equal(started.statusCode, variant === 'expired' ? 403 : 400, started.body);
+        if (variant === 'broker-refusal') {
+          assert.match(started.json().error, /public_budget_exceeded/);
+          assert.match(started.json().error, /HTTP 429/);
+        }
+        if (variant === 'broker-failure') assert.doesNotMatch(started.body, /Synthetic/);
         assert.equal(starts, ['expired', 'invalid-key'].includes(variant) ? 0 : 1);
         assert.equal(browser.owns(url.href), false);
         assert.equal(browser.remote(url.href), undefined);
@@ -3378,6 +3668,37 @@ test(
     assert.deepEqual(Object.keys(missingAuthAccess.json()), ['error']);
     assert.match(missingAuthAccess.json().error, /connection service/);
     assert.doesNotMatch(missingAuthAccess.body, /synthetic-private-auth-response/);
+    failure = Object.assign(
+      new IntegrationCatalogFailure('rate_limit', 429, 'public_budget_exceeded'),
+      {
+        cause: new Error('synthetic-private-catalog-response'),
+      },
+    );
+    const limitedCatalog = await f.app.inject({ url: '/api/apps/catalog' });
+    assert.equal(limitedCatalog.statusCode, 429);
+    assert.deepEqual(Object.keys(limitedCatalog.json()), ['error']);
+    assert.match(limitedCatalog.json().error, /public_budget_exceeded/);
+    assert.match(limitedCatalog.json().error, /429/);
+    assert.doesNotMatch(limitedCatalog.body, /synthetic-private-catalog-response/);
+    await assert.rejects(
+      f.service.manageConnections('discover', undefined, undefined, undefined, undefined, 'gmail'),
+      (error: unknown) =>
+        error instanceof IntegrationCatalogFailure && error.code === 'public_budget_exceeded',
+    );
+    failure = new IntegrationCatalogFailure('unavailable', 503, 'security_service_unavailable');
+    const unavailableCatalog = await f.app.inject({ url: '/api/apps/catalog' });
+    assert.equal(unavailableCatalog.statusCode, 503);
+    assert.match(unavailableCatalog.json().error, /security_service_unavailable/);
+    assert.match(unavailableCatalog.json().error, /503/);
+    failure = new IntegrationCatalogFailure('unavailable', 502, 'invalid_provider_response');
+    const invalidProviderCatalog = await f.app.inject({ url: '/api/apps/catalog' });
+    assert.equal(invalidProviderCatalog.statusCode, 502);
+    assert.match(invalidProviderCatalog.json().error, /invalid_provider_response/);
+    assert.match(invalidProviderCatalog.json().error, /502/);
+    failure = new IntegrationCatalogAccessDenied('installation_revoked');
+    const revoked = await f.app.inject({ url: '/api/apps/catalog' });
+    assert.equal(revoked.statusCode, 403);
+    assert.match(revoked.json().error, /installation_revoked/);
     failure = new IntegrationCatalogAccessDenied();
     const denied = await f.app.inject({ url: '/api/apps/catalog' });
     assert.equal(denied.statusCode, 403);
@@ -5885,6 +6206,128 @@ test(
 );
 
 test(
+  'transient inbox failures retain completed receipts and retry before the normal interval',
+  { skip: !process.env.TEST_DATABASE_URL },
+  async (t) => {
+    const f = await appsFixture(t);
+    f.provider.webhooksConfigured = false;
+    const selected = await f.connect('gmail');
+    const message = (id: string) => ({
+      id,
+      threadId: 'fixture-thread',
+      subject: 'Fixture update',
+      sender: 'sender@example.test',
+      receivedAt: '2026-01-01T00:00:00.000Z',
+    });
+    const cursors: Array<string | null> = [];
+    let unavailable = true;
+    f.provider.pollInbox = async (_account, cursor) => {
+      cursors.push(cursor);
+      if (cursor === null) return { cursor: 'baseline', hasMore: false, messages: [] };
+      if (cursor === 'baseline')
+        return {
+          cursor: 'remaining',
+          hasMore: true,
+          retryAfterMs: 60_000,
+          messages: [message('first')],
+        };
+      if (unavailable) throw new IntegrationInboxTransientError(503);
+      return {
+        cursor: 'complete',
+        hasMore: false,
+        messages: [message('first'), message('second')],
+      };
+    };
+    const row = async () =>
+      (
+        await f.pool.query<{
+          inbox_cursor: string | null;
+          inbox_poll_at: Date;
+          inbox_failed: boolean;
+          inbox_reconnect_required: boolean;
+        }>(
+          'SELECT inbox_cursor,inbox_poll_at,inbox_failed,inbox_reconnect_required FROM app_connections WHERE id=$1',
+          [selected.connectionId],
+        )
+      ).rows[0];
+    const assertShortRetry = (pollAt: Date) => {
+      const waitMs = pollAt.getTime() - Date.now();
+      assert.ok(waitMs > 30_000 && waitMs <= 65_000, `Retry in ${waitMs} ms`);
+    };
+    await f.service.pollInboxes();
+    await f.pool.query('UPDATE app_connections SET inbox_poll_at=NULL WHERE id=$1', [
+      selected.connectionId,
+    ]);
+    await f.service.pollInboxes();
+    assert.equal((await row()).inbox_cursor, 'remaining');
+    assert.equal((await row()).inbox_failed, false);
+    assertShortRetry((await row()).inbox_poll_at);
+    assert.equal((await f.pool.query('SELECT id FROM integration_events')).rowCount, 1);
+    await f.service.pollInboxes();
+    assert.deepEqual(cursors, [null, 'baseline']);
+    await f.pool.query('UPDATE app_connections SET inbox_poll_at=now() WHERE id=$1', [
+      selected.connectionId,
+    ]);
+    await f.service.pollInboxes();
+    assert.deepEqual(cursors, [null, 'baseline', 'remaining']);
+    assert.equal((await row()).inbox_cursor, 'remaining');
+    assert.equal((await row()).inbox_failed, true);
+    assert.equal((await row()).inbox_reconnect_required, false);
+    assertShortRetry((await row()).inbox_poll_at);
+    await f.service.pollInboxes();
+    assert.deepEqual(cursors, [null, 'baseline', 'remaining']);
+    unavailable = false;
+    await f.pool.query('UPDATE app_connections SET inbox_poll_at=now() WHERE id=$1', [
+      selected.connectionId,
+    ]);
+    await f.service.pollInboxes();
+    assert.equal((await row()).inbox_cursor, 'complete');
+    assert.equal((await row()).inbox_failed, false);
+    assert.equal((await f.pool.query('SELECT id FROM integration_events')).rowCount, 2);
+  },
+);
+
+test(
+  'shutdown releases a claimed inbox poll after the account becomes inactive',
+  { skip: !process.env.TEST_DATABASE_URL, timeout: 15_000 },
+  async (t) => {
+    const f = await appsFixture(t);
+    f.provider.webhooksConfigured = false;
+    const selected = await f.connect('gmail');
+    let enter = () => {};
+    const entered = new Promise<void>((resolve) => {
+      enter = resolve;
+    });
+    f.provider.pollInbox = async (_account, _cursor, signal) => {
+      enter();
+      return new Promise<never>((_resolve, reject) => {
+        if (signal.aborted) reject(signal.reason);
+        else signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+      });
+    };
+    const running = f.service.pollInboxes();
+    await entered;
+    await f.pool.query('UPDATE app_connections SET account_active=false WHERE id=$1', [
+      selected.connectionId,
+    ]);
+    await f.app.close();
+    await running;
+    const row = (
+      await f.pool.query<{
+        account_active: boolean;
+        inbox_claim_id: string | null;
+        inbox_poll_at: Date;
+      }>('SELECT account_active,inbox_claim_id,inbox_poll_at FROM app_connections WHERE id=$1', [
+        selected.connectionId,
+      ])
+    ).rows[0];
+    assert.equal(row.account_active, false);
+    assert.equal(row.inbox_claim_id, null);
+    assert.ok(row.inbox_poll_at.getTime() <= Date.now() + 5_000);
+  },
+);
+
+test(
   'disconnect during a claimed event prevents admission and cannot revive discarded delivery',
   { skip: !process.env.TEST_DATABASE_URL, timeout: 15_000 },
   async (t) => {
@@ -6379,6 +6822,7 @@ function composioProxyFixture(
     parseCallback: async () => assert.fail('Unexpected fixture callback.'),
     upload: async () => assert.fail('Unexpected fixture upload.'),
     isPendingAccount: () => false,
+    backoff: () => undefined,
     ...overrides,
   };
 }
@@ -8566,6 +9010,30 @@ test(
       path.tools?.map((tool) => tool.name),
       ['notion-search', 'notion-fetch'],
     );
+    const until = Date.now() + 120_000;
+    const backoff = provider.connectionBackoff;
+    provider.connectionBackoff = () => ({
+      until,
+      status: 429,
+      code: 'installation_busy' as const,
+    });
+    try {
+      const paused = (await integrations.execute(
+        owner,
+        'SEARCH_TOOLS',
+        { query: 'Notion page' },
+        undefined,
+        undefined,
+        undefined,
+        'background',
+      )) as { incomplete: string; discovered: unknown[] };
+      assert.match(paused.incomplete, /installation_busy, HTTP 429/);
+      assert.ok(paused.incomplete.includes(new Date(until).toISOString()));
+      assert.match(paused.incomplete, /Do not retry this source now/);
+      assert.ok(paused.discovered.length);
+    } finally {
+      provider.connectionBackoff = backoff;
+    }
     const read = await integrations.execute(owner, 'CONNECTED_MCP_CALL', {
       connectionId: connected.connectionId,
       pathId: path.id,
@@ -8882,9 +9350,13 @@ test('Composio failure envelopes reject with the provider error', async (t) => {
     next_cursor: null,
   }));
   let result: Record<string, unknown> = {};
+  let requestError: APIError | undefined;
   t.mock.method(client.sessions, 'create', async () => ({
     sessionId: 'fixture-session',
-    execute: async () => result,
+    execute: async () => {
+      if (requestError) throw requestError;
+      return result;
+    },
   }));
   const session = await createComposioProvider({
     proxy: composioProxyFixture(client, 'local-development'),
@@ -8988,21 +9460,93 @@ test('Composio failure envelopes reject with the provider error', async (t) => {
     resultType: 'completed',
   };
   await session.execute('GMAIL_SEND_EMAIL', {}, 'fixture-account');
+  const diagnosticRedactor = createFeedbackRedactor({ secrets: [], profile: { names: [] } });
+  for (const [ray, contentType] of [
+    ['230b030023ae2822-SJC', ' TEXT/HTML ; charset=UTF-8 '],
+    ['1234567890123456-SJC', 'text/html;charset=utf-8'],
+    ['private-fixture-ray', 'text/html'],
+    [undefined, 'text/html'],
+  ] as const) {
+    const headers = new Headers({
+      'content-type': contentType,
+      'x-private': 'private-fixture-header',
+    });
+    if (ray) headers.set('cf-ray', ray);
+    requestError = APIError.generate(
+      403,
+      undefined,
+      '<html>private-fixture-response-body</html>',
+      headers,
+    );
+    const started = Date.now();
+    await assert.rejects(
+      session.execute('GMAIL_FETCH_EMAILS', {}, 'fixture-account'),
+      (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.equal((error as Error & { status?: number }).status, 403);
+        assert.match(error.message, /HTTP 403/);
+        const timestamp = error.message.match(/\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z/);
+        assert.ok(timestamp);
+        assert.ok(Date.parse(timestamp[0]) >= started - 1000);
+        assert.ok(Date.parse(timestamp[0]) <= Date.now() + 1000);
+        assert.doesNotMatch(error.message, /private-fixture/);
+        assert.equal(diagnosticRedactor.text(error.message), error.message);
+        assert.equal(
+          error.message.includes('0x230b030023ae2822-SJC'),
+          ray === '230b030023ae2822-SJC',
+        );
+        assert.equal(
+          error.message.includes('0x1234567890123456-SJC'),
+          ray === '1234567890123456-SJC',
+        );
+        assert.equal(error.cause, undefined);
+        return true;
+      },
+    );
+  }
+  requestError = APIError.generate(
+    403,
+    { error: 'installation_revoked' },
+    undefined,
+    new Headers({ 'content-type': 'application/json', 'cf-ray': '230b030023ae2822-SJC' }),
+  );
+  await assert.rejects(
+    session.execute('GMAIL_FETCH_EMAILS', {}, 'fixture-account'),
+    (error: unknown) => error === requestError,
+  );
+  for (const contentType of ['text/plain', 'text/htmlish; charset=utf-8']) {
+    requestError = APIError.generate(
+      403,
+      undefined,
+      'synthetic-specific-provider-reason',
+      new Headers({ 'content-type': contentType, 'cf-ray': '230b030023ae2822-SJC' }),
+    );
+    await assert.rejects(
+      session.execute('GMAIL_FETCH_EMAILS', {}, 'fixture-account'),
+      (error: unknown) => error === requestError,
+    );
+  }
 });
 
-test('Composio connection requests classify HTTP failures without repeating consent or exposing provider details', async (t) => {
+test('Composio catalog and connection requests classify HTTP failures without exposing provider details', async (t) => {
   const { createServer } = await import('node:http');
   const { IntegrationConnectionError } = await import('../src/ports/integrations.ts');
-  let failure: { phase: string; status: number } | undefined;
+  let failure: { phase: string; status: number; code?: string } | undefined;
   let rejected = 0;
   const server = createServer(async (request, response) => {
     const path = new URL(request.url!, 'http://localhost').pathname;
-    const phase = path.endsWith('/tool_router/session') ? 'session' : undefined;
+    const phase = path.endsWith('/toolkits')
+      ? 'catalog'
+      : path.endsWith('/tool_router/session')
+        ? 'session'
+        : undefined;
     response.setHeader('content-type', 'application/json');
     if (failure && failure.phase === phase && phase) {
       rejected++;
       response.statusCode = failure.status;
-      response.end(JSON.stringify({ error: { message: 'synthetic-private-provider-body' } }));
+      response.end(
+        JSON.stringify({ error: failure.code ?? { message: 'synthetic-private-provider-body' } }),
+      );
       return;
     }
     if (path.endsWith('/toolkits')) {
@@ -9047,6 +9591,68 @@ test('Composio connection requests classify HTTP failures without repeating cons
       }),
     }),
   });
+  for (const [status, reason, code] of [
+    [429, 'rate_limit', 'public_budget_exceeded'],
+    [429, 'rate_limit', 'rate_limited'],
+    [429, 'rate_limit', 'provider_rate_limited'],
+    [503, 'unavailable', 'security_service_unavailable'],
+    [503, 'unavailable', 'provider_unavailable'],
+    [503, 'unavailable', 'invalid_limit_configuration'],
+    [502, 'unavailable', 'invalid_provider_response'],
+    [502, 'unavailable', 'unsafe_provider_response'],
+    [504, 'timeout', undefined],
+  ] as const) {
+    failure = { phase: 'catalog', status, code };
+    const before = rejected;
+    await assert.rejects(provider.listServices!(), (error: unknown) => {
+      assert.ok(error instanceof IntegrationCatalogFailure);
+      assert.equal(error.reason, reason);
+      assert.equal(error.status, status);
+      assert.equal(error.statusCode, status);
+      assert.equal(error.code, code);
+      assert.ok(error.message.includes(String(status)));
+      assert.doesNotMatch(String(error), /synthetic-private|fixture-key/);
+      assert.equal(error.cause, undefined);
+      return true;
+    });
+    assert.ok(rejected > before);
+  }
+  failure = { phase: 'catalog', status: 503, code: 'synthetic-private-provider-body' };
+  await assert.rejects(provider.listServices!(), (error: unknown) => {
+    assert.ok(error instanceof IntegrationCatalogFailure);
+    assert.equal(error.status, 503);
+    assert.equal(error.code, undefined);
+    assert.doesNotMatch(String(error), /synthetic-private|fixture-key/);
+    return true;
+  });
+  for (const code of [
+    'installation_enrollment_required',
+    'installation_revoked',
+    'browser_pairing_required',
+  ]) {
+    failure = { phase: 'catalog', status: 403, code };
+    await assert.rejects(provider.listServices!(), (error: unknown) => {
+      assert.ok(error instanceof IntegrationCatalogAccessDenied);
+      assert.equal(error.code, code);
+      assert.match(error.message, /HTTP 403/);
+      return true;
+    });
+  }
+  failure = { phase: 'catalog', status: 403 };
+  await assert.rejects(provider.listServices!(), IntegrationCatalogAccessDenied);
+  failure = undefined;
+  const timeout = t.mock.method(client.getClient().toolkits, 'list', async () => {
+    throw new APIConnectionTimeoutError();
+  });
+  await assert.rejects(provider.listServices!(), (error: unknown) => {
+    assert.ok(error instanceof IntegrationCatalogFailure);
+    assert.equal(error.reason, 'timeout');
+    assert.equal(error.statusCode, 504);
+    assert.equal(error.status, undefined);
+    return true;
+  });
+  timeout.mock.restore();
+  assert.ok((await provider.listServices!()).some((service) => service.slug === 'gmail'));
   const connect = async () => {
     const session = await provider.createSession('fixture-owner', {});
     return session.authorize('gmail', 'http://localhost:4310/api/apps/callback');
@@ -9074,6 +9680,21 @@ test('Composio connection requests classify HTTP failures without repeating cons
       assert.equal(rejected, before + 1);
     }
   }
+  for (const code of [
+    'installation_busy',
+    'public_budget_exceeded',
+    'service_unavailable',
+    'security_service_unavailable',
+  ]) {
+    failure = { phase: 'session', status: code.includes('unavailable') ? 503 : 429, code };
+    await assert.rejects(connect(), (error: unknown) => {
+      assert.ok(error instanceof IntegrationConnectionError);
+      assert.equal(error.code, code);
+      assert.ok(error.message.includes(code));
+      assert.ok(error.message.includes(String(failure!.status)));
+      return true;
+    });
+  }
   failure = undefined;
   assert.equal((await connect()).accountId, 'fixture-account');
   for (const [cause, reason] of [
@@ -9094,6 +9715,333 @@ test('Composio connection requests classify HTTP failures without repeating cons
     create.mock.restore();
   }
 });
+
+async function connectionServiceFixture(t: TestContext) {
+  t.mock.method(globalThis, 'fetch', async () => {
+    throw new Error('Unexpected external request in the connection service fixture.');
+  });
+  const root = await mkdtemp(join(tmpdir(), 'nod-connection-wait-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const calls: string[] = [];
+  let userId = '';
+  let reply: () => Response | Promise<Response> = () =>
+    Response.json({ data: {}, error: null, log_id: 'fixture-log', result_type: 'completed' });
+  const proxy = createComposioProxy({
+    dataRoot: root,
+    ownerId: 'fixture-owner',
+    keyStore: installationKeyStore,
+    checkpoint: fixtureIdentityCheckpoint,
+    url: 'https://proxy.example.test',
+    request: async (input, init) => {
+      const url = new URL(new Request(input, init).url);
+      if (url.pathname === '/v2/access/enroll') return Response.json({ state: 'enabled', userId });
+      calls.push(url.pathname);
+      if (url.pathname === '/v2/api/v3.1/tool_router/session')
+        return Response.json({
+          session_id: 'trs_fixture_wait',
+          mcp: { type: 'http', url: 'https://proxy.example.test/unsupported-mcp' },
+          config: { user_id: userId, toolkits: { enabled: ['gmail'] }, connected_accounts: {} },
+          config_version: 1,
+        });
+      return reply();
+    },
+  });
+  await proxy.initialize();
+  userId = proxy.userId;
+  const provider = createComposioProvider({ proxy });
+  return {
+    provider,
+    executions: () => calls.filter((path) => path.endsWith('/execute')).length,
+    reply: (next: () => Response | Promise<Response>) => {
+      reply = next;
+    },
+    send: async () =>
+      (await provider.createSession('fixture-owner', { gmail: 'ca_fixture_wait' })).execute(
+        'GMAIL_SEND_EMAIL',
+        { recipient_email: 'person@example.test' },
+        'ca_fixture_wait',
+      ),
+  };
+}
+
+const busyReply = (headers: Record<string, string> = {}) =>
+  Response.json({ error: 'installation_busy' }, { status: 429, headers });
+
+test('connection service refusals pause the install from Retry-After or a growing wait, and writes are never retried', async (t) => {
+  const service = await connectionServiceFixture(t);
+  const waited = () => {
+    const wait = service.provider.connectionBackoff!();
+    return wait && Math.round((wait.until - Date.now()) / 1000);
+  };
+  service.reply(() => busyReply({ 'retry-after': '120' }));
+  await assert.rejects(service.send());
+  assert.equal(service.executions(), 1);
+  assert.equal(service.provider.connectionBackoff!()?.status, 429);
+  assert.equal(service.provider.connectionBackoff!()?.code, 'installation_busy');
+  assert.ok(Math.abs(waited()! - 120) <= 2);
+  service.reply(() => busyReply({ 'retry-after': new Date(Date.now() + 3_600_000).toUTCString() }));
+  await assert.rejects(service.send());
+  assert.ok(Math.abs(waited()! - 900) <= 2);
+  service.reply(() =>
+    Response.json({ data: {}, error: null, log_id: 'fixture-log', result_type: 'completed' }),
+  );
+  await service.send();
+  assert.equal(service.provider.connectionBackoff!(), undefined);
+  service.reply(() => Response.json({ error: 'service_unavailable' }, { status: 503 }));
+  const growth = [];
+  for (let attempt = 0; attempt < 7; attempt++) {
+    await assert.rejects(service.send());
+    growth.push(waited());
+  }
+  assert.deepEqual(growth, [60, 120, 240, 480, 960, 1800, 1800]);
+  assert.equal(service.provider.connectionBackoff!()?.code, 'service_unavailable');
+  service.reply(() =>
+    Response.json({ data: {}, error: null, log_id: 'fixture-log', result_type: 'completed' }),
+  );
+  await service.send();
+  service.reply(() => busyReply());
+  await assert.rejects(service.send());
+  assert.equal(waited(), 60);
+  assert.equal(service.executions(), 12);
+  service.reply(() =>
+    Response.json({ data: {}, error: null, log_id: 'fixture-log', result_type: 'completed' }),
+  );
+  await service.send();
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let arrived = 0;
+  service.reply(async () => {
+    if (++arrived === 4) release();
+    await held;
+    return busyReply();
+  });
+  const concurrent = await Promise.allSettled([1, 2, 3, 4].map(() => service.send()));
+  assert.ok(concurrent.every((outcome) => outcome.status === 'rejected'));
+  assert.equal(waited(), 60);
+  service.reply(() => busyReply());
+  await assert.rejects(service.send());
+  assert.equal(waited(), 120);
+  service.reply(() =>
+    Response.json({ data: {}, error: null, log_id: 'fixture-log', result_type: 'completed' }),
+  );
+  await service.send();
+  const gated = (answers: Response[]) => {
+    const gates: (() => void)[] = [];
+    let reached = () => {};
+    service.reply(async () => {
+      const answer = answers.shift();
+      await new Promise<void>((resolve) => {
+        gates.push(resolve);
+        reached();
+      });
+      return (
+        answer ??
+        Response.json({ data: {}, error: null, log_id: 'fixture-log', result_type: 'completed' })
+      );
+    });
+    return {
+      open: (index: number) => gates[index]!(),
+      arrive: async (count: number) => {
+        while (gates.length < count)
+          await new Promise<void>((resolve) => {
+            reached = resolve;
+          });
+      },
+      sends: (count: number) =>
+        Array.from({ length: count }, () =>
+          service.send().then(
+            () => 'sent',
+            () => 'refused',
+          ),
+        ),
+    };
+  };
+  const overlap = gated([busyReply(), busyReply()]);
+  const earlier = overlap.sends(2);
+  await overlap.arrive(2);
+  overlap.open(0);
+  assert.equal(await Promise.race(earlier), 'refused');
+  const later = service.send();
+  await overlap.arrive(3);
+  overlap.open(1);
+  assert.deepEqual(await Promise.all(earlier), ['refused', 'refused']);
+  overlap.open(2);
+  await later;
+  assert.equal(waited(), 60);
+  service.reply(() =>
+    Response.json({ data: {}, error: null, log_id: 'fixture-log', result_type: 'completed' }),
+  );
+  await service.send();
+  const stale = gated([busyReply(), busyReply()]);
+  const before = stale.sends(2);
+  await stale.arrive(2);
+  stale.open(0);
+  assert.equal(await Promise.race(before), 'refused');
+  const reset = service.send();
+  await stale.arrive(3);
+  stale.open(2);
+  await reset;
+  assert.equal(service.provider.connectionBackoff!(), undefined);
+  stale.open(1);
+  assert.deepEqual(await Promise.all(before), ['refused', 'refused']);
+  assert.equal(waited(), 60);
+});
+
+test(
+  'a connection service wait skips background reads across apps, refuses writes and lets an owner read try once',
+  { skip: !process.env.TEST_DATABASE_URL },
+  async (t) => {
+    const f = await appsFixture(t);
+    const gmail = await f.connect('gmail');
+    const slack = await f.connect('slack');
+    let reads = 0;
+    let polls = 0;
+    f.provider.activity = {
+      gmail: {
+        read: async () => {
+          reads++;
+          return { records: [] };
+        },
+      },
+    };
+    f.provider.pollInbox = async () => {
+      polls++;
+      return { cursor: 'synthetic-cursor', hasMore: false, messages: [] };
+    };
+    t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+    const service = await connectionServiceFixture(t);
+    service.reply(() => busyReply({ 'retry-after': '120' }));
+    await assert.rejects(service.send());
+    f.provider.connectionBackoff = service.provider.connectionBackoff;
+    const until = new Date(Date.now() + 120_000).toISOString();
+    const signal = new AbortController().signal;
+    const sessions = f.sessions.length;
+    const background = () => [
+      f.service.readActivity({ connectionId: gmail.connectionId! }, signal),
+      f.service.execute(
+        'local-development',
+        'SLACK_LIST_CONVERSATIONS',
+        { connectionId: slack.connectionId },
+        undefined,
+        signal,
+        undefined,
+        'background',
+      ),
+    ];
+    await Promise.all(
+      background().map((read) =>
+        assert.rejects(read, (error: Error & { status?: number }) => {
+          assert.ok(
+            error.message.includes(
+              `rate limiting this install (installation_busy, HTTP 429), so Nod is not calling it until ${until}`,
+            ),
+          );
+          assert.match(error.message, /Do not retry this source now/);
+          assert.equal(error.status, 429);
+          return true;
+        }),
+      ),
+    );
+    await f.pool.query('UPDATE app_connections SET inbox_poll_at=NULL WHERE id=$1', [
+      gmail.connectionId,
+    ]);
+    await f.service.pollInboxes();
+    assert.equal(
+      (
+        await f.pool.query('SELECT inbox_failed FROM app_connections WHERE id=$1', [
+          gmail.connectionId,
+        ])
+      ).rows[0].inbox_failed,
+      true,
+    );
+    await assert.rejects(
+      f.service.execute('local-development', 'SLACK_SEND_MESSAGE', {
+        connectionId: slack.connectionId,
+        channel: 'C0SYNTHETIC',
+        text: 'Synthetic update',
+      }),
+      (error: Error & { notRun?: boolean }) => {
+        assert.ok(error.message.includes(until));
+        assert.match(error.message, /did not send this action/);
+        assert.equal(error.notRun, true);
+        return true;
+      },
+    );
+    assert.deepEqual([reads, polls, f.executed.length, f.sessions.length], [0, 0, 0, sessions]);
+    await f.service.execute(
+      'local-development',
+      'SLACK_LIST_CONVERSATIONS',
+      { connectionId: slack.connectionId },
+      undefined,
+      signal,
+      undefined,
+      'read',
+    );
+    assert.equal(f.executed.length, 1);
+    t.mock.timers.tick(121_000);
+    await Promise.all(background());
+    assert.deepEqual([reads, f.executed.length, service.executions()], [1, 2, 1]);
+  },
+);
+
+for (const [status, code] of [
+  [429, 'installation_busy'],
+  [503, 'service_unavailable'],
+] as const) {
+  test(
+    `a ${status} on session create marks an approved write as not run`,
+    { skip: !process.env.TEST_DATABASE_URL },
+    async (t) => {
+      const f = await appsFixture(t);
+      const slack = await f.connect('slack');
+      t.mock.method(globalThis, 'fetch', async () => {
+        throw new Error('Unexpected external request in the session refusal test.');
+      });
+      const root = await mkdtemp(join(tmpdir(), 'nod-session-refusal-'));
+      t.after(() => rm(root, { recursive: true, force: true }));
+      let userId = '';
+      const paths: string[] = [];
+      const proxy = createComposioProxy({
+        dataRoot: root,
+        ownerId: 'local-development',
+        keyStore: installationKeyStore,
+        checkpoint: fixtureIdentityCheckpoint,
+        url: 'https://proxy.example.test',
+        request: async (input, init) => {
+          const url = new URL(new Request(input, init).url);
+          if (url.pathname === '/v2/access/enroll')
+            return Response.json({ state: 'enabled', userId });
+          paths.push(url.pathname);
+          return Response.json({ error: code }, { status });
+        },
+      });
+      await proxy.initialize();
+      userId = proxy.userId;
+      const real = createComposioProvider({ proxy });
+      f.provider.createSession = (...input) => real.createSession(...input);
+      f.provider.connectionBackoff = real.connectionBackoff;
+      assert.equal(f.provider.connectionBackoff!(), undefined);
+      await assert.rejects(
+        f.service.execute('local-development', 'SLACK_SEND_MESSAGE', {
+          connectionId: slack.connectionId,
+          channel: 'C0SYNTHETIC',
+          text: 'Synthetic update',
+        }),
+        (error: Error & { notRun?: boolean; upstreamStatus?: number }) => {
+          assert.match(error.message, new RegExp(`${code}. HTTP ${status}`));
+          assert.equal(error.upstreamStatus, status);
+          assert.equal(error.notRun, true);
+          return true;
+        },
+      );
+      assert.deepEqual(paths, ['/v2/api/v3.1/tool_router/session']);
+      assert.equal(f.executed.length, 0);
+      assert.equal(f.provider.connectionBackoff!()?.status, status);
+    },
+  );
+}
 
 test('Composio proxy sessions omit SDK metadata and refuse unsupported webhooks', async (t) => {
   const client = new Composio({
@@ -9176,8 +10124,8 @@ test(
         CREATE TABLE threads(id uuid PRIMARY KEY,owner_id text NOT NULL,archived_at timestamptz);
         CREATE TABLE turns(id uuid PRIMARY KEY,owner_id text NOT NULL,source text NOT NULL,source_id text,
           message_id uuid,prompt text NOT NULL,channel text NOT NULL DEFAULT 'web',status text NOT NULL DEFAULT 'succeeded',
-          error text,created_at timestamptz NOT NULL DEFAULT now(),thread_id uuid,session_id uuid);
-        CREATE TABLE turn_events(id uuid DEFAULT gen_random_uuid(),turn_id uuid,type text,summary text DEFAULT '',created_at timestamptz NOT NULL DEFAULT now());
+          error text,created_at timestamptz NOT NULL DEFAULT now(),thread_id uuid,session_id uuid,task_id uuid);
+        CREATE TABLE turn_events(id uuid DEFAULT gen_random_uuid(),turn_id uuid,type text,summary text DEFAULT '',site text,parent_run_id uuid,call_id uuid,command jsonb,created_at timestamptz NOT NULL DEFAULT now());
         CREATE TABLE messages(id uuid,owner_id text,role text,text text,turn_id uuid,thread_id uuid,created_at timestamptz DEFAULT now(),hidden_at timestamptz);
         CREATE TABLE preferences(owner_id text PRIMARY KEY,time_zone text,locale text,hour_cycle text);
         CREATE TABLE schedules(id uuid,owner_id text,title text);
@@ -9213,6 +10161,21 @@ test(
       const ledger = createLedger({ pool, ownerId: 'owner' });
       await ledger.initialize();
       ledger.registerRoutes(app);
+      const vaultAccess = await createVaultAccess(pool, {
+        ownerId: 'owner',
+        check: async () => {
+          throw new Error('Reads need no check.');
+        },
+      });
+      const activity = createActivityLog({
+        bounds: ledger.bounds,
+        within: ledger.within,
+        chunk: ledger.chunk,
+        vault: vaultAccess.within,
+        steps: (turnIds, page) => ledger.steps(turnIds, page),
+        vaultPage: vaultAccess.ascending,
+      });
+      activity.registerRoutes(app);
       const usage = (turnId: string, costUsd: number | null): AgentEvent => ({
         type: 'model_usage',
         id: randomUUID(),
@@ -9282,8 +10245,13 @@ test(
           .curate({ task: 'review', instructions: 'Synthetic', input: {} }),
       );
       await ledger.action(chat, 'GMAIL_FETCH_EMAILS', { kind: 'read' });
-      await ledger.action(chat, 'GMAIL_SEND_EMAIL', { kind: 'approved' });
-      await ledger.action(foreign, 'GMAIL_SEND_EMAIL', { kind: 'approved' });
+      await ledger.action(
+        chat,
+        'GMAIL_SEND_EMAIL',
+        { kind: 'approved' },
+        'sam@example.test · Quote accepted',
+      );
+      await ledger.action(foreign, 'GMAIL_SEND_EMAIL', { kind: 'approved' }, 'Foreign target');
       for (let attempt = 0; attempt < 50; attempt++) {
         const rows = await pool.query('SELECT count(*)::int AS count FROM model_usage');
         if (rows.rows[0].count === 5) break;
@@ -9320,6 +10288,29 @@ test(
           ['Tell Sam we take the quote', 'chat', 0.55],
         ],
       );
+      for (const [prompt, title] of [
+        ['Berlin time, 8am on monday&#x20;', 'Berlin time, 8am on monday'],
+        ['**Berlin time, 8am on monday&#x20;**', 'Berlin time, 8am on monday'],
+        ['Explain `&#x20;` and \\&#x20;', 'Explain &#x20; and &#x20;'],
+        ['```python\nprint("hello")\n```', 'print("hello")'],
+        ['# First line\nSecond line', 'First line'],
+        ['- First\n- Second', 'First'],
+        ['> First\n>\n> Second', 'First'],
+        [
+          '| Berlin time | 8am on Monday |\n| --- | --- |\n| Europe | Berlin |',
+          'Berlin time | 8am on Monday',
+        ],
+      ]) {
+        await pool.query('UPDATE turns SET prompt=$2 WHERE id=$1', [chat, prompt]);
+        const entry = (await app.inject('/api/trust'))
+          .json()
+          .entries.find((item: TrustEntry) => item.id === chat) as TrustEntry;
+        assert.equal(entry.title, title);
+      }
+      await pool.query('UPDATE turns SET prompt=$2 WHERE id=$1', [
+        chat,
+        'Tell Sam we take the quote',
+      ]);
       const chatEntry = (entries: TrustEntry[]) =>
         entries.find((entry) => entry.title === 'Tell Sam we take the quote')!;
       assert.ok(view.entries.every((entry: TrustEntry) => entry.messageId === null));
@@ -9334,8 +10325,12 @@ test(
       assert.equal(scheduledEntry.messageId, null);
       assert.equal(scheduledEntry.costUsd, 0.1);
       assert.deepEqual(chatEntry(view.entries).actions, [
-        { label: 'Gmail: fetch emails' },
-        { label: 'Gmail: send email', because: { kind: 'approved' } },
+        { label: 'Gmail: fetch emails', read: true },
+        {
+          label: 'Gmail: send email',
+          target: 'sam@example.test · Quote accepted',
+          because: { kind: 'approved' },
+        },
       ]);
       const said = randomUUID();
       const foreignSaid = randomUUID();
@@ -9406,7 +10401,7 @@ test(
         [
           {
             label: 'Slack: send message',
-            because: { kind: 'message', text: 'Tell Sam we take the quote' },
+            because: { kind: 'message', text: 'Tell Sam we take the quote', whole: true },
           },
           { label: 'Slack: send message' },
         ],
@@ -9417,6 +10412,232 @@ test(
           .entries.map((entry: TrustEntry) => entry.id),
         [scheduled],
       );
+      const scheduleSignIn = randomUUID();
+      const scheduleBasis = {
+        kind: 'schedule',
+        messageId: said,
+        quote: 'Tell Sam we take the quote',
+      };
+      await pool.query(
+        "INSERT INTO vault_activity(id,owner_id,action,origin,item_kind,task,reason,basis) VALUES($1,'owner','sign_in','https://shop.example.test','login','Synthetic schedule','said_yes',$2)",
+        [scheduleSignIn, scheduleBasis],
+      );
+      const vaultPages = [
+        () => vaultAccess.within(null, null, null),
+        () => vaultAccess.ascending(null, null, null, 100),
+        () => vaultAccess.activity({}),
+      ];
+      for (const read of vaultPages)
+        assert.deepEqual(
+          (await read()).entries.find((entry) => entry.id === scheduleSignIn)?.because,
+          { kind: 'schedule', text: scheduleBasis.quote },
+        );
+      await pool.query('UPDATE vault_activity SET basis=$2 WHERE id=$1', [
+        scheduleSignIn,
+        { ...scheduleBasis, messageId: foreignSaid },
+      ]);
+      for (const read of vaultPages)
+        assert.equal(
+          (await read()).entries.find((entry) => entry.id === scheduleSignIn)?.because,
+          undefined,
+        );
+      await pool.query('DELETE FROM vault_activity WHERE id=$1', [scheduleSignIn]);
+      await pool.query(
+        `INSERT INTO vault_activity(id,owner_id,action,origin,item_kind,task,reason,amount_minor,currency) VALUES
+          ($1,'owner','card','https://shop.example.test','card','=HYPERLINK("https://attacker.example.test")','said_yes',1200,'EUR'),
+          ($2,'other','card','https://foreign.example.test','card','Foreign task','said_yes',900,'EUR'),
+          ($3,'owner','card','https://shop.example.test','card','@SUM(1+1)','said_yes',300,'EUR')`,
+        [randomUUID(), randomUUID(), randomUUID()],
+      );
+      const commandIds: string[] = [];
+      const commandOutput = '=SUM(1,2)\r\nsynthetic "output"';
+      for (const [turnId, status, exitCode] of [
+        [chat, 'tool_complete', 3],
+        [chat, 'tool_failed', null],
+        [chat, null, null],
+        [foreign, 'tool_complete', 0],
+        [scheduled, null, null],
+      ] as const) {
+        const id = randomUUID(),
+          call = randomUUID();
+        commandIds.push(id);
+        await pool.query(
+          `INSERT INTO turn_events(id,turn_id,type,summary,call_id,command,parent_run_id)
+           VALUES($1,$2,'tool_start','bash',$3,$4,$5)`,
+          [id, turnId, call, { command: '@synthetic --arg "value"' }, chat],
+        );
+        if (status)
+          await pool.query(
+            `INSERT INTO turn_events(turn_id,type,summary,call_id,command)
+             VALUES($1,$2,'bash',$3,$4)`,
+            [turnId, status, call, { exitCode, output: commandOutput }],
+          );
+      }
+      await pool.query("UPDATE turns SET status='running' WHERE id=$1", [chat]);
+      await pool.query("UPDATE turns SET status='cancelled' WHERE id=$1", [scheduled]);
+      const commandSteps = (await app.inject(`/api/trust/entries/${chat}/steps`))
+        .json()
+        .steps.filter((step: TrustStep) => step.command);
+      assert.equal(commandSteps.length, 3);
+      assert.deepEqual(
+        commandSteps.map((step: TrustStep) => [
+          step.command?.state,
+          step.command?.exitCode,
+          Boolean(step.failed),
+        ]),
+        [
+          ['finished', 3, true],
+          ['failed', null, true],
+          ['running', null, false],
+        ],
+      );
+      assert.ok(
+        commandSteps.every((step: TrustStep) => step.helper && step.command?.output === undefined),
+      );
+      const detail = (await app.inject(`/api/trust/commands/${commandIds[0]}`)).json().command;
+      assert.equal(detail.output, commandOutput);
+      assert.equal(detail.exitCode, 3);
+      assert.equal(detail.state, 'finished');
+      assert.equal(detail.helper, true);
+      assert.equal((await app.inject(`/api/trust/commands/${commandIds[3]}`)).statusCode, 404);
+      const stopped = (await app.inject(`/api/trust/commands/${commandIds[4]}`)).json().command;
+      assert.equal(stopped.state, 'interrupted');
+      const exported = await app.inject('/api/trust/export');
+      assert.equal(exported.statusCode, 200);
+      const cells = (body: string) =>
+        (() => {
+          const rows: string[][] = [];
+          let row: string[] = [];
+          let cell = '';
+          let quoted = false;
+          const line = body.replace(/^\ufeff/, '');
+          for (let index = 0; index < line.length; index++) {
+            const char = line[index]!;
+            if (quoted && char === '"' && line[index + 1] === '"') {
+              cell += '"';
+              index++;
+            } else if (char === '"') quoted = !quoted;
+            else if (char === ',' && !quoted) {
+              row.push(cell);
+              cell = '';
+            } else if (char === '\r' && line[index + 1] === '\n' && !quoted) {
+              rows.push([...row, cell]);
+              row = [];
+              cell = '';
+              index++;
+            } else cell += char;
+          }
+          return rows;
+        })();
+      const rows = cells(exported.body);
+      assert.ok(rows.every((row) => row.length === rows[0]!.length));
+      const commandRows = rows.slice(1).filter((row) => row[8]);
+      assert.equal(commandRows.length, 4);
+      assert.deepEqual(commandRows.find((row) => row[9] === '3')?.slice(8), [
+        '\'@synthetic --arg "value"',
+        '3',
+        'finished',
+        `'${commandOutput}`,
+      ]);
+      assert.equal(commandRows.filter((row) => row[10] === 'interrupted').length, 1);
+      await ledger.withExecution(
+        {
+          threadId: conversation,
+          sessionId: conversation,
+          turnId: chat,
+          runId: randomUUID(),
+          parentRunId: chat,
+          browserId: 'helper-browser',
+          onEvent() {},
+        },
+        () => ledger.action(chat, 'NOTION_UPDATE_PAGE', { kind: 'approved' }, 'Helper page'),
+      );
+      const chatSteps = (await app.inject(`/api/trust/entries/${chat}/steps`)).json().steps;
+      assert.ok(
+        chatSteps.some(
+          (step: TrustStep) =>
+            step.kind === 'action' && step.detail === 'Helper page' && step.helper,
+        ),
+      );
+      assert.ok(chatSteps.some((step: TrustStep) => step.kind === 'model' && step.costUsd));
+      assert.ok(
+        chatSteps.some(
+          (step: TrustStep) =>
+            step.kind === 'action' && step.detail === 'sam@example.test · Quote accepted',
+        ),
+      );
+      assert.deepEqual((await app.inject(`/api/trust/entries/${foreign}/steps`)).json().steps, []);
+      assert.ok(
+        rows.some(
+          (row) =>
+            row[1] === 'Tell Sam we take the quote' &&
+            row[5] === 'sam@example.test · Quote accepted',
+        ),
+      );
+      assert.ok(rows.some((row) => row[1] === 'Tell Sam we take the quote' && Number(row[7]) > 0));
+      assert.ok(rows.some((row) => row[1] === `'=HYPERLINK("https://attacker.example.test")`));
+      assert.ok(rows.some((row) => row[1] === `'@SUM(1+1)`));
+      assert.doesNotMatch(exported.body, /Foreign|foreign\.example/);
+      const scoped = cells((await app.inject(`/api/trust/export?session=${scheduled}`)).body);
+      assert.deepEqual([...new Set(scoped.slice(1).map((row) => row[1]))], ['Morning brief']);
+      await pool.query(
+        `WITH calls AS (SELECT gen_random_uuid() AS call,n FROM generate_series(1,205) n)
+         INSERT INTO turn_events(turn_id,type,summary,call_id,command,created_at)
+         SELECT $1::uuid,'tool_start','bash',call,jsonb_build_object('command','synthetic-page-' || n),
+           now()+n*interval '1 second' FROM calls
+         UNION ALL
+         SELECT $1::uuid,'tool_complete','bash',call,jsonb_build_object('exitCode',0,'output','synthetic-output-' || n),
+           now()+n*interval '1 second'+interval '1 millisecond' FROM calls`,
+        [chat],
+      );
+      const pagedCommands = cells((await app.inject('/api/trust/export')).body).filter((row) =>
+        row[8]?.startsWith('synthetic-page-'),
+      );
+      assert.equal(pagedCommands.length, 205);
+      assert.equal(new Set(pagedCommands.map((row) => row[8])).size, 205);
+      assert.ok(
+        pagedCommands.every(
+          (row) =>
+            row[9] === '0' &&
+            row[10] === 'finished' &&
+            row[11] === row[8]!.replace('page', 'output'),
+        ),
+      );
+      assert.deepEqual((await activity.read({ from: '2000-01-01' }, 200)).entries, []);
+      const tied = Array.from({ length: 31 }, () => randomUUID());
+      await pool.query(
+        `INSERT INTO turns(id,owner_id,source,prompt,thread_id,session_id,created_at)
+         SELECT id,'owner','user','Tied request',$2,id,'2026-01-01T00:00:00.123456Z' FROM unnest($1::uuid[]) id`,
+        [tied, conversation],
+      );
+      await pool.query(
+        `INSERT INTO app_actions(owner_id,turn_id,action,basis) SELECT 'owner',id,'GMAIL_FETCH_EMAILS','{"kind":"read"}' FROM unnest($1::uuid[]) id`,
+        [tied],
+      );
+      const span = await ledger.bounds({});
+      const paged: string[] = [];
+      let cursor: { at: string; id: string } | null = null;
+      for (let attempt = 0; ; attempt++) {
+        assert.ok(attempt < 100, 'Paging must advance.');
+        const page = await ledger.chunk(span, cursor, 2);
+        paged.push(...page.entries.map((entry) => entry.id));
+        if (page.entries.length < 2 || !page.next) break;
+        cursor = page.next;
+      }
+      assert.equal(new Set(paged).size, paged.length);
+      assert.ok(tied.every((id) => paged.includes(id)));
+      assert.ok(!paged.includes(foreign));
+      const listed: string[] = [];
+      let before = '';
+      for (let attempt = 0; ; attempt++) {
+        assert.ok(attempt < 100, 'Paging must advance.');
+        const page = (await app.inject(`/api/trust/entries${before}`)).json() as TrustPage;
+        listed.push(...page.entries.map((entry) => entry.id));
+        if (!page.next) break;
+        before = `?at=${encodeURIComponent(page.next.at)}&id=${page.next.id}`;
+      }
+      assert.equal(new Set(listed).size, listed.length);
+      assert.ok(tied.every((id) => listed.includes(id)));
       await pool.query(
         "DELETE FROM app_actions WHERE action='SLACK_SEND_MESSAGE' OR (turn_id=$1 AND action='GMAIL_FETCH_EMAILS')",
         [scheduled],
@@ -10132,6 +11353,190 @@ test('Composio inbox polling rejects cancellation and invalid metadata after par
   assert.equal(JSON.parse(unlabeled.cursor).historyId, '200');
 });
 
+test('Composio inbox polling retains completed messages when a later Gmail read is temporarily unavailable', async (t) => {
+  const diagnostics: string[] = [];
+  t.mock.method(console, 'warn', (value: string) => diagnostics.push(value));
+  let unavailable = true;
+  let historyReads = 0;
+  let failedMessageReads = 0;
+  const poll = inboxPollFixture(t, (input) => {
+    if (input.endpoint.endsWith('/history')) {
+      historyReads++;
+      return {
+        status: 200,
+        data: {
+          historyId: '200',
+          history: [{ messagesAdded: ['m0', 'm1'].map((id) => ({ message: { id } })) }],
+        },
+      };
+    }
+    const id = input.endpoint.split('/').at(-1)!;
+    if (id === 'm1') {
+      failedMessageReads++;
+      if (unavailable) return { status: 503, data: { error: 'service_unavailable' } };
+    }
+    return {
+      status: 200,
+      data: {
+        id,
+        threadId: `thread-${id}`,
+        internalDate: '1790769600000',
+        labelIds: ['INBOX'],
+        payload: { headers: [] },
+      },
+    };
+  });
+  const first = await poll(
+    'inbox-account',
+    JSON.stringify({ accountId: 'inbox-account', historyId: '100' }),
+    new AbortController().signal,
+  );
+  assert.deepEqual(
+    first.messages.map(({ id }) => id),
+    ['m0'],
+  );
+  assert.equal(first.hasMore, true);
+  assert.equal(first.retryAfterMs, 60_000);
+  assert.deepEqual(JSON.parse(first.cursor), {
+    accountId: 'inbox-account',
+    historyId: '100',
+    pending: ['m1'],
+    finalHistoryId: '200',
+  });
+  assert.equal(failedMessageReads, 3);
+  unavailable = false;
+  const second = await poll('inbox-account', first.cursor, new AbortController().signal);
+  assert.deepEqual(
+    second.messages.map(({ id }) => id),
+    ['m1'],
+  );
+  assert.equal(second.hasMore, false);
+  assert.equal(second.retryAfterMs, undefined);
+  assert.equal(JSON.parse(second.cursor).historyId, '200');
+  assert.equal(historyReads, 1);
+  assert.doesNotMatch(diagnostics.join(' '), /m0|m1|inbox-account/);
+});
+
+test('Composio inbox polling shares a bounded retry budget across Gmail reads', async (t) => {
+  let historyReads = 0;
+  let firstReads = 0;
+  let secondReads = 0;
+  const poll = inboxPollFixture(t, (input) => {
+    if (input.endpoint.endsWith('/history')) {
+      historyReads++;
+      if (historyReads === 1) return { status: 503, data: {} };
+      return {
+        status: 200,
+        data: {
+          historyId: '200',
+          history: [{ messagesAdded: ['m0', 'm1'].map((id) => ({ message: { id } })) }],
+        },
+      };
+    }
+    const id = input.endpoint.split('/').at(-1)!;
+    if (id === 'm0') {
+      firstReads++;
+      if (firstReads === 1) return { status: 503, data: {} };
+    } else {
+      secondReads++;
+      return { status: 503, data: {} };
+    }
+    return {
+      status: 200,
+      data: {
+        id,
+        threadId: `thread-${id}`,
+        internalDate: '1790769600000',
+        labelIds: ['INBOX'],
+        payload: { headers: [] },
+      },
+    };
+  });
+  const result = await poll(
+    'inbox-account',
+    JSON.stringify({ accountId: 'inbox-account', historyId: '100' }),
+    new AbortController().signal,
+  );
+  assert.deepEqual(
+    result.messages.map(({ id }) => id),
+    ['m0'],
+  );
+  assert.equal(result.retryAfterMs, 60_000);
+  assert.deepEqual([historyReads, firstReads, secondReads], [2, 2, 1]);
+});
+
+test('Composio inbox polling defers proxy refusals, retries provider errors and cancels backoff', async (t) => {
+  for (const [status, code, retryAfterMs] of [
+    [429, 'public_budget_exceeded', 300_000],
+    [429, 'rate_limited', 60_000],
+    [429, 'installation_busy', 60_000],
+    [503, 'service_unavailable', 60_000],
+    [503, 'security_service_unavailable', 60_000],
+  ] as const) {
+    let requests = 0;
+    const poll = inboxPollFixture(t, () => {
+      requests++;
+      throw APIError.generate(status, { error: code }, undefined, new Headers());
+    });
+    await assert.rejects(
+      poll('inbox-account', null, new AbortController().signal),
+      (error: unknown) => {
+        assert.ok(error instanceof IntegrationInboxTransientError);
+        assert.equal(error.status, status);
+        assert.equal(error.code, code);
+        assert.equal(error.retryAfterMs, retryAfterMs);
+        return true;
+      },
+    );
+    assert.equal(requests, 1);
+  }
+
+  for (const [status, code] of [
+    [429, 'rate_limited'],
+    [503, 'service_unavailable'],
+  ] as const) {
+    let providerRequests = 0;
+    const providerPoll = inboxPollFixture(t, () => {
+      providerRequests++;
+      if (providerRequests === 1) return { status, data: { error: code } };
+      return { status: 200, data: { historyId: '200' } };
+    });
+    const recovered = await providerPoll('inbox-account', null, new AbortController().signal);
+    assert.equal(JSON.parse(recovered.cursor).historyId, '200');
+    assert.equal(providerRequests, 2);
+  }
+
+  const controller = new AbortController();
+  let cancelledRequests = 0;
+  const cancellationPoll = inboxPollFixture(t, () => {
+    cancelledRequests++;
+    setTimeout(() => controller.abort(), 25);
+    return { status: 503, data: {} };
+  });
+  await assert.rejects(cancellationPoll('inbox-account', null, controller.signal), {
+    name: 'AbortError',
+  });
+  assert.equal(cancelledRequests, 1);
+});
+
+test('Composio inbox polling reports a transient failure when no message can be read', async (t) => {
+  let reads = 0;
+  const poll = inboxPollFixture(t, () => {
+    reads++;
+    return { status: 503, data: {} };
+  });
+  await assert.rejects(
+    poll('inbox-account', null, new AbortController().signal),
+    (error: unknown) => {
+      assert.ok(error instanceof IntegrationInboxTransientError);
+      assert.equal(error.status, 503);
+      assert.equal(error.retryAfterMs, 60_000);
+      return true;
+    },
+  );
+  assert.equal(reads, 3);
+});
+
 test('Composio inbox polling reads past a message with a very long or very large header set', async (t) => {
   const recipients = Array.from({ length: 400 }, (_, index) => `person${index}@example.test`);
   const received = Array.from({ length: 230 }, (_, index) => ({
@@ -10485,6 +11890,21 @@ test(
     const prepared = await f.service.prepare(owner, 'GITHUB_LIST_REPOSITORIES', {
       connectionId: connected.connectionId,
     });
+    const execute = f.session.execute;
+    for (const status of [400, 429, 503]) {
+      f.session.execute = async () => {
+        throw Object.assign(new Error('Synthetic upstream failure.'), { status });
+      };
+      await assert.rejects(
+        f.service.executeApproved(owner, 'GITHUB_LIST_REPOSITORIES', prepared),
+        (error: Error & { statusCode?: number; upstreamStatus?: number }) => {
+          assert.equal(error.statusCode, 502);
+          assert.equal(error.upstreamStatus, status);
+          return true;
+        },
+      );
+    }
+    f.session.execute = execute;
     const executions = f.executed.length;
     await f.pool.query('UPDATE app_connections SET account_active=false WHERE id=$1', [
       connected.connectionId,
@@ -10642,11 +12062,23 @@ test('proactive readers use fixed GET paths, preserve pages, and check exact sou
     },
   });
   let fail = false;
+  let failStatus = 503;
   const proxyExecute = async (input: Parameters<Composio['tools']['proxyExecute']>[0]) => {
     assert.equal(input.method, 'GET');
     assert.equal(input.connectedAccountId, 'fixture-account');
     calls.push(input);
-    if (fail) return { status: 503, data: {} };
+    if (fail)
+      return {
+        status: failStatus,
+        data: {
+          error: {
+            message: 'Synthetic upstream reason.',
+            status: 'UPSTREAM_FAILURE',
+            token: 'synthetic-source-secret',
+          },
+          content: 'Synthetic unrelated private response content.',
+        },
+      };
     if (input.endpoint.endsWith('/missing')) return { status: 404, data: {} };
     if (input.endpoint.endsWith('/threads'))
       return { status: 200, data: { threads: [{ id: 'thread1' }], nextPageToken: 'page2' } };
@@ -10721,8 +12153,18 @@ test('proactive readers use fixed GET paths, preserve pages, and check exact sou
   await assert.rejects(readActivity(client, 'gmail', 'fixture-account', {}, AbortSignal.abort()));
   assert.equal(calls.length, before);
   fail = true;
-  await assert.rejects(read('gmail', {}), /could not be checked/);
+  for (const status of [401, 403, 429, 503]) {
+    failStatus = status;
+    await assert.rejects(read('gmail', {}), (error: Error & { status?: number }) => {
+      assert.equal(error.status, status);
+      assert.ok(error.message.includes(String(status)));
+      assert.match(error.message, /Synthetic upstream reason/);
+      assert.doesNotMatch(error.message, /synthetic-source-secret|unrelated private/);
+      return true;
+    });
+  }
   const isolatedCalls: Array<Parameters<Composio['tools']['proxyExecute']>[0]> = [];
+  let recordFailureStatus = 400;
   const isolated = {
     proxyExecute: async (input: Parameters<Composio['tools']['proxyExecute']>[0]) => {
       isolatedCalls.push(input);
@@ -10735,7 +12177,7 @@ test('proactive readers use fixed GET paths, preserve pages, and check exact sou
             nextPageToken: 'next-page',
           },
         };
-      if (item === 'bad') return { status: 503, data: {} };
+      if (item === 'bad') return { status: recordFailureStatus, data: {} };
       if (input.endpoint.includes('/messages/')) {
         const full = input.parameters?.some(
           (parameter) => parameter.name === 'format' && parameter.value === 'full',
@@ -10776,6 +12218,23 @@ test('proactive readers use fixed GET paths, preserve pages, and check exact sou
   assert.equal(partial.records.find((record) => record.id === 'bad')?.error, 'unavailable');
   assert.equal(partial.records.find((record) => record.id === 'large')?.available, true);
   assert.equal(partial.records.find((record) => record.id === 'good')?.available, true);
+  for (const status of [429, 503]) {
+    recordFailureStatus = status;
+    await assert.rejects(
+      readActivity(
+        isolated,
+        'gmail',
+        'fixture-account',
+        { ids: ['bad'] },
+        new AbortController().signal,
+      ),
+      (error: Error & { status?: number }) => {
+        assert.equal(error.status, status);
+        assert.ok(error.message.includes(String(status)));
+        return true;
+      },
+    );
+  }
   assert.ok(
     isolatedCalls
       .filter((call) => call.endpoint.includes('/threads/'))
@@ -10795,6 +12254,43 @@ test('proactive readers use fixed GET paths, preserve pages, and check exact sou
   );
   assert.equal(exact.records.find((record) => record.id === 'large')?.error, 'unavailable');
   assert.equal(exact.records.find((record) => record.id === 'good')?.available, true);
+  for (const status of [429, 503]) {
+    let entered!: () => void;
+    const pending = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    let activeSignal: AbortSignal | undefined;
+    const stop = new AbortController();
+    const interrupted = {
+      proxyExecute: async (
+        input: Parameters<Composio['tools']['proxyExecute']>[0],
+        options?: { signal?: AbortSignal },
+      ) => {
+        if (input.endpoint.endsWith('/bad')) {
+          await pending;
+          return { status, data: {} };
+        }
+        activeSignal = options?.signal;
+        entered();
+        return new Promise<never>(() => {});
+      },
+    } as unknown as Pick<Composio['tools'], 'proxyExecute'>;
+    try {
+      await assert.rejects(
+        readActivity(
+          interrupted,
+          'gmail',
+          'fixture-account',
+          { ids: ['bad', 'waiting'] },
+          stop.signal,
+        ),
+        (error: Error & { status?: number }) => error.status === status,
+      );
+      assert.equal(activeSignal?.aborted, true);
+    } finally {
+      stop.abort();
+    }
+  }
   const slow = {
     proxyExecute: async (input: Parameters<Composio['tools']['proxyExecute']>[0]) => {
       if (input.endpoint.endsWith('/threads'))

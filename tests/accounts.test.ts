@@ -32,6 +32,55 @@ import { trustBasis, trustDecision } from '../src/server/trust-basis.ts';
 import { createTrust } from '../src/server/trust.ts';
 import { createTrustReview } from '../src/server/trust-review.ts';
 import { trustFacts } from '../src/server/trust-facts.ts';
+import {
+  createErrorRedactor,
+  createRedactor,
+  createTextRedactor,
+} from '../src/server/redaction.ts';
+
+test('decision reservations release only requests that did not reach dispatch', async () => {
+  for (const phase of ['before dispatch', 'provider error', 'transport error']) {
+    const controller = new AbortController();
+    const settled: Array<number | null> = [];
+    const usage: ProviderUsageEvent[] = [];
+    let calls = 0;
+    const model = createDecisionModel({
+      resolve: async () => ({ provider: 'openai', key: 'synthetic-decision-key' }),
+      reserve: async () => {
+        if (phase === 'before dispatch') controller.abort();
+        return async (cost) => {
+          settled.push(cost);
+        };
+      },
+      fetch: async () => {
+        calls++;
+        if (phase === 'transport error')
+          throw new Error('Synthetic connection lost after dispatch.');
+        return new Response('', { status: 503 });
+      },
+    });
+    await assert.rejects(
+      model.check(
+        {
+          instructions: 'Check synthetic access.',
+          input: {},
+          question: {
+            name: 'access',
+            choices: [
+              { value: false, description: 'Ordinary mail.' },
+              { value: true, description: 'Access secret.' },
+            ],
+          },
+        },
+        controller.signal,
+        (event) => usage.push(event),
+      ),
+    );
+    assert.equal(calls, phase === 'before dispatch' ? 0 : 1);
+    assert.deepEqual(settled, [phase === 'before dispatch' ? 0 : null]);
+    assert.equal(usage[0]?.costUsd, phase === 'before dispatch' ? 0 : null);
+  }
+});
 
 test('decision selection uses the LLM only when no decision connection is available', async () => {
   let resolutions = 0;
@@ -134,13 +183,14 @@ test('OpenAI decision failures keep the region and provider reason without expos
   assert.equal(calls, 1);
 });
 
-test('About records only confirmed shared choices and clears them on failure', async (t) => {
+test('About accepts multiple choices and records only confirmed sharing', async (t) => {
   const { JSDOM } = await import('jsdom');
   const { act, createElement } = await import('react');
   const dom = new JSDOM('<!doctype html><div id="root"></div>', {
     url: 'https://nod.example.test/onboarding',
   });
   dom.window.HTMLElement.prototype.scrollIntoView = () => {};
+  Object.defineProperty(dom.window, 'matchMedia', { value: () => ({ matches: true }) });
   const globals = {
     window: dom.window,
     document: dom.window.document,
@@ -156,7 +206,7 @@ test('About records only confirmed shared choices and clears them on failure', a
   for (const [key, value] of Object.entries(globals))
     Object.defineProperty(globalThis, key, { configurable: true, writable: true, value });
   const { createRoot } = await import('react-dom/client');
-  const root = createRoot(dom.window.document.getElementById('root')!);
+  let root = createRoot(dom.window.document.getElementById('root')!);
   t.after(async () => {
     await act(async () => root.unmount());
     dom.window.close();
@@ -165,23 +215,15 @@ test('About records only confirmed shared choices and clears them on failure', a
       else Reflect.deleteProperty(globalThis, key);
   });
   const { About } = await import('../src/web/pages/onboarding/steps/about.tsx');
-  const { readStored, writeStored } = await import('../src/web/pages/onboarding/storage.ts');
-  const profile = {
-    scope: 'work',
-    roles: ['engineering'],
-    companySize: '11_100',
-    jobs: ['research'],
-  };
-  writeStored('about', {
-    current: 'done',
-    seen: ['scope', 'roles', 'size', 'jobs'],
-    profile,
-    editing: null,
-  });
+  const { readStored } = await import('../src/web/pages/onboarding/storage.ts');
+  const { profileScopes, profileRoles, profileWhoFor, profileCompanySizes, profileJobs } =
+    await import('../src/shared/onboarding.ts');
   let status = 200;
   let shared = true;
-  t.mock.method(globalThis, 'fetch', async (path: RequestInfo | URL) => {
+  const submissions: { roles: string[]; jobs: string[] }[] = [];
+  t.mock.method(globalThis, 'fetch', async (path: RequestInfo | URL, options?: RequestInit) => {
     assert.equal(String(path), '/api/onboarding/profile');
+    submissions.push(JSON.parse(String(options?.body)));
     return Response.json(
       status === 200 ? { ok: true, shared } : { error: 'Could not share your choices.' },
       { status },
@@ -191,7 +233,7 @@ test('About records only confirmed shared choices and clears them on failure', a
   await act(async () =>
     root.render(
       createElement(About, {
-        arrived: 'back',
+        arrived: 'forward',
         quiet: true,
         onNext: () => completed++,
         onBack() {},
@@ -199,32 +241,90 @@ test('About records only confirmed shared choices and clears them on failure', a
       }),
     ),
   );
-  const next = dom.window.document.querySelector<HTMLButtonElement>('.ob-next');
-  assert.ok(next);
-  await act(async () => next.click());
+  const clickChoice = async (options: readonly { id: string }[], id: string) => {
+    const index = options.findIndex((option) => option.id === id);
+    assert.notEqual(index, -1);
+    const button = dom.window.document.querySelectorAll<HTMLButtonElement>(
+      '.ob-chips .ob-chip[aria-pressed]',
+    )[index];
+    assert.ok(button, id);
+    await act(async () => button.click());
+  };
+  const primary = async () => {
+    const button = dom.window.document.querySelector<HTMLButtonElement>('.ob-next');
+    assert.ok(button);
+    await act(async () => button.click());
+  };
+  const remount = async () => {
+    await act(async () => root.unmount());
+    root = createRoot(dom.window.document.getElementById('root')!);
+    await act(async () =>
+      root.render(
+        createElement(About, {
+          arrived: 'back',
+          quiet: true,
+          onNext: () => completed++,
+          onBack() {},
+          usageShared: true,
+        }),
+      ),
+    );
+  };
+  const workRoles = profileRoles.filter((option) => !('personal' in option));
+  await clickChoice(profileScopes, 'work');
+  await clickChoice(workRoles, 'agency');
+  await clickChoice(workRoles, 'engineering');
+  await primary();
+  await clickChoice(profileWhoFor, 'clients');
+  await clickChoice(profileCompanySizes, '2_10');
+  await clickChoice(profileJobs, 'email');
+  await clickChoice(profileJobs, 'meetings');
+  await primary();
+  assert.deepEqual(submissions[0]?.roles, ['agency', 'engineering']);
+  assert.deepEqual(submissions[0]?.jobs, ['email', 'meetings']);
+  assert.equal(submissions.length, 1);
   assert.equal(completed, 1);
-  assert.deepEqual(readStored('about-shared'), {
+  const sharedChoices = {
     onboarding_profile_completed: true,
     onboarding_scope: 'work',
-    onboarding_roles: ['engineering'],
-    onboarding_who_for: 'not_asked',
-    onboarding_company_size: '11_100',
-    onboarding_jobs: ['research'],
-  });
-  shared = false;
-  await act(async () => next.click());
-  assert.equal(readStored('about-shared'), null);
+    onboarding_roles: ['agency', 'engineering'],
+    onboarding_who_for: 'clients',
+    onboarding_company_size: '2_10',
+    onboarding_jobs: ['email', 'meetings'],
+  };
+  assert.deepEqual(readStored('about-shared'), sharedChoices);
+  assert.equal(readStored<{ current: string }>('about')?.current, 'done');
+  await remount();
+  await primary();
   assert.equal(completed, 2);
-  status = 502;
-  await act(async () => next.click());
-  assert.equal(readStored('about-shared'), null);
-  const continueAnyway = dom.window.document.querySelector<HTMLButtonElement>(
-    '.ob-footer-end button:not(.ob-next)',
-  );
-  assert.ok(continueAnyway);
-  await act(async () => continueAnyway.click());
+  assert.equal(submissions.length, 2);
+  assert.deepEqual(readStored('about-shared'), sharedChoices);
+  shared = false;
+  await primary();
   assert.equal(readStored('about-shared'), null);
   assert.equal(completed, 3);
+  status = 502;
+  await primary();
+  assert.equal(readStored('about-shared'), null);
+  const retry = dom.window.document.querySelector<HTMLButtonElement>(
+    '.ob-footer-end button:not(.ob-next)',
+  );
+  assert.ok(retry);
+  await act(async () => retry.click());
+  assert.equal(completed, 3);
+  assert.equal(submissions.length, 5);
+  await primary();
+  assert.equal(readStored('about-shared'), null);
+  assert.equal(completed, 4);
+  assert.equal(submissions.length, 5);
+  assert.equal(readStored<{ current: string }>('about')?.current, 'done');
+  status = 200;
+  shared = true;
+  await remount();
+  await primary();
+  assert.equal(completed, 5);
+  assert.equal(submissions.length, 5);
+  assert.equal(readStored('about-shared'), null);
 });
 
 test('Join sends fixed answers only with a matching confirmed share', async (t) => {
@@ -448,14 +548,23 @@ test('decision trust never calls an LLM for uncertainty, missing results or fail
       assert.fail('Decision checks must not call an LLM.');
     },
   });
-  assert.equal(trustBasis(await review(instructions, input), words, ['message'])?.kind, 'message');
+  assert.equal(
+    trustBasis(await review(instructions, input), withOwnerIds(words, ['message']))?.kind,
+    'message',
+  );
   assert.equal(calls, 0);
   probability = 0.8;
-  assert.equal(trustBasis(await review(instructions, input), words, ['message']), undefined);
+  assert.equal(
+    trustBasis(await review(instructions, input), withOwnerIds(words, ['message'])),
+    undefined,
+  );
   assert.equal(calls, 0);
   choice = 'ask';
   probability = 0.995;
-  assert.equal(trustBasis(await review(instructions, input), words, ['message']), undefined);
+  assert.equal(
+    trustBasis(await review(instructions, input), withOwnerIds(words, ['message'])),
+    undefined,
+  );
   assert.equal(calls, 0);
   fail = true;
   await assert.rejects(review(instructions, input));
@@ -522,9 +631,10 @@ test('uncertain effects cannot authorize a change through confident permission',
     return { run: false };
   };
   assert.equal(
-    trustBasis(await createTrustReview({ decisions, review })('Original policy', input), input, [
-      'message',
-    ]),
+    trustBasis(
+      await createTrustReview({ decisions, review })('Original policy', input),
+      withOwnerIds(input, ['message']),
+    ),
     undefined,
   );
   assert.equal(calls, 0);
@@ -610,7 +720,10 @@ test('batched trust validates all answers, records one request, and refuses conf
       });
       const input = { ...words, action: { name: 'list_projects', arguments: {} } };
       assert.equal(
-        trustBasis(await review('Complete permission policy', input), words, ['message'])?.kind,
+        trustBasis(
+          await review('Complete permission policy', input),
+          withOwnerIds(words, ['message']),
+        )?.kind,
         'read',
       );
       assert.equal(usage.length, 1);
@@ -618,7 +731,10 @@ test('batched trust validates all answers, records one request, and refuses conf
       primary = 0.995;
       conflict = true;
       assert.equal(
-        trustBasis(await review('Complete permission policy', input), words, ['message']),
+        trustBasis(
+          await review('Complete permission policy', input),
+          withOwnerIds(words, ['message']),
+        ),
         undefined,
       );
       assert.equal(usage.length, 2);
@@ -692,7 +808,7 @@ test('pure decision checks bind the evaluated model, preserve target checks and 
   });
   const allowed = () =>
     review('Apply the permission policy.', input).then((answer) =>
-      trustBasis(answer, input, ['message']),
+      trustBasis(answer, withOwnerIds(input, ['message'])),
     );
   assert.equal((await allowed())?.kind, 'message');
   assert.equal(events.length, 1);
@@ -737,7 +853,7 @@ test('pure decision checks bind the evaluated model, preserve target checks and 
 test('trust calendar facts preserve whole inputs and use the local run date across leap days and DST', () => {
   const input = {
     userMessages: [{ at: '2028-02-28T23:30:00Z', text: 'Tomorrow in Madrid.' }],
-    scheduledTaskInstruction: 'Send the report tomorrow.',
+    scheduledInstructions: [{ at: '2026-11-14T00:00:00Z', text: 'Send the report tomorrow.' }],
     scheduledFor: '2028-02-28T23:30:00Z',
     timeZone: 'Europe/Madrid',
     action: {
@@ -803,23 +919,51 @@ test('trust decisions select only owner evidence and keep reply evidence separat
     userRules: 'Ask before deleting files.',
   };
   const decision = trustDecision(words);
-  assert.deepEqual(trustBasis(decision.result({ trust: 'message:0' }), words, ['owner-message']), {
-    kind: 'message',
-    messageId: 'owner-message',
-    quote: 'Send the report to ana@example.test',
-  });
+  assert.deepEqual(
+    trustBasis(decision.result({ trust: 'message:0' }), withOwnerIds(words, ['owner-message'])),
+    {
+      kind: 'message',
+      messageId: 'owner-message',
+      quote: 'Send the report to ana@example.test',
+    },
+  );
   for (const value of ['message:1', 'assistant', 'Send the report', true, null])
     assert.equal(decision.result({ trust: value }), undefined);
   assert.deepEqual(decision.result({ trust: 'rule' }), { run: false, rule: true });
   assert.deepEqual(decision.result({ trust: 'read' }), { run: true, because: 'read' });
   for (const [source, input, kind] of [
-    ['schedule', { scheduledTaskInstruction: 'Send the weekly report.' }, 'schedule'],
+    [
+      'schedule:0',
+      { scheduledInstructions: [{ at: '2026-11-14T00:00:00Z', text: 'Send the weekly report.' }] },
+      'schedule',
+    ],
     ['standing', { standingInstruction: 'Reply to delivery questions.' }, 'standing'],
     ['rules', { userRules: 'Archive delivery notices.' }, 'rule'],
   ] as const) {
     const gate = trustDecision(input);
-    assert.equal(trustBasis(gate.result({ trust: source }), input, [])?.kind, kind);
+    assert.equal(trustBasis(gate.result({ trust: source }), input)?.kind, kind);
   }
+  const scheduled = {
+    scheduledInstructions: [
+      { at: '2026-11-14T00:00:00Z', text: 'Check it every morning.' },
+      { at: '2026-11-14T00:01:00Z', text: 'Make it cheaper.' },
+      { at: '2026-11-13T00:00:00Z', text: 'Look at the budget folder.', canAuthorize: false },
+      { at: '2026-11-13T00:01:00Z', text: 'Send Lena the report.', canAuthorize: false },
+    ],
+  };
+  for (const [because, kind] of [
+    ['Check it every morning', 'schedule'],
+    ['Make it cheaper', 'schedule'],
+    ['Send Lena the report', undefined],
+    ['Look at the budget folder', undefined],
+  ] as const)
+    assert.equal(trustBasis({ run: true, because }, scheduled)?.kind, kind);
+  assert.equal(
+    trustDecision(scheduled).question.choices.some(({ value }) =>
+      String(value).startsWith('message:'),
+    ),
+    false,
+  );
   let output: unknown = { readOnly: true };
   let currentRules: string | undefined = words.userRules;
   let holdReview = false;
@@ -1196,7 +1340,10 @@ test('unavailable decisions avoid ledger reads and retain dynamic availability a
     { reads, writes, resolutions, requests },
     { reads: 0, writes: 0, resolutions: 0, requests: 0 },
   );
-  assert.deepEqual(await checkMail(emails, AbortSignal.abort()), Array.from({ length: 100 }));
+  assert.deepEqual(
+    await checkMail(emails, AbortSignal.abort()),
+    Array<string>(100).fill('the read was stopped before its check finished'),
+  );
   assert.equal(availabilityReads - beforeAvailability, 1);
   assert.equal(curatorRequests, 100);
 
@@ -1208,7 +1355,9 @@ test('unavailable decisions avoid ledger reads and retain dynamic availability a
     { reads: 1, writes: 1, resolutions: 1, requests: 1 },
   );
   spent = 1;
-  assert.deepEqual(await checkMail([request.input.email]), [undefined]);
+  assert.deepEqual(await checkMail([request.input.email]), [
+    'This month’s spending limit is reached.',
+  ]);
   assert.equal(curatorRequests, 100);
   assert.deepEqual(
     { reads, writes, resolutions, requests },
@@ -1295,7 +1444,11 @@ test('decision requests revalidate capability and cancellation after resolving c
       if (stop === 'configuration') configured = false;
       if (stop === 'cancel') controller.abort();
       release();
-      assert.deepEqual(await result, [undefined]);
+      assert.deepEqual(await result, [
+        stop === 'cancel'
+          ? 'the read was stopped before its check finished'
+          : 'the check model gave no valid answer',
+      ]);
       await new Promise((resolve) => setImmediate(resolve));
       assert.equal(calls, 0);
       assert.equal(fallback, 0);
@@ -1668,7 +1821,7 @@ describe('account routes', () => {
     const delivered: ModelTrace[] = [];
     const traces = createModelTraces(async (trace) => {
       delivered.push(trace);
-    });
+    }, '0.3.0');
     traces.configure({
       secrets: ['fixture-model-key-8c41f2'],
       profile: async () => ({ names: ['Marta Vidal'], region: 'ES' }),
@@ -1765,7 +1918,8 @@ describe('account routes', () => {
       assert.ok(!privateContent.includes(value), value);
     assert.match(sent, /order 123456 on 2026-10-19/);
     assert.match(sent, /192\.168\.1\.1\.example/);
-    assert.deepEqual(Object.keys(delivered[0].metadata), ['turn_id', 'thread_id']);
+    assert.deepEqual(Object.keys(delivered[0].metadata), ['turn_id', 'thread_id', 'app_version']);
+    assert.equal(delivered[0].metadata.app_version, '0.3.0');
     assert.match(delivered[0].metadata.thread_id, /^[0-9a-f]{32}$/);
     assert.match(delivered[0].metadata.turn_id, /^[0-9a-f]{32}$/);
     assert.ok(!sent.includes('fixture-session') && !sent.toLowerCase().includes(turnId));
@@ -2415,6 +2569,46 @@ test('server model credentials reject invalid destinations and cloud accounts be
   );
 });
 
+test('secret redaction finishes for long malformed Basic credentials', async () => {
+  const { execFile } = await import('node:child_process');
+  const { promisify } = await import('node:util');
+  await promisify(execFile)(
+    process.execPath,
+    [
+      '--import',
+      'tsx',
+      '--input-type=module',
+      '-e',
+      `import { redactSecretText } from ${JSON.stringify(new URL('../src/server/redaction.ts', import.meta.url).href)};
+       const tail = '='.repeat(300_000) + 'a';
+       for (const token of [tail, Buffer.from('synthetic:synthetic').toString('base64') + tail]) {
+         redactSecretText('Basic ' + token);
+       }`,
+    ],
+    { timeout: 5000 },
+  );
+});
+
+test('secret redaction keeps valid tokens when another token is missing', () => {
+  const secrets = [' fixture-access-token ', undefined, null, 42] as unknown as string[];
+  const text = createTextRedactor(secrets);
+  const error = createErrorRedactor(secrets);
+  const redact = createRedactor(secrets);
+  assert.equal(text('Using fixture-access-token.'), 'Using [redacted].');
+  assert.equal(error('Failed for fixture-access-token.'), 'Failed for [redacted].');
+  assert.equal(
+    JSON.stringify(redact({ detail: 'fixture-access-token' })),
+    '{"detail":"[redacted]"}',
+  );
+  secrets.push('fixture-refresh-token', undefined as unknown as string);
+  assert.equal(text('fixture-access-token fixture-refresh-token'), '[redacted] [redacted]');
+  assert.equal(error('fixture-refresh-token'), '[redacted]');
+  assert.equal(
+    JSON.stringify(redact({ detail: 'fixture-refresh-token' })),
+    '{"detail":"[redacted]"}',
+  );
+});
+
 describe('model connections', { skip: !process.env.TEST_DATABASE_URL }, () => {
   async function fixture(t: import('node:test').TestContext) {
     const { createModelService } = await import('../src/server/models.ts');
@@ -2540,6 +2734,106 @@ describe('model connections', { skip: !process.env.TEST_DATABASE_URL }, () => {
     ]);
   });
 
+  test('incomplete saved credentials do not break redaction for the selected connection', async (t) => {
+    const f = await fixture(t);
+    const ownerId = 'fixture-incomplete-subscription';
+    const owner = await f.create(ownerId);
+    await owner.addKey('openai', 'fixture-selected-model-key');
+    const { createDatabaseModelStore } = await import('../src/server/model-store.ts');
+    const store = createDatabaseModelStore({
+      database: f.database,
+      ownerId,
+      keyStore: f.keyStore,
+    });
+    await store.initialize();
+    const { idToken: _, ...saved } = subscriptionCredential();
+    await store.change((state) => {
+      state.connections.push({
+        id: randomUUID(),
+        provider: 'openai',
+        method: 'subscription',
+        label: 'Synthetic older subscription',
+        status: 'reconnect',
+        models: [],
+        managed: false,
+        credential: saved as import('../src/ports/models.ts').ModelCredential,
+      });
+      for (const [type, provider] of [
+        ['api_key', 'openai'],
+        ['endpoint', 'compatible'],
+        ['bedrock', 'amazon-bedrock'],
+        ['cloudflare', 'cloudflare-workers-ai'],
+        ['azure', 'azure'],
+      ] as const)
+        for (const key of [undefined, null, 42, '', 'a', 'ab', 'abc', 'abcd'])
+          state.connections.push({
+            id: randomUUID(),
+            provider,
+            method: 'api_key',
+            label: 'Synthetic incomplete key',
+            status: 'reconnect',
+            models: [],
+            managed: false,
+            credential: {
+              type,
+              key,
+            } as unknown as import('../src/ports/models.ts').ModelCredential,
+          });
+      for (const [provider, credential] of [
+        [
+          'compatible',
+          { type: 'endpoint', url: 'http://127.0.0.1:1/v1', key: 'fixture-endpoint-key-ab12' },
+        ],
+        [
+          'azure',
+          {
+            type: 'azure',
+            url: 'https://fixture.example.test/openai/v1',
+            model: 'fixture-model',
+            deployment: 'fixture-deployment',
+            key: 'fixture-azure-key-cd34',
+          },
+        ],
+      ] as const)
+        state.connections.push({
+          id: randomUUID(),
+          provider,
+          method: 'api_key',
+          label: `Synthetic keyed ${credential.type}`,
+          status: 'reconnect',
+          models: [],
+          managed: false,
+          credential,
+        });
+    });
+    const restored = await f.create(ownerId);
+    assert.ok(
+      restored
+        .view()
+        .connections.filter((row) => row.label === 'Synthetic incomplete key')
+        .every((row) => row.keyEnding === undefined),
+    );
+    for (const [label, ending] of [
+      ['Synthetic keyed endpoint', 'ab12'],
+      ['Synthetic keyed azure', 'cd34'],
+    ])
+      assert.equal(
+        restored.view().connections.find((row) => row.label === label)?.keyEnding,
+        ending,
+      );
+    const secrets: string[] = [];
+    restored.onSecrets((values) => secrets.push(...values));
+    assert.equal(
+      createTextRedactor(secrets)('Using fixture-selected-model-key and fixture-access.'),
+      'Using [redacted] and [redacted].',
+    );
+    assert.ok(secrets.every((secret) => typeof secret === 'string' && secret.length > 0));
+    assert.deepEqual(await (await restored.resolve()).read(), {
+      type: 'api_key',
+      key: 'fixture-selected-model-key',
+    });
+  });
+
   function stubSignIn(
     exchange: () => Promise<import('../src/ports/models.ts').ModelCredential>,
     aborted?: () => void,
@@ -2605,7 +2899,12 @@ describe('model connections', { skip: !process.env.TEST_DATABASE_URL }, () => {
     const models = saved.view().connections[0].models;
     assert.deepEqual(
       models.filter((model) => model.id !== 'fixture/small').map((model) => model.pricing),
-      [{ input: 1.25, output: 5 }, { input: 0, output: 0 }, 'variable', 'variable'],
+      [
+        { input: 1.25, output: 5, cacheRead: 0, cacheWrite: 0 },
+        { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        'variable',
+        'variable',
+      ],
     );
     const small = models[1].pricing;
     assert.ok(small && small !== 'variable');
@@ -2765,7 +3064,7 @@ describe('model connections', { skip: !process.env.TEST_DATABASE_URL }, () => {
     );
     assert.equal((await f.database.query('SELECT * FROM vault_app_grants')).rowCount, 0);
     const removed = await f.create('fixture-environment-owner', backend, modelEnvironment({}));
-    assert.deepEqual(removed.view(), { connections: [], selection: null });
+    assert.deepEqual(removed.view(), { connections: [], selection: null, routes: {}, light: null });
     await assert.rejects(removed.resolve());
     for (const access of captured) assert.equal(await access.read(), undefined);
   });
@@ -2815,6 +3114,163 @@ describe('model connections', { skip: !process.env.TEST_DATABASE_URL }, () => {
     await assert.rejects(owner.resolve());
   });
 
+  test('a model request failure that Pi does not retry pauses automatic requests to that model, tries again after a growing wait, and clears on success', async (t) => {
+    const f = await fixture(t);
+    const { createPiMemoryCurator } = await import('../src/providers/pi/memory-curator.ts');
+    const { createPiModelRuntime } = await import('../src/providers/pi/models.ts');
+    const { lightestEffort } = await import('../src/shared/models.ts');
+    const definitions = (await f.backend.catalog('mistral', 'api_key')).map((item) => ({
+      ...item,
+      spec: { ...item.spec, api: 'openai-completions', baseUrl: 'https://model.example/v1' },
+    }));
+    const backend = { ...f.backend, catalog: async () => definitions };
+    let service = await f.create('fixture-failing-owner', backend);
+    service.setRequestBudget(async () => async () => {});
+    let checks = 0;
+    await service.setSelectionCheck(async () => {
+      checks++;
+    });
+    const connectionId = await service.addKey('mistral', 'fixture-failing-key');
+    assert.equal(checks, 1);
+    const other = await f.create('fixture-healthy-owner', backend);
+    other.setRequestBudget(async () => async () => {});
+    await other.addKey('mistral', 'fixture-healthy-key');
+    const original = globalThis.fetch;
+    t.after(() => {
+      globalThis.fetch = original;
+    });
+    const healthy = () =>
+      new Response(
+        'data: {"choices":[{"index":0,"delta":{"role":"assistant","content":"{\\"ready\\":true}"}}]}\n\ndata: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n',
+        { headers: { 'content-type': 'text/event-stream' } },
+      );
+    let reply = (): Response =>
+      Response.json({ error: { message: 'Synthetic outage.' } }, { status: 503 });
+    let calls = 0;
+    globalThis.fetch = async (input) => {
+      assert.ok(String(input).startsWith('https://model.example/'));
+      calls++;
+      return reply();
+    };
+    const ask = async () => {
+      const { runtime, model } = await createPiModelRuntime(await service.resolve());
+      return runtime.completeSimple(model, {
+        messages: [{ role: 'user', content: 'Synthetic question.', timestamp: 1 }],
+      });
+    };
+    const curator = createPiMemoryCurator({
+      provider: 'mistral',
+      resolve: () => service.resolve(),
+    });
+    const request = {
+      task: 'plan' as const,
+      instructions: 'Prepare the synthetic task.',
+      input: {},
+    };
+    t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+    const first = service.view().selection!;
+    const definition = definitions.find((item) => item.choice.id !== first.modelId)!;
+    const second = {
+      connectionId,
+      modelId: definition.choice.id,
+      effort: lightestEffort(definition.choice.efforts),
+    };
+    const allowed = (schedule = first) =>
+      service.automaticRequestsAllowed({ kind: 'schedule', schedule });
+
+    assert.equal((await ask()).stopReason, 'error');
+    assert.equal(calls, 1);
+    assert.equal(service.view().connections[0]!.issue, undefined);
+    assert.equal(await allowed(), true);
+
+    reply = () =>
+      Response.json(
+        { error: { code: 402, message: 'This request requires more credits.' } },
+        { status: 402 },
+      );
+    const noCredits = reply;
+    assert.equal((await ask()).stopReason, 'error');
+    assert.equal(calls, 2);
+    assert.match(
+      service.view().connections[0]!.issue!.reason,
+      /HTTP 402; This request requires more credits\./,
+    );
+    assert.match(service.current.issue!.reason, /requires more credits/);
+    assert.equal(await allowed(), false);
+    assert.equal(await allowed(second), true);
+    assert.equal(service.paused({ kind: 'schedule', schedule: first }), true);
+    assert.equal(service.paused({ kind: 'schedule', schedule: second }), false);
+    assert.equal(
+      service.paused({ kind: 'schedule', schedule: { ...first, modelId: 'fixture-missing' } }),
+      false,
+    );
+    await assert.rejects(curator.curate(request), /Automatic requests to this model are paused/);
+    assert.equal(calls, 2);
+    const ledger = createLedger({
+      pool: { query: async () => ({ rows: [] }) } as never,
+      ownerId: 'fixture-failing-owner',
+    });
+    await assert.rejects(ledger.curator(curator).curate(request), /paused/);
+    assert.equal(calls, 2);
+    await assert.rejects(
+      ledger.forOwner(() => ledger.curator(curator).curate(request)),
+      /requires more credits/,
+    );
+    assert.equal(calls, 3);
+    assert.equal(await allowed(), false);
+    assert.equal(await other.automaticRequestsAllowed({ kind: 'background' }, true), true);
+    assert.doesNotMatch(
+      JSON.stringify(service.view()),
+      /credentialTag|requestFailures|fixture-failing-key/,
+    );
+
+    await service.close();
+    service = await f.create('fixture-failing-owner', backend);
+    service.setRequestBudget(async () => async () => {});
+    await service.setSelectionCheck(async () => {
+      checks++;
+    });
+    assert.equal(await allowed(), false);
+    t.mock.timers.tick(120_001);
+    assert.equal(await allowed(), true);
+    await assert.rejects(curator.curate(request), /requires more credits/);
+    assert.equal(calls, 4);
+    t.mock.timers.tick(120_001);
+    assert.equal(await allowed(), false);
+    t.mock.timers.tick(240_000);
+    assert.equal(await allowed(), true);
+    await assert.rejects(curator.curate(request), /requires more credits/);
+    assert.equal(calls, 5);
+    assert.equal(await allowed(), false);
+
+    assert.equal(checks, 2);
+    await service.select(second);
+    assert.equal(checks, 3);
+    assert.equal(service.current.issue, undefined);
+    reply = healthy;
+    assert.equal((await ask()).stopReason, 'stop');
+    assert.equal(calls, 6);
+    assert.equal(await allowed(), false);
+    reply = noCredits;
+    assert.equal((await ask()).stopReason, 'error');
+    assert.equal(calls, 7);
+    assert.match(service.current.issue!.reason, /requires more credits/);
+    reply = healthy;
+    assert.equal((await ask()).stopReason, 'stop');
+    assert.equal(calls, 8);
+    assert.equal(service.current.issue, undefined);
+    assert.equal(await allowed(), true);
+    assert.match(service.view().connections[0]!.issue!.reason, /requires more credits/);
+    await service.select(first);
+    assert.equal(checks, 4);
+    await service.select(first);
+    assert.equal(checks, 5);
+    assert.deepEqual(await curator.curate(request), { ready: true });
+    assert.equal(calls, 9);
+    assert.equal(service.view().connections[0]!.issue, undefined);
+    assert.equal(service.current.issue, undefined);
+  });
+
   test('model setup chooses capable defaults, preserves explicit choices and requires valid cloud accounts', async (t) => {
     const f = await fixture(t);
     const backend = {
@@ -2824,28 +3280,28 @@ describe('model connections', { skip: !process.env.TEST_DATABASE_URL }, () => {
     };
     const google = await f.create('fixture-google-default', backend);
     await google.addKey('google', 'fixture-google-key');
-    assert.equal(google.view().selection?.modelId, 'gemini-3.8-flash');
+    assert.equal(google.view().selection?.modelId, 'gemini-4-argon');
     assert.equal(google.view().selection?.effort, 'medium');
     const chosen = google.view().selection!;
     await google.addKey('mistral', 'fixture-mistral-key');
     assert.deepEqual(google.view().selection, chosen);
-    const paidGoogle = await f.create('fixture-google-paid-choice', {
+    const freeGoogle = await f.create('fixture-google-free-choice', {
       ...backend,
       catalog: async () =>
         (await backend.catalog('google')).filter(
-          (definition) => definition.choice.id === 'gemini-4-argon',
+          (definition) => definition.choice.id === 'gemini-3.8-flash',
         ),
     });
-    const paidConnection = await paidGoogle.addKey('google', 'fixture-google-paid-key');
-    assert.equal(paidGoogle.view().selection, null);
-    assert.equal(paidGoogle.configured, false);
-    await paidGoogle.select({
-      connectionId: paidConnection,
-      modelId: 'gemini-4-argon',
+    const freeConnection = await freeGoogle.addKey('google', 'fixture-google-free-key');
+    assert.equal(freeGoogle.view().selection, null);
+    assert.equal(freeGoogle.configured, false);
+    await freeGoogle.select({
+      connectionId: freeConnection,
+      modelId: 'gemini-3.8-flash',
       effort: 'medium',
     });
-    assert.equal(paidGoogle.configured, true);
-    assert.equal((await paidGoogle.resolve()).definition.choice.id, 'gemini-4-argon');
+    assert.equal(freeGoogle.configured, true);
+    assert.equal((await freeGoogle.resolve()).definition.choice.id, 'gemini-3.8-flash');
     const bedrock = await f.create('fixture-bedrock-default', backend);
     await bedrock.addKey('amazon-bedrock', 'fixture-bedrock-key', { region: 'eu-west-1' });
     assert.equal(bedrock.view().selection, null);
@@ -2962,6 +3418,111 @@ describe('model connections', { skip: !process.env.TEST_DATABASE_URL }, () => {
     assert.equal(await access.read(), undefined);
     assert.equal(owner.hasImageModel(), false);
     assert.equal((await owner.resolve()).definition.choice.images, false);
+  });
+
+  test('work models follow own choices and lanes while checks keep the owner model', async (t) => {
+    const f = await fixture(t);
+    const { createPiModelBackend } = await import('../src/providers/pi/models.ts');
+    let listed = ['gpt-6.1-sol', 'gpt-6-luna', 'gpt-audio-1.5'];
+    const backend = createPiModelBackend({
+      fetch: async () => Response.json({ data: listed.map((id) => ({ id })) }),
+    });
+    const owner = await f.create('fixture-work-model-owner', backend);
+    const events: Array<{ event: string; properties?: Record<string, unknown> }> = [];
+    const app = Fastify();
+    owner.register(app, (event) => void events.push(event));
+    t.after(() => app.close());
+    const route = (lane: string, value: unknown) =>
+      app.inject({ method: 'PUT', url: '/api/models/routes', payload: { lane, route: value } });
+    const connectionId = await owner.addKey('openai', 'fixture-work-model-key');
+    const main = { connectionId, modelId: 'gpt-6.1-sol', effort: 'high' as const };
+    await owner.select(main);
+    const light = owner.view().light!;
+    assert.equal(light.modelId, 'gpt-6-luna');
+    for (const kind of ['chat', 'schedule', 'background'] as const)
+      assert.deepEqual(owner.workModel({ kind }), { selection: main, follows: 'chat' });
+
+    assert.equal((await route('background', 'light')).statusCode, 200);
+    assert.deepEqual(owner.workModel({ kind: 'background' }), {
+      selection: light,
+      follows: 'light',
+    });
+    assert.deepEqual(owner.workModel({ kind: 'schedule' }).selection, main);
+    assert.equal((await owner.resolve()).definition.choice.id, 'gpt-6.1-sol');
+    assert.equal(
+      (await owner.resolve(false, owner.workModel({ kind: 'background' }).selection)).definition
+        .choice.id,
+      'gpt-6-luna',
+    );
+    assert.equal(await owner.automaticRequestsAllowed({ kind: 'background' }, true), true);
+
+    const pinned = { ...main, effort: 'low' as const };
+    assert.deepEqual(owner.workModel({ kind: 'background', task: pinned }), {
+      selection: pinned,
+      follows: 'task',
+    });
+    assert.deepEqual(owner.workModel({ kind: 'schedule', schedule: light }), {
+      selection: light,
+      follows: 'schedule',
+    });
+    assert.deepEqual(owner.workModel({ kind: 'chat', schedule: light }).selection, main);
+
+    const audio = owner
+      .view()
+      .connections[0]!.models.find((model) => model.id === 'gpt-audio-1.5')!;
+    for (const invalid of [
+      { ...main, modelId: audio.id, effort: audio.efforts[0] ?? 'high' },
+      { ...main, modelId: 'fixture-missing-model' },
+      { ...main, effort: 'off' },
+      { ...main, connectionId: randomUUID() },
+      'heavy',
+    ])
+      assert.equal((await route('schedule', invalid)).statusCode, 400, JSON.stringify(invalid));
+    assert.deepEqual(owner.view().routes, { background: 'light' });
+
+    assert.equal((await route('schedule', light)).statusCode, 200);
+    assert.deepEqual(owner.workModel({ kind: 'schedule' }), { selection: light, follows: 'lane' });
+
+    listed = ['gpt-6.1-sol'];
+    await owner.refreshCatalog(connectionId);
+    assert.equal(owner.view().light, null);
+    assert.deepEqual(owner.workModel({ kind: 'background' }), { selection: main, follows: 'chat' });
+    assert.throws(() => owner.workModel({ kind: 'schedule' }), /gpt-6-luna/);
+    assert.throws(() => owner.workModel({ kind: 'chat', task: light }), /gpt-6-luna/);
+    assert.equal(await owner.automaticRequestsAllowed({ kind: 'background' }, true), true);
+    listed = ['gpt-6.1-sol', 'gpt-6-luna'];
+    await owner.refreshCatalog(connectionId);
+
+    await f.database.query('UPDATE model_settings SET routes=$2 WHERE owner_id=$1', [
+      'fixture-work-model-owner',
+      JSON.stringify({ background: 'light', schedule: { ...main, effort: 'off' } }),
+    ]);
+    const restarted = await f.create('fixture-work-model-owner', backend);
+    assert.deepEqual(restarted.workModel({ kind: 'schedule' }).selection, main);
+
+    const second = await owner.addKey('openai', 'fixture-work-model-second');
+    assert.equal((await route('schedule', { ...main, connectionId: second })).statusCode, 200);
+    await owner.remove(second);
+    assert.deepEqual(owner.view().routes, { background: 'light' });
+    assert.deepEqual(
+      owner.workModel({ kind: 'schedule', schedule: { ...main, connectionId: second } }),
+      { selection: main, follows: 'chat' },
+    );
+
+    assert.equal((await route('background', null)).statusCode, 200);
+    assert.deepEqual(owner.view().routes, { background: null });
+    assert.deepEqual(owner.workModel({ kind: 'background' }).selection, main);
+    const routeEvents = events
+      .filter(({ event }) => event === 'setting_changed')
+      .map(({ properties }) => properties)
+      .filter((properties) => String(properties?.setting).startsWith('model_route'));
+    assert.deepEqual(routeEvents, [
+      { setting: 'model_route_background', actor: 'owner', state: 'light' },
+      { setting: 'model_route_schedule', actor: 'owner', state: 'configured' },
+      { setting: 'model_route_schedule', actor: 'owner', state: 'configured' },
+      { setting: 'model_route_background', actor: 'owner', state: 'default' },
+    ]);
+    assert.doesNotMatch(JSON.stringify(routeEvents), /gpt-|[0-9a-f]{8}-/);
   });
 
   test('classification resolves an approved small model only on the selected owned connection', async (t) => {
@@ -5749,7 +6310,8 @@ describe('persisted setting analytics privacy', { skip: !process.env.TEST_DATABA
       CREATE TABLE preferences(owner_id text PRIMARY KEY,notification_rule text NOT NULL DEFAULT '',rules text NOT NULL DEFAULT '',
         time_zone text,quiet_start text NOT NULL DEFAULT '22:00',quiet_end text NOT NULL DEFAULT '08:00',
         quiet_hours_enabled boolean NOT NULL DEFAULT true,locale text,hour_cycle text NOT NULL DEFAULT 'auto',
-        speech_voice text,speech_reply text NOT NULL DEFAULT 'auto',proactive_paused boolean NOT NULL DEFAULT false)`);
+        speech_voice text,speech_reply text NOT NULL DEFAULT 'auto',proactive_paused boolean NOT NULL DEFAULT false,
+        local_files_enabled boolean NOT NULL DEFAULT false)`);
     const captured: Parameters<ProductAnalytics['capture']>[0][] = [];
     const analytics = await createAnalytics({
       provider: { capture: (event) => captured.push(event), shutdown: async () => {} },
@@ -5818,6 +6380,8 @@ describe('persisted setting analytics privacy', { skip: !process.env.TEST_DATABA
     const { createPreferencesStore } = await import('../src/server/preferences.ts');
     const f = await fixture(t);
     const preferences = createPreferencesStore(f.database, f.owner, f.analytics.forOwner(f.owner));
+    await preferences.update({ proactivePaused: false });
+    f.captured.length = 0;
     const privatePatch = {
       notificationRule: 'Synthetic private notification rule',
       rules: 'Synthetic private standing rule',
@@ -5895,8 +6459,14 @@ describe('persisted setting analytics privacy', { skip: !process.env.TEST_DATABA
       { setting: 'monthly_spending_limit', actor: 'agent', state: 'configured' },
       { setting: 'task_spending_limit', actor: 'agent', state: 'configured' },
     ]);
+    await ledger.setLimits({ preparationUsd: 3.17 }, 'owner');
+    assert.deepEqual(f.changes().at(-1), {
+      setting: 'preparation_spending_limit',
+      actor: 'owner',
+      state: 'configured',
+    });
     const count = f.changes().length;
-    await ledger.setLimits({ monthlyUsd: 37.42, taskUsd: 8.53 });
+    await ledger.setLimits({ monthlyUsd: 37.42, taskUsd: 8.53, preparationUsd: 3.17 });
     await assert.rejects(ledger.setLimits({ monthlyUsd: -1 }));
     assert.equal(f.changes().length, count);
     await ledger.setLimits({ monthlyUsd: null, taskUsd: null });
@@ -5929,8 +6499,7 @@ describe('persisted setting analytics privacy', { skip: !process.env.TEST_DATABA
       const saved = await preferences.update(
         { notificationRule: 'Synthetic accepted notification' },
         'agent',
-        rules,
-        client,
+        { expectedRules: rules, client },
       );
       assert.equal(saved.notificationRule, 'Synthetic accepted notification');
       assert.equal((await preferences.get()).notificationRule, 'Synthetic original notification');
@@ -5942,7 +6511,10 @@ describe('persisted setting analytics privacy', { skip: !process.env.TEST_DATABA
     ]);
     await assert.rejects(
       transaction(async (client) => {
-        await preferences.update({ rules: 'Synthetic rolled-back rules' }, 'agent', rules, client);
+        await preferences.update({ rules: 'Synthetic rolled-back rules' }, 'agent', {
+          expectedRules: rules,
+          client,
+        });
         assert.equal(f.changes().length, 1);
         throw new Error('Synthetic outer preference rollback');
       }, f.database),
@@ -5953,22 +6525,33 @@ describe('persisted setting analytics privacy', { skip: !process.env.TEST_DATABA
     await assert.rejects(
       transaction(
         (client) =>
-          preferences.update(
-            { notificationRule: 'Synthetic unauthorized notification' },
-            'agent',
-            'Synthetic stale reviewed rules',
+          preferences.update({ notificationRule: 'Synthetic unauthorized notification' }, 'agent', {
+            expectedRules: 'Synthetic stale reviewed rules',
             client,
-          ),
+          }),
         f.database,
       ),
-      { statusCode: 409, message: 'Your rules changed. Review them before asking again.' },
+      {
+        statusCode: 409,
+        message: 'The saved owner instructions changed. Review them before asking again.',
+      },
     );
     assert.equal((await preferences.get()).notificationRule, 'Synthetic accepted notification');
     assert.equal(f.changes().length, 1);
+    await assert.rejects(
+      preferences.update({ notificationRule: 'Synthetic stale replacement' }, 'agent', {
+        expectedNotificationRule: 'Synthetic original notification',
+      }),
+      { statusCode: 409 },
+    );
+    assert.equal((await preferences.get()).notificationRule, 'Synthetic accepted notification');
     for (const enabled of [true, false]) {
       f.analytics.setUsageData(f.owner, enabled);
       await transaction(async (client) => {
-        await preferences.update({ proactivePaused: enabled }, 'agent', rules, client);
+        await preferences.update({ proactivePaused: enabled }, 'agent', {
+          expectedRules: rules,
+          client,
+        });
         f.analytics.setUsageData(f.owner, false);
         f.analytics.setUsageData(f.owner, true);
         assert.equal(f.changes().length, 1);
@@ -5977,7 +6560,8 @@ describe('persisted setting analytics privacy', { skip: !process.env.TEST_DATABA
       assert.equal(f.changes().length, 1);
     }
     await transaction(
-      (client) => preferences.update({ proactivePaused: true }, 'agent', rules, client),
+      (client) =>
+        preferences.update({ proactivePaused: true }, 'agent', { expectedRules: rules, client }),
       f.database,
     );
     assert.deepEqual(f.changes().slice(1), [
@@ -6244,3 +6828,12 @@ describe('persisted setting analytics privacy', { skip: !process.env.TEST_DATABA
     }
   });
 });
+
+function withOwnerIds<
+  T extends { userMessages?: ReadonlyArray<{ at: string; text: string; canAuthorize?: boolean }> },
+>(words: T, ids: readonly string[]) {
+  return {
+    ...words,
+    userMessages: words.userMessages?.map((message, index) => ({ ...message, id: ids[index] })),
+  };
+}

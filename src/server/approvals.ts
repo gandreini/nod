@@ -19,6 +19,14 @@ import { lockKey, locksTable } from './locks.ts';
 import { withdrawnSql } from './turn-chain.ts';
 import { afterCommit, transaction } from './transaction.ts';
 import type { CaptureAnalytics } from './analytics.ts';
+import type { TrustBasis } from './trust-basis.ts';
+import {
+  ownerChatRevision,
+  validateInstructionChange,
+  validateOwnerInstructions,
+  type InstructionChange,
+  type OwnerInstructions,
+} from './owner-instructions.ts';
 
 export interface ApprovalExecutionContext {
   threadId: string;
@@ -27,6 +35,8 @@ export interface ApprovalExecutionContext {
   signal?: AbortSignal;
   details?: Record<string, unknown>;
   expectedRevision?: number;
+  basis?: TrustBasis;
+  instructionChange?: InstructionChange;
 }
 
 export interface ApprovalWork {
@@ -42,6 +52,11 @@ export interface ApprovalDescription {
   args: Record<string, unknown>;
   details?: Record<string, unknown>;
   work?: ApprovalWork;
+}
+
+export interface ApprovalPresentation {
+  question: string;
+  action: string;
 }
 
 export interface ChatConfirmationInput {
@@ -64,7 +79,7 @@ export type ChatConfirmationResult =
   | undefined;
 
 function chatConfirmationSql(match: string) {
-  return `SELECT a.*,u.source AS turn_source,u.status AS turn_status,u.background AS turn_background,u.session_id AS turn_session_id,u.prompt AS turn_prompt
+  return `SELECT a.*,u.source AS turn_source,u.status AS turn_status,u.background AS turn_background,u.session_id AS turn_session_id,u.prompt AS turn_prompt,to_jsonb(u)->>'task_id' AS turn_task_id
   FROM approvals a JOIN turns u ON u.id=a.turn_id
   WHERE ${match}
     AND a.owner_id=$2 AND u.owner_id=$2 AND a.thread_id=$3 AND u.thread_id=$3
@@ -153,16 +168,15 @@ async function scheduleAuthority(client: PoolClient, turnId: string) {
     return undefined;
   return (
     await client.query<{
-      authority_instruction: string | null;
-      authority_source_message_id: string | null;
+      authority: OwnerInstructions | null;
       scheduled_for: Date;
       time_zone: string;
       title: string;
       kind: string | null;
     }>(
-      `SELECT r.authority_instruction,r.authority_source_message_id,r.scheduled_for,r.time_zone,r.title,s.kind
-       FROM schedule_runs r LEFT JOIN schedules s ON s.id=r.schedule_id AND s.owner_id=r.owner_id
-       WHERE r.turn_id=$1 AND r.owner_id=$2`,
+      `SELECT to_jsonb(r)->'authority' AS authority,r.scheduled_for,r.time_zone,r.title,s.kind
+     FROM schedule_runs r LEFT JOIN schedules s ON s.id=r.schedule_id AND s.owner_id=r.owner_id
+     WHERE r.turn_id=$1 AND r.owner_id=$2`,
       [turnId, ownerId],
     )
   ).rows[0];
@@ -173,13 +187,19 @@ async function workOf(
   taskId: string | null,
   schedule: Awaited<ReturnType<typeof scheduleAuthority>>,
 ): Promise<ApprovalWork | undefined> {
-  if (schedule)
+  if (schedule) {
+    const ownerRequest = schedule.authority?.messages
+      .filter((message) => message.canAuthorize !== false)
+      .map((message) => message.text)
+      .filter(Boolean)
+      .join('\n\n');
     return {
       kind: 'schedule',
       title: schedule.title,
-      ...(schedule.authority_instruction ? { ownerRequest: schedule.authority_instruction } : {}),
+      ...(ownerRequest ? { ownerRequest } : {}),
       ...(schedule.kind === 'recurring' ? { waitsForAnswer: true as const } : {}),
     };
+  }
   if (!taskId) return undefined;
   const task = (
     await client.query<{ title: string; request: string | null }>(
@@ -229,7 +249,7 @@ export async function turnOrigin(turnId: string) {
       source: origin.source,
       messageIds: said,
       channel: current.channel,
-      scheduleInstruction: run?.authority_instruction ?? undefined,
+      scheduleInstruction: run?.authority ?? undefined,
       ...(run
         ? {
             scheduledFor: localTimestamp(run.time_zone, run.scheduled_for),
@@ -255,7 +275,10 @@ export async function createApprovals(
     client?: PoolClient,
   ) => Promise<void>,
   interpret?: (reply: string) => Promise<boolean | undefined>,
-  describe?: (proposal: ApprovalDescription, signal?: AbortSignal) => Promise<string>,
+  describe?: (
+    proposal: ApprovalDescription,
+    signal?: AbortSignal,
+  ) => Promise<string | ApprovalPresentation>,
   analytics?: CaptureAnalytics,
 ) {
   const changed = (
@@ -300,8 +323,16 @@ export async function createApprovals(
       validate?: (client: PoolClient) => Promise<void>;
       expectedRevision?: number;
       expectedChatRevision?: string;
+      basis?: TrustBasis;
+      instructionChange?: InstructionChange;
     } = {},
   ) {
+    const instructionChange = options.instructionChange
+      ? structuredClone(options.instructionChange)
+      : undefined;
+    const replacesInstruction =
+      action === 'NOD_schedule_create' ||
+      (action === 'NOD_schedule_update' && typeof instructionChange?.changes.prompt === 'string');
     const encoded = JSON.stringify(args);
     if (!encoded) throw new Error('The action has no arguments to save.');
     const snapshot = JSON.parse(encoded) as Record<string, unknown>;
@@ -334,12 +365,16 @@ export async function createApprovals(
       let authorMessageId: string | null;
       const schedule =
         origin.source === 'schedule' ? await scheduleAuthority(client, origin.id) : undefined;
+      if (schedule?.authority) await validateOwnerInstructions(client, ownerId, schedule.authority);
       if (steering) {
         authorMessageId = steering.id;
       } else if (origin.source === 'event') {
         authorMessageId = null;
       } else if (origin.source === 'schedule') {
-        authorMessageId = schedule?.authority_source_message_id ?? null;
+        authorMessageId =
+          schedule?.authority?.messages.find(
+            (message) => message.canAuthorize !== false && message.id,
+          )?.id ?? null;
       } else {
         const author =
           origin.source === 'user' && origin.message_id
@@ -424,48 +459,53 @@ export async function createApprovals(
       };
     };
     let question: string | undefined;
+    let title: string | undefined;
     if (!allowed) {
       const existing = await withTurnLock(turn.turnId, (client) => inspect(client, true));
       if ('cached' in existing) {
         if (existing.cached) return existing.result;
         return { [appConfirmation]: existing.question as string };
       }
-      if (!describe) throw new Error('The confirmation model is unavailable.');
-      question = await describe(
+      if (!describe) throw new Error('The confirmation formatter is unavailable.');
+      const presentation = await describe(
         {
           turn: { ...turn },
           action,
           args: JSON.parse(encoded),
-          ...(details ? { details: JSON.parse(details) } : {}),
+          ...(details || (replacesInstruction && instructionChange)
+            ? {
+                details: {
+                  ...(details ? JSON.parse(details) : {}),
+                  ...(replacesInstruction && instructionChange
+                    ? { scheduleDefinition: instructionChange.after }
+                    : {}),
+                },
+              }
+            : {}),
           ...(existing.work ? { work: existing.work } : {}),
         },
         options.signal,
       );
+      question = typeof presentation === 'string' ? presentation : presentation.question;
+      title = typeof presentation === 'string' ? undefined : presentation.action;
       options.signal?.throwIfAborted();
       if (typeof question !== 'string' || !question.trim())
-        throw new Error('The confirmation model did not produce a valid question.');
+        throw new Error('The confirmation formatter did not produce a valid question.');
+      if (title !== undefined && (!title.trim() || title.length > 64 || /[\r\n]/.test(title)))
+        throw new Error('The confirmation model did not produce a valid action label.');
     }
     const saveProposal = async (client: PoolClient) => {
-      if (options.expectedChatRevision !== undefined) {
-        const latest = (
-          await client.query<{ id: string }>(
-            `SELECT m.id FROM messages m WHERE m.owner_id=$1 AND m.thread_id=$2 AND m.role='user' AND m.hidden_at IS NULL
-               AND EXISTS (SELECT 1 FROM turns s WHERE s.owner_id=$1 AND s.thread_id=m.thread_id AND s.source='user'
-                 AND (s.message_id=m.id OR s.id=m.turn_id))
-               AND NOT EXISTS (SELECT 1 FROM turns u WHERE u.owner_id=$1 AND (u.message_id=m.id OR u.id=m.turn_id)
-                 AND to_jsonb(u)->>'task_id' IS NOT NULL)
-               ORDER BY m.created_at DESC,m.id DESC LIMIT 1`,
-            [ownerId, turn.threadId],
-          )
-        ).rows[0]?.id;
-        if (latest !== options.expectedChatRevision)
-          throw Object.assign(
-            conflict(
-              'The chat changed while this action was being checked. This action did not run. Please ask again.',
-            ),
-            { notRun: true },
-          );
-      }
+      if (
+        options.expectedChatRevision !== undefined &&
+        (await ownerChatRevision(client, ownerId, turn.threadId)) !== options.expectedChatRevision
+      )
+        throw Object.assign(
+          conflict(
+            'The chat changed while this action was being checked. This action did not run. Please ask again.',
+          ),
+          { notRun: true },
+        );
+      if (instructionChange) await validateInstructionChange(client, ownerId, instructionChange);
       const inspected = await inspect(client);
       if ('cached' in inspected) return inspected;
       await options.validate?.(client);
@@ -478,7 +518,7 @@ export async function createApprovals(
       );
       const approval = (
         await client.query(
-          "INSERT INTO approvals(id,owner_id,thread_id,turn_id,action,args,status,source_message_id,confirmation_message_id,expected_revision,details) VALUES($1,$2,$3,$4,$5,$6,'pending',$7,$8,$9,$10::jsonb) RETURNING *",
+          "INSERT INTO approvals(id,owner_id,thread_id,turn_id,action,args,status,source_message_id,confirmation_message_id,expected_revision,details,title,instruction_change) VALUES($1,$2,$3,$4,$5,$6,'pending',$7,$8,$9,$10::jsonb,$11,$12::jsonb) RETURNING *",
           [
             randomUUID(),
             ownerId,
@@ -490,6 +530,8 @@ export async function createApprovals(
             messageId,
             expectedRevision ?? null,
             details ?? null,
+            title ?? null,
+            instructionChange ? JSON.stringify(instructionChange) : null,
           ],
         )
       ).rows[0];
@@ -522,6 +564,8 @@ export async function createApprovals(
       signal: options.signal,
       ...(options.details ? { details: options.details } : {}),
       ...(expectedRevision === undefined ? {} : { expectedRevision }),
+      ...(allowed && options.basis ? { basis: options.basis } : {}),
+      ...(instructionChange ? { instructionChange: instructionChange } : {}),
     });
   }
 
@@ -599,10 +643,36 @@ export async function createApprovals(
             background: true,
           },
         };
-      await client.query(
-        "UPDATE turns SET status='cancelled',finished_at=now() WHERE id=$1 AND owner_id=$2 AND status='waiting'",
+      const cancelled = await client.query(
+        "UPDATE turns SET status='cancelled',finished_at=now() WHERE id=$1 AND owner_id=$2 AND status='waiting' RETURNING id",
         [approval.turn_id, ownerId],
       );
+      if (cancelled.rowCount && approval.turn_background && approval.turn_task_id) {
+        const task = (
+          await client.query<{ id: string }>(
+            "SELECT id FROM tasks WHERE id=$1 AND owner_id=$2 AND turn_id=$3 AND state='open' FOR UPDATE",
+            [approval.turn_task_id, ownerId, approval.turn_id],
+          )
+        ).rows[0];
+        if (task) {
+          const messageId = randomUUID();
+          await client.query(
+            `INSERT INTO messages(id,owner_id,thread_id,turn_id,role,text,created_at)
+             VALUES($1,$2,$3,$4,'assistant',$5,clock_timestamp())`,
+            [
+              messageId,
+              ownerId,
+              input.threadId,
+              approval.turn_id,
+              'The proposed action did not run. This task is still open, but its current work stopped. Reply here to continue the remaining work.',
+            ],
+          );
+          await client.query(
+            'UPDATE tasks SET continuation_message_id=$3,updated_at=now() WHERE id=$1 AND owner_id=$2',
+            [task.id, ownerId, messageId],
+          );
+        }
+      }
       return undefined;
     }
     if (!active) return undefined;
@@ -664,12 +734,16 @@ export async function createApprovals(
         )
       ).rows[0];
       if (!selected) return undefined;
-      const refused = await preflight?.(
-        selected.action,
-        selected.args,
-        selected.expected_revision ?? undefined,
-        client,
-      ).then(
+      const refused = await (async () => {
+        if (selected.instruction_change)
+          await validateInstructionChange(client, ownerId, selected.instruction_change);
+        return preflight?.(
+          selected.action,
+          selected.args,
+          selected.expected_revision ?? undefined,
+          client,
+        );
+      })().then(
         () => undefined,
         (error: unknown) => ({ error }),
       );
@@ -693,6 +767,42 @@ export async function createApprovals(
           sourceMessageId: approval.source_message_id,
           signal,
           ...(approval.details ? { details: approval.details } : {}),
+          ...(approval.instruction_change
+            ? {
+                instructionChange: {
+                  ...approval.instruction_change,
+                  replaceInstruction:
+                    approval.action === 'NOD_schedule_create' ||
+                    (approval.action === 'NOD_schedule_update' &&
+                      typeof approval.instruction_change.changes.prompt === 'string'),
+                  evidence:
+                    approval.action === 'NOD_schedule_create' ||
+                    (approval.action === 'NOD_schedule_update' &&
+                      typeof approval.instruction_change.changes.prompt === 'string')
+                      ? {
+                          messages: [],
+                          approvals: [
+                            {
+                              id: approval.id,
+                              at: new Date().toISOString(),
+                              definition: approval.instruction_change.after,
+                            },
+                          ],
+                        }
+                      : {
+                          messages: [
+                            {
+                              id: null,
+                              approvalId: approval.id,
+                              at: new Date().toISOString(),
+                              text: '',
+                              fields: approval.instruction_change.changes,
+                            },
+                          ],
+                        },
+                },
+              }
+            : {}),
           ...(approval.expected_revision === null
             ? {}
             : { expectedRevision: approval.expected_revision }),

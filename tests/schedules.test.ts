@@ -8,6 +8,11 @@ import { z } from 'zod';
 import type { InboundMessage, MessagingTransport } from '../src/ports/messaging.ts';
 import type { Schedule, ScheduleHistory, TaskDetail } from '../src/shared/contracts.ts';
 import {
+  captureOwnerInstructions,
+  mergeOwnerInstructions,
+  validateOwnerInstructions,
+} from '../src/server/owner-instructions.ts';
+import {
   readSchedule,
   scheduleExpression,
   scheduleLocalTime,
@@ -33,6 +38,7 @@ test(
     const { createTasks } = await import('../src/server/tasks.ts');
     const thread = await import('../src/server/thread.ts');
     const { createChannels } = await import('../src/server/channels.ts');
+    const { turnOrigin } = await import('../src/server/approvals.ts');
     const ownerId = 'local-development';
     let clock = new Date('2035-10-26T12:00:00.000Z');
     type Data = { scheduleId: string; revision: number; scheduledFor: string };
@@ -41,14 +47,19 @@ test(
     };
     let failAfterTask = false;
     const watched = new Map<string, string>();
+    let watchPolls = 0;
+    let modelPaused = false;
     const personal = createPersonalService({
       pool: db.pool,
       ownerId: 'local-development',
       scheduler: thread.boss,
       now: () => clock,
       watchable: async (ids) => ids.every((id) => watched.has(id)),
-      watchState: async (ids) =>
-        ids.every((id) => watched.has(id)) ? ids.map((id) => watched.get(id)).join() : null,
+      watchState: async (ids) => {
+        watchPolls++;
+        return ids.every((id) => watched.has(id)) ? ids.map((id) => watched.get(id)).join() : null;
+      },
+      modelPaused: () => modelPaused,
       enqueueTurn: async (...args) => {
         assert.ok(args[1]?.client);
         const id = await thread.enqueueTurn(...args);
@@ -56,6 +67,7 @@ test(
         return id;
       },
       refresh() {},
+      validateModel: (choice) => choice,
     });
     const app = Fastify();
     app.setErrorHandler((error, _request, reply) => {
@@ -98,6 +110,11 @@ test(
     };
     const saved = async (id: string) =>
       (await personal.listSchedules()).find((schedule) => schedule.id === id)!;
+    const runNow = (schedule: Schedule, requestId = randomUUID()) =>
+      request('POST', `/api/schedules/${schedule.id}/run`, {
+        requestId,
+        expectedRevision: schedule.revision,
+      });
     const inbox: InboundMessage[] = [];
     const sent: Array<Parameters<MessagingTransport['post']>[0]> = [];
     const transport: MessagingTransport = {
@@ -169,11 +186,45 @@ test(
         sourceId,
       };
     };
+    const manageRouted = async (
+      action: string,
+      args: Record<string, unknown>,
+      provenance?: { turnId: string; sourceMessageId: string | null },
+    ) => {
+      if (!provenance) return personal.manage(action, args);
+      const turn = (
+        await db.pool.query(
+          "SELECT thread_id,to_jsonb(turns)->>'task_id' AS task_id FROM turns WHERE id=$1",
+          [provenance.turnId],
+        )
+      ).rows[0];
+      const captured =
+        turn && provenance.sourceMessageId
+          ? await captureOwnerInstructions(
+              db.pool,
+              ownerId,
+              turn.thread_id,
+              [provenance.sourceMessageId],
+              turn.task_id,
+              new Date(Date.now() - 86_400_000),
+              provenance.turnId,
+            )
+          : undefined;
+      const prepared = await personal.prepareScheduleChange(action, args);
+      return personal.manage(action, args, {
+        ...provenance,
+        instructionChange: {
+          ...prepared,
+          evidence: captured?.evidence ?? { messages: [] },
+          previousEvidence: 'evidence' in prepared ? prepared.evidence : undefined,
+        },
+      });
+    };
     const createRouted = (
       provenance?: { turnId: string; sourceMessageId: string | null },
       timing: Record<string, unknown> = {},
     ) =>
-      personal.manage(
+      manageRouted(
         'schedule_create',
         {
           title: 'Synthetic reminder',
@@ -194,6 +245,174 @@ test(
       });
       await personal.initialize();
       await tasks.initialize();
+      await db.pool.query(`ALTER TABLE schedule_runs ADD CONSTRAINT
+        schedule_runs_schedule_id_schedule_revision_scheduled_for_key
+        UNIQUE(schedule_id,schedule_revision,scheduled_for)`);
+      await personal.initialize({ workers: false });
+
+      await t.test(
+        'manual runs retain timing and start once across concurrent requests and retries',
+        async () => {
+          const schedule = await create({ cron: '0 9 * * *' });
+          const job = await jobFor(schedule.id);
+          const requestId = randomUUID();
+          const responses = await Promise.all([
+            runNow(schedule, requestId),
+            runNow(schedule, requestId),
+          ]);
+          for (const response of responses) assert.equal(response.statusCode, 200, response.body);
+          assert.deepEqual(responses[0]!.json(), responses[1]!.json());
+          const [run] = await runs(schedule.id);
+          assert.equal((await runs(schedule.id)).length, 1);
+          assert.equal(run!.scheduledFor, clock.toISOString());
+          assert.deepEqual(await saved(schedule.id), {
+            ...schedule,
+            lastRun: run,
+            activeRun: { turnId: run!.turnId, status: 'queued' },
+          });
+          assert.equal((await jobFor(schedule.id)).id, job.id);
+          assert.equal((await runNow(schedule)).statusCode, 409);
+          const before = clock;
+          clock = new Date(job.data.scheduledFor);
+          await deliver([job]);
+          assert.equal((await runs(schedule.id)).length, 1);
+          assert.notEqual((await jobFor(schedule.id)).id, job.id);
+          clock = before;
+          const turn = (
+            await db.pool.query('SELECT source,background,prompt FROM turns WHERE id=$1', [
+              run!.turnId,
+            ])
+          ).rows[0];
+          assert.equal(turn.source, 'schedule');
+          assert.equal(turn.background, true);
+          assert.match(turn.prompt, /Return a synthetic result only/);
+          await db.pool.query("UPDATE turns SET status='succeeded' WHERE id=$1", [run!.turnId]);
+          const repeated = await runNow(schedule, requestId);
+          assert.deepEqual(repeated.json(), { turnId: run!.turnId, activeRun: null });
+          assert.equal((await runs(schedule.id)).length, 1);
+          assert.equal((await saved(schedule.id)).activeRun, null);
+
+          failAfterTask = true;
+          const failed = await runNow(schedule);
+          failAfterTask = false;
+          assert.equal(failed.statusCode, 500);
+          assert.equal((await runs(schedule.id)).length, 1);
+          assert.equal(
+            (
+              await db.pool.query(
+                'SELECT count(*)::int AS count FROM turns WHERE source_id LIKE $1',
+                [`schedule:${schedule.id}:%`],
+              )
+            ).rows[0].count,
+            1,
+          );
+
+          const stale = schedule;
+          const paused = (
+            await request('PATCH', `/api/schedules/${schedule.id}`, { enabled: false })
+          ).json<Schedule>();
+          assert.equal((await runNow(stale)).statusCode, 409);
+          assert.equal((await runNow(paused)).statusCode, 200);
+          assert.equal((await saved(schedule.id)).enabled, false);
+          assert.equal((await saved(schedule.id)).nextRun, null);
+          assert.equal((await runs(schedule.id)).length, 2);
+          await request('DELETE', `/api/schedules/${schedule.id}`);
+          assert.equal((await runNow(paused)).statusCode, 404);
+          assert.equal((await runNow({ ...paused, id: randomUUID() })).statusCode, 404);
+          const foreign = await create({ cron: '0 10 * * *' });
+          await db.pool.query('UPDATE schedules SET owner_id=$2 WHERE id=$1', [
+            foreign.id,
+            'foreign-run',
+          ]);
+          assert.equal((await runNow(foreign)).statusCode, 404);
+          assert.equal((await runNow({ ...paused, id: 'invalid' })).statusCode, 400);
+          assert.equal(
+            (
+              await request('POST', `/api/schedules/${foreign.id}/run`, {
+                requestId: 'invalid',
+                expectedRevision: 0,
+              })
+            ).statusCode,
+            400,
+          );
+        },
+      );
+
+      await t.test('manual and timed one-time runs stay separate at the same time', async () => {
+        const before = clock;
+        const schedule = await create({
+          kind: 'once',
+          runAt: new Date(clock.getTime() + 60_000).toISOString(),
+        });
+        const job = await jobFor(schedule.id);
+        clock = new Date(schedule.runAt!);
+        const manual = await runNow(schedule);
+        assert.equal(manual.statusCode, 200, manual.body);
+        await db.pool.query("UPDATE turns SET status='succeeded' WHERE id=$1", [
+          manual.json().turnId,
+        ]);
+        assert.equal((await saved(schedule.id)).enabled, true);
+        assert.equal((await jobFor(schedule.id)).id, job.id);
+        await deliver([job]);
+        assert.equal((await runs(schedule.id)).length, 2);
+        const completed = await saved(schedule.id);
+        assert.equal(completed.enabled, false);
+        assert.equal((await runNow(completed)).statusCode, 409);
+        await db.pool.query("UPDATE turns SET status='succeeded' WHERE id=$1", [
+          completed.activeRun!.turnId,
+        ]);
+        assert.equal((await runNow(completed)).statusCode, 200);
+        assert.equal((await saved(schedule.id)).enabled, false);
+        await request('DELETE', `/api/schedules/${schedule.id}`);
+        clock = before;
+      });
+
+      await t.test(
+        'a due one-time schedule waits for a manual run and keeps its due time',
+        async () => {
+          const before = clock;
+          const schedule = await create({
+            kind: 'once',
+            runAt: new Date(clock.getTime() + 60_000).toISOString(),
+          });
+          const manual = await runNow(schedule);
+          assert.equal(manual.statusCode, 200, manual.body);
+          const manualTurn = manual.json().turnId;
+          const originalJob = await jobFor(schedule.id);
+          clock = new Date(Date.parse(schedule.runAt!) + 11 * 60_000);
+          await deliver([originalJob]);
+          assert.equal((await saved(schedule.id)).enabled, true);
+          assert.equal((await saved(schedule.id)).runAt, schedule.runAt);
+          assert.equal((await runs(schedule.id)).length, 1);
+          let deferred = await jobFor(schedule.id);
+          assert.notEqual(deferred.id, originalJob.id);
+          assert.equal(Date.parse(deferred.data.scheduledFor), clock.getTime() + 60_000);
+          await db.pool.query("UPDATE turns SET status='waiting',started_at=now() WHERE id=$1", [
+            manualTurn,
+          ]);
+          clock = new Date(deferred.data.scheduledFor);
+          await deliver([deferred]);
+          assert.equal((await saved(schedule.id)).enabled, true);
+          assert.equal((await runs(schedule.id)).length, 1);
+          await db.pool.query("UPDATE turns SET status='succeeded' WHERE id=$1", [manualTurn]);
+          deferred = await jobFor(schedule.id);
+          clock = new Date(deferred.data.scheduledFor);
+          await deliver([deferred]);
+          const [timed] = (await runs(schedule.id)).filter((run) => run.turnId !== manualTurn);
+          assert.equal(timed!.scheduledFor, schedule.runAt);
+          assert.equal((await saved(schedule.id)).enabled, false);
+          assert.equal((await saved(schedule.id)).nextRun, null);
+          assert.match(
+            (await db.pool.query('SELECT prompt FROM turns WHERE id=$1', [timed!.turnId])).rows[0]
+              .prompt,
+            /This run was due/,
+          );
+          await deliver([originalJob, deferred]);
+          assert.equal((await runs(schedule.id)).length, 2);
+          await request('DELETE', `/api/schedules/${schedule.id}`);
+          clock = before;
+        },
+      );
 
       await t.test('completed tasks produce isolated, reviewable schedule drafts', async (t) => {
         const seed = async (
@@ -664,6 +883,139 @@ test(
         },
       );
       await t.test(
+        'a schedule model changes only the model of its next runs and reprices its month',
+        async (t) => {
+          const { createLedger } = await import('../src/server/ledger.ts');
+          const ledger = createLedger({ pool: db.pool, ownerId });
+          await ledger.initialize();
+          const connectionId = randomUUID();
+          const main = { connectionId, modelId: 'gpt-6.1-sol', effort: 'high' };
+          const light = { connectionId, modelId: 'gpt-6-luna', effort: 'low' };
+          const prices: Record<string, { input: number; output: number } | null> = {
+            'gpt-6.1-sol': { input: 2, output: 10 },
+            'gpt-6-luna': { input: 0.1, output: 0.5 },
+            'fixture-local': null,
+          };
+          const modelled = createPersonalService({
+            pool: db.pool,
+            ownerId,
+            scheduler: thread.boss,
+            now: () => clock,
+            enqueueTurn: thread.enqueueTurn,
+            refresh() {},
+            sessionCosts: ledger.sessionCosts,
+            sessionUsage: ledger.sessionUsage,
+            validateModel: (choice) => {
+              if (!(choice.modelId in prices))
+                throw Object.assign(new Error('Choose an available text model and effort.'), {
+                  statusCode: 400,
+                });
+              return choice;
+            },
+            workPricing: (own) => {
+              const modelId = own?.modelId ?? main.modelId;
+              return { modelId, pricing: prices[modelId] ?? undefined };
+            },
+          });
+          const modelledApp = Fastify();
+          modelledApp.setErrorHandler((error, _request, reply) => {
+            const value = error as Error & { statusCode?: number };
+            reply
+              .code(error instanceof z.ZodError ? 400 : (value.statusCode ?? 500))
+              .send({ error: value.message });
+          });
+          modelled.registerRoutes(modelledApp);
+          t.after(() => modelledApp.close());
+          const send = (method: 'POST' | 'PUT', url: string, payload: unknown) =>
+            modelledApp.inject({ method, url, payload: payload as object });
+          const setModel = (id: string, model: unknown) =>
+            send('PUT', `/api/schedules/${id}/model`, { model });
+          clock = new Date('2035-10-26T12:00:00.000Z');
+          const fixture = {
+            title: 'Fixture modelled schedule',
+            prompt: 'Return a synthetic modelled result only.',
+            timeZone: 'Europe/Lisbon',
+            kind: 'recurring',
+            cron: '15 8 * * *',
+          };
+          assert.equal(
+            (
+              await send('POST', '/api/schedules', {
+                ...fixture,
+                model: { ...light, modelId: 'fixture-unavailable' },
+              })
+            ).statusCode,
+            400,
+          );
+          const created = await send('POST', '/api/schedules', { ...fixture, model: light });
+          assert.equal(created.statusCode, 200, created.body);
+          const schedule = created.json<Schedule>();
+          assert.deepEqual(schedule.model, light);
+          const before = (
+            await db.pool.query('SELECT revision,job_id,next_run_at FROM schedules WHERE id=$1', [
+              schedule.id,
+            ])
+          ).rows[0];
+          const changed = await setModel(schedule.id, main);
+          assert.equal(changed.statusCode, 200, changed.body);
+          assert.deepEqual(changed.json<Schedule>().model, main);
+          assert.deepEqual(
+            (
+              await db.pool.query('SELECT revision,job_id,next_run_at FROM schedules WHERE id=$1', [
+                schedule.id,
+              ])
+            ).rows[0],
+            before,
+          );
+          assert.equal(
+            (await setModel(schedule.id, { ...main, modelId: 'gpt-x' })).statusCode,
+            400,
+          );
+          assert.equal((await setModel(randomUUID(), main)).statusCode, 404);
+          assert.deepEqual((await modelled.getSchedule(schedule.id)).model, main);
+
+          clock = new Date(schedule.nextRun!);
+          await deliver([await jobFor(schedule.id)]);
+          const [run] = await runs(schedule.id);
+          assert.ok(run);
+          assert.deepEqual(await thread.workOrigin(run.turnId), {
+            kind: 'schedule',
+            task: null,
+            schedule: main,
+          });
+          await thread.resumeTurn(run.turnId, `fixture-resume:${run.turnId}`, 'Continue.');
+          const resumed = (
+            await db.pool.query<{ id: string }>(
+              'SELECT id FROM turns WHERE parent_turn_id=$1 AND owner_id=$2',
+              [run.turnId, ownerId],
+            )
+          ).rows[0]!;
+          assert.equal((await thread.workOrigin(resumed.id))?.kind, 'schedule');
+
+          await db.pool.query(
+            `INSERT INTO model_usage(id,owner_id,turn_id,cost_usd,details) VALUES
+               ($1,$3,$4,3,'{"category":"agent","model":"gpt-6.1-sol","inputTokens":1000000,"outputTokens":100000}'),
+               ($2,$3,$4,0.01,'{"category":"review","model":"gpt-6.1-sol","inputTokens":5000}')`,
+            [randomUUID(), randomUUID(), ownerId, run.turnId],
+          );
+          await db.pool.query(
+            "UPDATE turns SET status='succeeded' WHERE id=$1 OR parent_turn_id=$1",
+            [run.turnId],
+          );
+          const monthly = async () => (await modelled.getSchedule(schedule.id)).monthlyUsd!;
+          const onMain = await monthly();
+          assert.ok(onMain > 0);
+          await setModel(schedule.id, light);
+          const onLight = await monthly();
+          assert.ok(Math.abs(onLight / onMain - (0.1 + 0.05 + 0.01) / 3.01) < 1e-9);
+          await setModel(schedule.id, { ...light, modelId: 'fixture-local' });
+          assert.equal((await modelled.getSchedule(schedule.id)).monthlyUsd ?? null, null);
+          await setModel(schedule.id, null);
+          assert.equal((await modelled.getSchedule(schedule.id)).model, null);
+          assert.equal(await monthly(), onMain);
+        },
+      );
+      await t.test(
         'a recurring schedule starts no run while its last run is busy or waiting on the owner',
         async () => {
           const before = clock;
@@ -676,26 +1028,83 @@ test(
           };
           const [first] = await fire();
           assert.deepEqual(await fire(), [first]);
+          assert.equal((await runNow(schedule)).statusCode, 409);
           for (const status of ['running', 'waiting']) {
             await db.pool.query('UPDATE turns SET status=$2,started_at=now() WHERE id=$1', [
               first,
               status,
             ]);
             assert.deepEqual(await fire(), [first]);
+            assert.equal((await runNow(schedule)).statusCode, 409);
+            assert.equal((await saved(schedule.id)).activeRun?.status, status);
           }
+          const resumed = randomUUID();
           await db.pool.query(
             `INSERT INTO turns(id,owner_id,thread_id,source,prompt,session_id,parent_turn_id,background,status,started_at)
-             SELECT $1,owner_id,thread_id,'resume','Synthetic answer.',id,id,true,'succeeded',now() FROM turns WHERE id=$2`,
-            [randomUUID(), first],
+             SELECT $1,owner_id,thread_id,'resume','Synthetic answer.',id,id,true,'queued',now() FROM turns WHERE id=$2`,
+            [resumed, first],
           );
+          for (const status of ['queued', 'running', 'waiting'] as const) {
+            await db.pool.query('UPDATE turns SET status=$2 WHERE id=$1', [resumed, status]);
+            assert.deepEqual((await saved(schedule.id)).activeRun, { turnId: resumed, status });
+            assert.equal((await runNow(schedule)).statusCode, 409);
+          }
+          await db.pool.query("UPDATE turns SET status='succeeded' WHERE id=$1", [resumed]);
+          assert.equal((await saved(schedule.id)).activeRun, null);
           assert.equal((await fire()).length, 2);
           await db.pool.query("UPDATE turns SET status='succeeded' WHERE id=ANY($1::uuid[])", [
             (await runs(schedule.id)).map((run) => run.turnId),
           ]);
+          const due = await jobFor(schedule.id);
+          clock = new Date(due.data.scheduledFor);
+          const beforeRace = (await runs(schedule.id)).length;
+          const [, manual] = await Promise.all([deliver([due]), runNow(schedule)]);
+          assert.ok([200, 409].includes(manual.statusCode), manual.body);
+          assert.equal((await runs(schedule.id)).length, beforeRace + 1);
+          assert.notEqual((await jobFor(schedule.id)).id, due.id);
           await request('DELETE', `/api/schedules/${schedule.id}`);
           clock = before;
         },
       );
+      await t.test('stale watched jobs do not poll accounts or start runs', async () => {
+        const before = clock;
+        const account = randomUUID();
+        watched.set(account, 'v1');
+        const disabled = await create({ cron: '*/15 * * * *', watch: [account] });
+        const disabledJob = await jobFor(disabled.id);
+        const pause = await request('PATCH', `/api/schedules/${disabled.id}`, {
+          enabled: false,
+        });
+        assert.equal(pause.statusCode, 200, pause.body);
+        const beforeDisabled = watchPolls;
+        clock = new Date(disabledJob.data.scheduledFor);
+        await deliver([disabledJob]);
+        assert.equal(watchPolls, beforeDisabled);
+        assert.equal((await runs(disabled.id)).length, 0);
+
+        const revised = await create({ cron: '*/15 * * * *', watch: [account] });
+        const oldJob = await jobFor(revised.id);
+        const update = await request('PATCH', `/api/schedules/${revised.id}`, {
+          title: 'Updated fixture watch',
+        });
+        assert.equal(update.statusCode, 200, update.body);
+        const currentJob = await jobFor(revised.id);
+        assert.notEqual(currentJob.id, oldJob.id);
+        assert.notEqual(currentJob.data.revision, oldJob.data.revision);
+        const beforeRevised = watchPolls;
+        clock = new Date(oldJob.data.scheduledFor);
+        await deliver([oldJob]);
+        assert.equal(watchPolls, beforeRevised);
+        assert.equal((await runs(revised.id)).length, 0);
+
+        clock = new Date(currentJob.data.scheduledFor);
+        await deliver([currentJob]);
+        assert.equal(watchPolls, beforeRevised + 1);
+        assert.equal((await runs(revised.id)).length, 1);
+        await request('DELETE', `/api/schedules/${disabled.id}`);
+        await request('DELETE', `/api/schedules/${revised.id}`);
+        clock = before;
+      });
       await t.test(
         'a watch schedule skips a fire only while its accounts are unchanged since a finished run',
         async () => {
@@ -725,16 +1134,57 @@ test(
           const [first] = await fire();
           await finish();
           assert.deepEqual(await fire(), [first]);
+          const manual = await runNow(schedule);
+          assert.equal(manual.statusCode, 200, manual.body);
+          assert.equal((await runs(schedule.id)).length, 2);
           await finish('failed');
-          assert.equal((await fire()).length, 2);
-          await finish();
-          assert.equal((await fire()).length, 2);
-          watched.set(account, 'v2');
           assert.equal((await fire()).length, 3);
           await finish();
-          await personal.manage('schedule_update', { id: schedule.id, watch: null });
+          assert.equal((await fire()).length, 3);
+          watched.set(account, 'v2');
           assert.equal((await fire()).length, 4);
           await finish();
+          await personal.manage('schedule_update', { id: schedule.id, watch: null });
+          assert.equal((await fire()).length, 5);
+          await finish();
+          await request('DELETE', `/api/schedules/${schedule.id}`);
+          clock = before;
+        },
+      );
+      await t.test(
+        'a recurring schedule skips planned fires while its model is paused, while Run now and one-time runs still start',
+        async () => {
+          const before = clock;
+          const schedule = await create({ cron: '*/15 * * * *' });
+          const fire = async () => {
+            const job = await jobFor(schedule.id);
+            clock = new Date(job.data.scheduledFor);
+            await deliver([job]);
+            return (await runs(schedule.id)).length;
+          };
+          modelPaused = true;
+          try {
+            assert.equal(await fire(), 0);
+            assert.equal(await fire(), 0);
+            const manual = await runNow(await saved(schedule.id));
+            assert.equal(manual.statusCode, 200, manual.body);
+            assert.equal((await runs(schedule.id)).length, 1);
+            await db.pool.query("UPDATE turns SET status='succeeded' WHERE id=$1", [
+              manual.json().turnId,
+            ]);
+            const once = await create({
+              kind: 'once',
+              runAt: new Date(clock.getTime() + 60_000).toISOString(),
+            });
+            const job = await jobFor(once.id);
+            clock = new Date(job.data.scheduledFor);
+            await deliver([job]);
+            assert.equal((await runs(once.id)).length, 1);
+            await request('DELETE', `/api/schedules/${once.id}`);
+          } finally {
+            modelPaused = false;
+          }
+          assert.equal(await fire(), 2);
           await request('DELETE', `/api/schedules/${schedule.id}`);
           clock = before;
         },
@@ -802,7 +1252,40 @@ test(
           await deliver([job]);
           assert.deepEqual(await runs(schedule.id), []);
           await deliver([replacement]);
-          assert.equal((await runs(schedule.id)).length, 1);
+          const lateRuns = await runs(schedule.id);
+          assert.equal(lateRuns.length, 1);
+          assert.match(
+            (await db.pool.query('SELECT prompt FROM turns WHERE id=$1', [lateRuns[0]!.turnId]))
+              .rows[0].prompt,
+            /\nThis run was due at Tue,? 6 Nov 2035, 10:00 WET and started at Wed,? 7 Nov 2035, 10:00 WET\.$/,
+          );
+        },
+      );
+      await t.test(
+        'a late recurring run says when it was due, when it started and what was skipped',
+        async () => {
+          const before = clock;
+          clock = new Date('2035-11-07T10:00:00.000Z');
+          const promptOf = async (id: string) => {
+            const [run] = await runs(id);
+            return (await db.pool.query('SELECT prompt FROM turns WHERE id=$1', [run!.turnId]))
+              .rows[0].prompt as string;
+          };
+          const onTime = await create({ cron: '0 8 * * *' });
+          clock = new Date(onTime.nextRun!);
+          await deliver([await jobFor(onTime.id)]);
+          const base = await promptOf(onTime.id);
+          assert.doesNotMatch(base, /This run was due/);
+          const late = await create({ cron: '0 8 * * *' });
+          clock = new Date(new Date(late.nextRun!).getTime() + 2 * 86_400_000 + 36_720_000);
+          await deliver([await jobFor(late.id)]);
+          const prompt = await promptOf(late.id);
+          assert.match(
+            prompt,
+            /This run was due at Fri,? 9 Nov 2035, 08:00 WET and started at Sun,? 11 Nov 2035, 18:12 WET\. 2 later runs were skipped\.$/,
+          );
+          assert.equal(prompt.replace(/\nThis run was due.*$/, ''), base);
+          clock = before;
         },
       );
       channels = await connect();
@@ -818,16 +1301,42 @@ test(
           const schedule = await createRouted(provenance);
           const stored = (
             await db.pool.query(
-              'SELECT delivery_channel,channel_source_id,authority_instruction,authority_source_message_id FROM schedules WHERE id=$1',
+              'SELECT delivery_channel,channel_source_id,authority FROM schedules WHERE id=$1',
               [schedule.id],
             )
           ).rows[0];
-          assert.deepEqual(stored, {
-            delivery_channel: origin.channel,
-            channel_source_id: origin.sourceId,
-            authority_instruction: 'Remind me in a minute.',
-            authority_source_message_id: origin.sourceMessageId,
-          });
+          assert.equal(stored.delivery_channel, origin.channel);
+          assert.equal(stored.channel_source_id, origin.sourceId);
+          assert.equal(
+            stored.authority.messages.find(
+              (message: { id: string }) => message.id === origin.sourceMessageId,
+            )?.text,
+            'Remind me in a minute.',
+          );
+          const manual = await runNow(schedule);
+          assert.equal(manual.statusCode, 200, manual.body);
+          const manualTurn = manual.json().turnId;
+          assert.deepEqual(
+            (
+              await db.pool.query('SELECT channel,channel_source_id FROM turns WHERE id=$1', [
+                manualTurn,
+              ])
+            ).rows[0],
+            {
+              channel: origin.channel,
+              channel_source_id: origin.sourceId,
+            },
+          );
+          assert.deepEqual(
+            (
+              await db.pool.query('SELECT authority FROM schedule_runs WHERE turn_id=$1', [
+                manualTurn,
+              ])
+            ).rows[0],
+            {
+              authority: stored.authority,
+            },
+          );
           const sameThread = await receive('Remind me in a minute again.');
           const otherThread = await receive('Remind me in a minute.', 'other-thread');
           for (const [route, timing, reused] of [
@@ -848,6 +1357,16 @@ test(
             assert.equal(created.id === schedule.id, reused);
             assert.equal(created.existing === true, reused);
           }
+          const pinned = { connectionId: randomUUID(), modelId: 'fixture-model', effort: 'high' };
+          await db.pool.query('UPDATE schedules SET model=$2 WHERE id=$1', [
+            schedule.id,
+            JSON.stringify(pinned),
+          ]);
+          assert.equal((await createRouted(provenance)).id, schedule.id);
+          const repinned = { ...pinned, modelId: 'fixture-other-model' };
+          const again = await createRouted(provenance, { model: repinned });
+          assert.equal(again.id, schedule.id);
+          assert.deepEqual(again.model, repinned);
           for (const sourceOwner of [ownerId, 'foreign-source']) {
             const sourceThread = randomUUID();
             const sourceTurn = randomUUID();
@@ -902,6 +1421,303 @@ test(
           );
         },
       );
+      await t.test(
+        'schedule changes retain exact owner evidence and bind each run to its revision',
+        async () => {
+          const withdrawn = await receive('Withdrawn synthetic request.');
+          await db.pool.query('UPDATE turns SET withdrawn=true WHERE id=$1', [withdrawn.turnId]);
+          const context = await receive('Look at the synthetic budget folder.');
+          const asked = await receive('Check it every morning.');
+          const schedule = await createRouted(asked, {
+            title: 'Synthetic budget check',
+            prompt: 'Check the synthetic budget folder.',
+          });
+          const evidence = async () =>
+            (await db.pool.query('SELECT authority FROM schedules WHERE id=$1', [schedule.id]))
+              .rows[0].authority;
+          const first = await evidence();
+          assert.equal(
+            first.messages.find((message: { id: string }) => message.id === asked.sourceMessageId)
+              ?.text,
+            'Check it every morning.',
+          );
+          assert.equal(
+            first.messages.find((message: { id: string }) => message.id === context.sourceMessageId)
+              ?.canAuthorize,
+            false,
+          );
+          assert.ok(
+            !first.messages.some(
+              (message: { id: string }) => message.id === withdrawn.sourceMessageId,
+            ),
+          );
+          const change = await receive('Make it cheaper.');
+          for (const prompt of ['Check the folder cheaply.', 'Check the folder more cheaply.'])
+            await manageRouted('schedule_update', { id: schedule.id, prompt }, change);
+          const changed = await evidence();
+          assert.equal(
+            changed.messages.filter(
+              (message: { id: string }) => message.id === change.sourceMessageId,
+            ).length,
+            1,
+          );
+          assert.ok(
+            changed.messages.some(
+              (message: { id: string }) => message.id === asked.sourceMessageId,
+            ),
+          );
+          const manual = await runNow(await saved(schedule.id));
+          assert.equal(manual.statusCode, 200, manual.body);
+          assert.deepEqual((await turnOrigin(manual.json().turnId))?.scheduleInstruction, changed);
+          for (let index = 0; index < 11; index++) {
+            const update = await receive(`Use synthetic format ${index}.`);
+            await manageRouted(
+              'schedule_update',
+              { id: schedule.id, prompt: `Read the folder with format ${index}.` },
+              update,
+            );
+          }
+          assert.ok(
+            (await evidence()).messages.some(
+              (message: { id: string }) => message.id === asked.sourceMessageId,
+            ),
+          );
+          assert.deepEqual((await turnOrigin(manual.json().turnId))?.scheduleInstruction, changed);
+          await db.pool.query("UPDATE turns SET status='succeeded',finished_at=now() WHERE id=$1", [
+            manual.json().turnId,
+          ]);
+          const beforeRestart = await evidence();
+          await personal.initialize({ workers: false });
+          assert.deepEqual(await evidence(), beforeRestart);
+          const timing = await receive('Move it to the next day.');
+          await manageRouted(
+            'schedule_update',
+            { id: schedule.id, runAt: new Date(clock.getTime() + 86_400_000).toISOString() },
+            timing,
+          );
+          assert.ok(
+            (await evidence()).messages.some(
+              (message: { id: string }) => message.id === timing.sourceMessageId,
+            ),
+          );
+          await db.pool.query('UPDATE turns SET withdrawn=true WHERE id=$1', [timing.turnId]);
+          await assert.rejects(
+            validateOwnerInstructions(db.pool, ownerId, await evidence()),
+            /withdrawn or unavailable/,
+          );
+          const edited = await request('PATCH', `/api/schedules/${schedule.id}`, {
+            prompt: 'Owner-written synthetic prompt.',
+          });
+          assert.equal(edited.statusCode, 200, edited.body);
+          const reset = await evidence();
+          assert.equal(reset.messages.length, 1);
+          assert.equal(reset.messages[0].id, null);
+          assert.equal(reset.messages[0].text, 'Owner-written synthetic prompt.');
+        },
+      );
+      await t.test(
+        'a schedule created in a task retains the allowed earlier chat and exact proposal',
+        async () => {
+          const background = await receive('The synthetic task board is in Documents/board.');
+          const asked = await receive('Check it every morning.');
+          const current = (
+            await db.pool.query('SELECT thread_id FROM turns WHERE id=$1', [asked.turnId])
+          ).rows[0];
+          await db.pool.query("UPDATE turns SET status='running',started_at=now() WHERE id=$1", [
+            asked.turnId,
+          ]);
+          const task = await tasks.execute(
+            { threadId: current.thread_id, turnId: asked.turnId },
+            {
+              action: 'start',
+              title: 'Synthetic board schedule',
+              message: 'Set the synthetic schedule.',
+              doneWhen: 'The schedule exists.',
+              now: 'Set the schedule.',
+            },
+            asked.sourceMessageId,
+          );
+          assert.ok(task && 'id' in task);
+          const started = new Date(Date.now() - 3 * 86_400_000);
+          await db.pool.query('UPDATE tasks SET created_at=$2 WHERE id=$1', [task.id, started]);
+          for (const [source, age] of [
+            [background, 60_000],
+            [asked, 1_000],
+          ] as const)
+            await db.pool.query('UPDATE messages SET created_at=$2 WHERE id=$1', [
+              source.sourceMessageId,
+              new Date(started.getTime() - age),
+            ]);
+          const unrelated = await receive('Send the separate synthetic invoice to Lena.');
+          const child = (await db.pool.query('SELECT id FROM turns WHERE task_id=$1', [task.id]))
+            .rows[0];
+          const schedule = await createRouted(
+            { turnId: child.id, sourceMessageId: asked.sourceMessageId },
+            { title: 'Synthetic task schedule', prompt: 'Read Documents/board.' },
+          );
+          const authority = (
+            await db.pool.query('SELECT authority FROM schedules WHERE id=$1', [schedule.id])
+          ).rows[0].authority;
+          assert.equal(
+            authority.messages.find(
+              (message: { id: string }) => message.id === background.sourceMessageId,
+            )?.canAuthorize,
+            false,
+          );
+          assert.equal(
+            authority.messages.find(
+              (message: { id: string }) => message.id === asked.sourceMessageId,
+            )?.canAuthorize,
+            true,
+          );
+          assert.ok(
+            !authority.messages.some(
+              (message: { id: string }) => message.id === unrelated.sourceMessageId,
+            ),
+          );
+          const proposalId = randomUUID();
+          const proposal = 'Read the synthetic board every Friday?';
+          await db.pool.query(
+            "INSERT INTO messages(id,owner_id,thread_id,turn_id,role,text) VALUES($1,$2,$3,$4,'assistant',$5)",
+            [proposalId, ownerId, current.thread_id, asked.turnId, proposal],
+          );
+          const reply = await receive('Do that every Friday.');
+          await db.pool.query('UPDATE messages SET reply_to_message_id=$2 WHERE id=$1', [
+            reply.sourceMessageId,
+            proposalId,
+          ]);
+          const accepted = await createRouted(reply, {
+            title: 'Synthetic proposal schedule',
+            prompt: 'Read the synthetic board on Friday.',
+          });
+          const record = (
+            await db.pool.query('SELECT authority FROM schedules WHERE id=$1', [accepted.id])
+          ).rows[0].authority;
+          assert.deepEqual(
+            record.messages.find((message: { id: string }) => message.id === reply.sourceMessageId)
+              ?.replyTo,
+            { id: proposalId, text: proposal },
+          );
+        },
+      );
+      await t.test(
+        'legacy schedule instructions migrate once without inventing earlier context',
+        async () => {
+          const source = await receive('Read the synthetic legacy board every Friday.');
+          const schedule = await create({
+            title: 'Synthetic legacy evidence',
+            prompt: 'Read the synthetic legacy board.',
+            kind: 'once',
+            runAt: new Date(clock.getTime() + 60_000).toISOString(),
+          });
+          const manual = await runNow(schedule);
+          assert.equal(manual.statusCode, 200, manual.body);
+          await db.pool.query(
+            'ALTER TABLE schedules ADD COLUMN authority_instruction text, ADD COLUMN authority_source_message_id uuid, ADD COLUMN authority_context jsonb; ALTER TABLE schedule_runs ADD COLUMN authority_instruction text, ADD COLUMN authority_source_message_id uuid, ADD COLUMN authority_context jsonb;',
+          );
+          for (const table of ['schedules', 'schedule_runs'])
+            await db.pool.query(
+              `UPDATE ${table} SET authority=NULL,authority_instruction=$2,authority_source_message_id=$3 WHERE ${table === 'schedules' ? 'id' : 'schedule_id'}=$1`,
+              [
+                schedule.id,
+                'Read the synthetic legacy board every Friday.',
+                source.sourceMessageId,
+              ],
+            );
+          const sourceTime = new Date(Date.now() - 3 * 86_400_000).toISOString();
+          await db.pool.query('UPDATE messages SET created_at=$2 WHERE id=$1', [
+            source.sourceMessageId,
+            sourceTime,
+          ]);
+          const incomplete = await create({
+            title: 'Synthetic legacy correction',
+            kind: 'once',
+            runAt: new Date(clock.getTime() + 60_000).toISOString(),
+          });
+          await db.pool.query(
+            'UPDATE schedules SET authority=NULL,authority_instruction=$2,authority_source_message_id=$3,authority_context=$4 WHERE id=$1',
+            [
+              incomplete.id,
+              'Send the synthetic report every Friday.',
+              source.sourceMessageId,
+              JSON.stringify({ changes: ['Only summarize in Nod. Never send email.'] }),
+            ],
+          );
+          await personal.initialize({ workers: false });
+          const migrated = (
+            await db.pool.query('SELECT authority FROM schedules WHERE id=$1', [schedule.id])
+          ).rows[0].authority;
+          assert.equal(migrated.messages.length, 1);
+          assert.equal(migrated.messages[0].id, source.sourceMessageId);
+          assert.equal(new Date(migrated.messages[0].at).toISOString(), sourceTime);
+          assert.equal(migrated.messages[0].text, 'Read the synthetic legacy board every Friday.');
+          const run = (await turnOrigin(manual.json().turnId))?.scheduleInstruction;
+          assert.equal(run?.messages[0]?.id, source.sourceMessageId);
+          assert.equal(run?.messages[0]?.text, migrated.messages[0].text);
+          assert.equal(new Date(run!.messages[0]!.at).toISOString(), sourceTime);
+          const incompleteEvidence = async () =>
+            (await db.pool.query('SELECT authority FROM schedules WHERE id=$1', [incomplete.id]))
+              .rows[0].authority;
+          await assert.rejects(
+            validateOwnerInstructions(db.pool, ownerId, await incompleteEvidence()),
+            /changes without source records/,
+          );
+          const metadata = await request('PATCH', `/api/schedules/${incomplete.id}`, {
+            title: 'Synthetic renamed legacy schedule',
+          });
+          assert.equal(metadata.statusCode, 200, metadata.body);
+          await assert.rejects(
+            validateOwnerInstructions(db.pool, ownerId, await incompleteEvidence()),
+            /changes without source records/,
+          );
+          const replacement = await request('PATCH', `/api/schedules/${incomplete.id}`, {
+            prompt: 'Read the synthetic report. Never send email.',
+          });
+          assert.equal(replacement.statusCode, 200, replacement.body);
+          assert.equal((await runNow(await saved(incomplete.id))).statusCode, 200);
+          await personal.initialize({ workers: false });
+          assert.deepEqual(
+            (await db.pool.query('SELECT authority FROM schedules WHERE id=$1', [schedule.id]))
+              .rows[0].authority,
+            migrated,
+          );
+        },
+      );
+      await t.test('scheduled cache retention follows the actual recurring cadence', async () => {
+        const before = clock;
+        try {
+          clock = new Date('2035-10-26T12:00:00.000Z');
+          for (const [cron, delay, expected] of [
+            ['*/3 * * * *', 0, 'short'],
+            ['*/15 * * * *', 20 * 60_000, 'long'],
+            ['0 * * * *', 0, undefined],
+          ] as const) {
+            const schedule = await create({ cron });
+            const job = await jobFor(schedule.id);
+            clock = new Date(new Date(job.data.scheduledFor).getTime() + delay);
+            await deliver([job]);
+            const [run] = await runs(schedule.id);
+            assert.equal(await personal.scheduleCache(run!.turnId), expected);
+            assert.equal(
+              (await request('DELETE', `/api/schedules/${schedule.id}`)).statusCode,
+              200,
+            );
+          }
+          const once = await create({
+            kind: 'once',
+            runAt: new Date(clock.getTime() + 60_000).toISOString(),
+          });
+          const job = await jobFor(once.id);
+          clock = new Date(job.data.scheduledFor);
+          await deliver([job]);
+          const [run] = await runs(once.id);
+          assert.equal(await personal.scheduleCache(run!.turnId), undefined);
+          assert.equal(await personal.scheduleCache(randomUUID()), undefined);
+          assert.equal((await request('DELETE', `/api/schedules/${once.id}`)).statusCode, 200);
+        } finally {
+          clock = before;
+        }
+      });
     } finally {
       await channels?.close();
       await app.close();
@@ -955,8 +1771,10 @@ test('scheduled controls reconcile pause and delete after a client timeout', asy
     revision: 1,
     nextRun: null,
     lastRun: null,
+    activeRun: null,
     baselineObservation: null,
     watch: null,
+    model: null,
     monthlyUsd: null,
   };
   let current: Schedule | null = schedule;

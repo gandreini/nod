@@ -1,16 +1,18 @@
+import type { ModelSelection } from '../src/shared/models.ts';
 import type { Context } from '@earendil-works/pi-ai';
 import type { ModelAccess } from '../src/ports/models.ts';
 import { createPiModelBackend, createPiModelRuntime } from '../src/providers/pi/models.ts';
 import type { Presentation } from '../src/shared/presentation.ts';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { createHash, randomUUID } from 'node:crypto';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { chmod, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { syncBuiltinESMExports } from 'node:module';
+import path, { join, win32 } from 'node:path';
 import { setTimeout } from 'node:timers/promises';
-import test from 'node:test';
+import test, { type TestContext } from 'node:test';
 import { JSDOM } from 'jsdom';
 import { exportJWK, generateKeyPair, SignJWT } from 'jose';
 import {
@@ -28,7 +30,11 @@ import {
   type RuntimeContext,
 } from '../src/ports/agent.ts';
 import type { WorkspaceExecOptions, WorkspaceSession } from '../src/ports/computer.ts';
-import { readPiSessionEntries } from '../src/providers/pi/checkpoint.ts';
+import {
+  dropFailedInput,
+  openLocalSession,
+  readPiSessionEntries,
+} from '../src/providers/pi/checkpoint.ts';
 import { createPiAgent } from '../src/providers/pi/index.ts';
 import { createPiMemoryCurator } from '../src/providers/pi/memory-curator.ts';
 import { createPiUsageTracker } from '../src/providers/pi/usage.ts';
@@ -36,6 +42,8 @@ import type { DecisionQuestion } from '../src/ports/decisions.ts';
 import type { ProviderUsageEvent } from '../src/ports/provider-usage.ts';
 import { createSandbox } from '../src/providers/pi/sandbox.ts';
 import { createAgentRuntime } from '../src/runtime/index.ts';
+import { createCommandRedactor } from '../src/server/redaction.ts';
+import type { WorkspaceCommandRecord } from '../src/shared/execution.ts';
 import { Type } from '@sinclair/typebox';
 import { fakeComputer, fakeWorkspace, fakeExecution } from './runtime-fixtures.ts';
 
@@ -91,10 +99,12 @@ function smallContextAccess(
 
 test('models and routers complete tool discovery inside the endpoint context', async (t) => {
   const { createSkillLibrary } = await import('../src/providers/pi/skills.ts');
+  const { createDocumentation } = await import('../src/server/documentation.ts');
   const { coreSkills } = await import('../src/runtime/prompt.ts');
   for (const { provider, id, window, limit } of [
     { provider: 'compatible', id: 'fixture-small', window: 8192, limit: 8192 },
     { provider: 'compatible', id: 'fixture-memory-small', window: 8192, limit: 8192 },
+    { provider: 'compatible', id: 'fixture-docs-small', window: 8192, limit: 8192 },
     { provider: 'openrouter', id: 'openrouter/free', window: 200_000, limit: 8192 },
     { provider: 'openrouter', id: 'openrouter/auto', window: 2_000_000, limit: 8192 },
     { provider: 'compatible', id: 'fixture-medium', window: 16_384, limit: 16_384 },
@@ -139,7 +149,7 @@ test('models and routers complete tool discovery inside the endpoint context', a
         }
       }
       const guide = 'Synthetic MCP guide: inspect the selected account before reading its records.';
-      const earlier = 'Synthetic earlier session content. '.repeat(2000);
+      const earlier = 'Synthetic earlier session content. '.repeat(100);
       if (id === 'fixture-resumed' || id === 'fixture-followup') {
         const saved = join(directory, 'sessions/fixture');
         await mkdir(saved, { recursive: true });
@@ -158,21 +168,45 @@ test('models and routers complete tool discovery inside the endpoint context', a
       const access = smallContextAccess(provider, id, window);
       let requests = 0;
       let summaries = 0;
+      let rejections = 0;
       const bodies: Record<string, any>[] = [];
       const requestBudgets: number[] = [];
-      const calls = [
-        ['nod_tool_search', { query: 'skills', limit: 1 }],
-        [
-          'skills',
-          { action: 'read', name: id.startsWith('fixture-mcp') ? 'mcp__fixture' : 'artifacts' },
-        ],
-        ['nod_tool_search', { query: 'share_file', limit: 1 }],
-        ['share_file', { path: 'report.txt' }],
-      ] as const;
+      let selectedOutput = 0;
+      const documentation =
+        id === 'fixture-docs-small'
+          ? createDocumentation(join(process.cwd(), 'docs/src/content/docs'))
+          : undefined;
+      const docsSection = (await documentation?.search('Composio zero data retention'))?.[0];
+      assert.ok(!documentation || docsSection);
+      const calls =
+        id === 'fixture-docs-small'
+          ? ([
+              ['nod_tool_search', { query: 'nod_docs', limit: 1 }],
+              ['nod_docs', { action: 'search', query: 'Composio zero data retention' }],
+              ['nod_docs', { action: 'read', id: docsSection!.id }],
+              ['nod_tool_search', { query: 'share_file', limit: 1 }],
+              ['share_file', { path: 'report.txt' }],
+            ] as const)
+          : ([
+              ['nod_tool_search', { query: 'skills', limit: 1 }],
+              [
+                'skills',
+                {
+                  action: 'read',
+                  name: id.startsWith('fixture-mcp') ? 'mcp__fixture' : 'artifacts',
+                },
+              ],
+              ['nod_tool_search', { query: 'share_file', limit: 1 }],
+              ['share_file', { path: 'report.txt' }],
+            ] as const);
       const serve = async (url: RequestInfo | URL, init?: RequestInit) => {
         assert.equal(String(url), `${access.definition.spec.baseUrl}/chat/completions`);
         const body = JSON.parse(String(init?.body));
         bodies.push(body);
+        assert.ok(
+          (body.max_tokens ?? body.max_completion_tokens) <= selectedOutput,
+          `Requested output exceeds Pi's ${selectedOutput}-token limit.`,
+        );
         let images = 0;
         const text = JSON.stringify(
           { messages: body.messages, tools: body.tools },
@@ -184,11 +218,17 @@ test('models and routers complete tool discovery inside the endpoint context', a
         );
         const input = Math.ceil(text.length / 3.5) + images * 1200;
         requestBudgets.push(input + (body.max_tokens ?? body.max_completion_tokens ?? 0));
-        if (input + (body.max_tokens ?? body.max_completion_tokens ?? 0) > limit)
+        if (input + (body.max_tokens ?? body.max_completion_tokens ?? 0) > limit) {
+          rejections++;
           return Response.json(
-            { error: { message: `Synthetic endpoint context is ${limit} tokens.` } },
+            {
+              error: {
+                message: `Context length exceeded: Synthetic endpoint context is ${limit} tokens.`,
+              },
+            },
             { status: 400 },
           );
+        }
         assert.ok(!JSON.stringify(body).includes('fixture-small-key'));
         assert.equal(body.model, id);
         const summarizing = !body.tools?.length;
@@ -220,7 +260,6 @@ test('models and routers complete tool discovery inside the endpoint context', a
           }
           if (id === 'fixture-resumed' && requests === 0) {
             assert.ok(JSON.stringify(body).includes('Synthetic retained recent turn.'));
-            assert.ok(!JSON.stringify(body).includes(earlier));
           }
         }
         const call = summarizing ? undefined : calls[requests++];
@@ -283,10 +322,14 @@ test('models and routers complete tool discovery inside the endpoint context', a
               test.mock.method(globalThis, 'fetch', serve);
               fetchMocked = true;
             }
-            return createAgentSession(options);
+            const result = await createAgentSession(options);
+            assert.equal(result.session.model?.contextWindow, limit);
+            selectedOutput = result.session.model!.maxTokens;
+            return result;
           },
         }),
         skills: createSkillLibrary(join(process.cwd(), 'src/runtime/skills'), coreSkills),
+        documentation,
         computer: fakeComputer(),
         workspace: fakeWorkspace({
           readArtifact: async (_thread, path) => readFile(join(directory, path)),
@@ -299,7 +342,7 @@ test('models and routers complete tool discovery inside the endpoint context', a
         prompt: 'Return the text report named report.txt.',
         rules: 'Do not contact anyone.',
         memory: 'Synthetic earlier memory. '.repeat(2000),
-        ...(id === 'fixture-memory-small'
+        ...(['fixture-memory-small', 'fixture-docs-small'].includes(id)
           ? {
               memoryBrief: {
                 mode: 'recall' as const,
@@ -383,23 +426,31 @@ test('models and routers complete tool discovery inside the endpoint context', a
           largestRequestTokens: Math.max(...requestBudgets),
         }),
       );
-      assert.equal(requests, 5);
-      assert.equal(bodies.length, 5 + summaries);
-      assert.deepEqual(started, ['tool_search', 'skills', 'tool_search', 'share_file']);
+      assert.equal(requests, calls.length + 1);
+      assert.equal(bodies.length, calls.length + 1 + summaries + rejections);
+      assert.deepEqual(
+        started,
+        id === 'fixture-docs-small'
+          ? ['tool_search', 'nod_docs', 'nod_docs', 'tool_search', 'share_file']
+          : ['tool_search', 'skills', 'tool_search', 'share_file'],
+      );
       assert.equal(published.length, 1);
       assert.equal(published[0].toString(), 'Synthetic report bytes');
       if (id === 'fixture-resumed')
         assert.ok((await localText(join(directory, 'sessions/fixture'))).includes(earlier));
       if (!['fixture-large', 'fixture-mcp-large'].includes(id)) {
         const before = bodies.length;
-        await assert.rejects(
-          runtime.runTurn({
-            ...input,
-            turnId: randomUUID(),
-            prompt: 'Oversized current request. '.repeat(5000),
-          }),
+        assert.equal(
+          (
+            await runtime.runTurn({
+              ...input,
+              turnId: randomUUID(),
+              prompt: 'Oversized current request. '.repeat(5000),
+            })
+          ).status,
+          'succeeded',
         );
-        assert.equal(bodies.length, before);
+        assert.ok(bodies.length > before);
         assert.equal(published.length, 1);
       }
     });
@@ -525,6 +576,26 @@ test('model checks fit the output limit of the selected text model', async (t) =
     });
 });
 
+test('wide output models reserve room for request input', async (t) => {
+  const { bodies, url, close } = await contextRecoveryServer(0, 1, -1, false, 100_000);
+  t.after(close);
+  const access = smallContextAccess('compatible', 'fixture-output-limit', 100_000);
+  access.definition.spec = { ...access.definition.spec, baseUrl: url, maxTokens: 65_000 };
+  access.read = async () => ({ type: 'endpoint', url, key: 'fixture-key' });
+  const { runtime, model } = await createPiModelRuntime(access);
+  const result = await runtime.completeSimple(
+    model,
+    {
+      systemPrompt: 'Answer the synthetic request.',
+      messages: [{ role: 'user', content: 'Synthetic input. '.repeat(1000), timestamp: 1 }],
+    },
+    { maxTokens: 65_000 },
+  );
+  assert.equal(result.stopReason, 'stop');
+  assert.equal(bodies.length, 1);
+  assert.equal(bodies[0].max_tokens, 50_000);
+});
+
 test('small Pi sessions save full output and keep nested results available to scripts', async (t) => {
   const { workspace, prefix, root } = await hostSandbox(t);
   const directory = await mkdtemp(join(tmpdir(), 'nod-small-output-'));
@@ -569,6 +640,14 @@ test('small Pi sessions save full output and keep nested results available to sc
           return { content: [] };
         },
       },
+      {
+        name: 'skills',
+        description: 'Read a synthetic learned skill.',
+        parameters: { type: 'object', properties: {} },
+        execute: async () => ({
+          content: [{ type: 'text', text: untrustedBlock('learned skill', full) }],
+        }),
+      },
     ],
     shouldStop: () => false,
     onEvent: () => {},
@@ -577,12 +656,22 @@ test('small Pi sessions save full output and keep nested results available to sc
   const run = (tool: ToolDefinition, id: string) =>
     tool.execute(id, {}, undefined, undefined, undefined as never);
   const result = await run(external, 'direct');
+  const learned = await run(
+    captured!.customTools!.find((tool) => tool.name === 'skills')!,
+    'direct',
+  );
+  const { untrustedParts } = await import('../src/shared/untrusted.ts');
+  assert.ok(
+    learned.content.some(
+      (part) => part.type === 'text' && part.text.startsWith(untrustedParts('learned skill').open),
+    ),
+  );
   const preview = result.content.find((part) => part.type === 'text')!.text;
   assert.ok(preview.length < 2000);
   assert.match(preview, /untrusted_tool_result/);
   const saved = preview.match(/"workspaceFile":"([^"]+)"/)![1];
-  assert.ok(saved.startsWith(workspace.path + '/.nod/outputs/'));
-  assert.equal(await readFile(saved.replace(prefix, root), 'utf8'), full);
+  assert.ok(saved.startsWith('.nod/outputs/'));
+  assert.equal(await readFile(join(workspace.path, saved).replace(prefix, root), 'utf8'), full);
   assert.equal(existsSync(prefix), false);
   const nested = await run(external, 'parent/child');
   assert.equal(nested.content[0].type === 'text' && nested.content[0].text, full);
@@ -594,7 +683,154 @@ test('small Pi sessions save full output and keep nested results available to sc
   const read = captured!.customTools!.find((tool) => tool.name === 'read')!;
   await read.execute('read', { path: saved, limit: 2 }, undefined, undefined, undefined as never);
   assert.deepEqual(guarded, ['read']);
+  const bash = captured!.customTools!.find((tool) => tool.name === 'bash')!;
+  const command = (await bash.execute(
+    'bash',
+    { command: "printf 'synthetic-line-%05d\\n' $(seq 1 600); echo synthetic-last-line; exit 4" },
+    undefined,
+    undefined,
+    undefined as never,
+  )) as Awaited<ReturnType<ToolDefinition['execute']>> & {
+    exitCode?: number;
+    commandOutput?: string;
+  };
+  const shown = command.content.find((part) => part.type === 'text')!.text;
+  assert.match(shown, /"workspaceFile"/);
+  assert.ok(shown.includes('synthetic-last-line'));
+  assert.equal(command.exitCode, 4);
+  assert.match(command.commandOutput!, /synthetic-line-00600\nsynthetic-last-line/);
   await session.dispose();
+});
+
+test('direct image results save over-budget images in the workspace', async (t) => {
+  const { workspace, prefix, root } = await hostSandbox(t);
+  const directory = await mkdtemp(join(tmpdir(), 'nod-image-output-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const png = Buffer.from(
+    'iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAACXBIWXMAAAPoAAAD6AG1e1JrAAAAlklEQVRoge2SwQkAMBCD3H9pO0QfchBwACNBOA25gRtAXtFdiLuQG7gB5BXdhbgLuYEbQF7RXYi7kBu4AeQV3YW4C7mBG0Be0V2Iu5AbuAHkFd2FuAu5gRtAXtFdiLuQG7gB5BXdhbgLuYEbQF7RXYi7kBu4AeQV3YW4C7mBG0Be0V2Iu5AbuAHkFd2FuAu5gRtAXvGHB6nc8OJ57m0sAAAAAElFTkSuQmCC',
+    'base64',
+  );
+  const bmp = Buffer.from(
+    'Qk06AAAAAAAAADYAAAAoAAAAAQAAAAEAAAABABgAAAAAAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAD/AA==',
+    'base64',
+  );
+  const image = { type: 'image' as const, data: png.toString('base64'), mimeType: 'image/png' };
+  const mixedImage = { ...image, mimeType: 'image/png ; charset=binary' };
+  const mixedText = 'Synthetic screenshot description. ' + 'detail '.repeat(500);
+  const trailingText = 'Synthetic caption after the screenshot.';
+  const shortCaption = 'Synthetic bitmap caption. '.repeat(30);
+  let captured: Parameters<typeof createAgentSession>[0];
+  const agent = createPiAgent({
+    provider: 'compatible',
+    resolve: async () => smallContextAccess('compatible', 'fixture-vision-small', 2048),
+    sessionRoot: directory,
+    createSession: async (options) => {
+      captured = options;
+      return createAgentSession(options);
+    },
+  });
+  t.after(() => agent.dispose());
+  const session = await agent.open({
+    ...fakeExecution(randomUUID()),
+    systemPrompt: 'Synthetic fixture',
+    workspace,
+    runTool: async (_name, _params, run) => run(),
+    tools: [
+      {
+        name: 'fixture_image',
+        description: 'Return a synthetic image.',
+        parameters: Type.Object({}),
+        execute: async () => ({ content: [image] }),
+      },
+      {
+        name: 'fixture_mixed',
+        description: 'Return synthetic text and image.',
+        parameters: Type.Object({}),
+        execute: async () => ({
+          content: [
+            { type: 'text' as const, text: mixedText },
+            mixedImage,
+            { type: 'text' as const, text: trailingText },
+          ],
+        }),
+      },
+      {
+        name: 'fixture_bmp',
+        description: 'Return a synthetic bitmap.',
+        parameters: Type.Object({}),
+        execute: async () => ({
+          content: [
+            { type: 'image' as const, data: bmp.toString('base64'), mimeType: 'image/bmp' },
+            { type: 'text' as const, text: shortCaption },
+          ],
+        }),
+      },
+    ],
+    shouldStop: () => false,
+    onEvent: () => {},
+  });
+  t.after(() => session.dispose());
+  const run = async (name: string, bytes: Buffer, mimeType: string) => {
+    const tool = captured!.customTools!.find((candidate) => candidate.name === name)!;
+    const result = await tool.execute('direct', {}, undefined, undefined, undefined as never);
+    assert.deepEqual(
+      result.content.map((part) => part.type),
+      ['text'],
+    );
+    const pointer = result.content.find((part) => part.type === 'text')!.text;
+    assert.match(pointer, /untrusted_tool_result/);
+    if (name === 'fixture_bmp') assert.ok(pointer.includes(shortCaption));
+    const file = pointer.match(/"workspaceFile":"([^"]+)"/)![1];
+    assert.ok(file.startsWith('.nod/outputs/'));
+    const manifest = JSON.parse(
+      await readFile(join(workspace.path, file).replace(prefix, root), 'utf8'),
+    ) as { content: Array<{ type: string; path: string; mimeType?: string }> };
+    const savedImage = manifest.content.find((item) => item.type === 'image')!;
+    assert.equal(savedImage.mimeType, mimeType);
+    assert.deepEqual(
+      await readFile(join(workspace.path, savedImage.path).replace(prefix, root)),
+      bytes,
+    );
+    return manifest;
+  };
+  const imageOnly = await run('fixture_image', png, 'image/png');
+  assert.deepEqual(
+    imageOnly.content.map((item) => item.type),
+    ['image'],
+  );
+  const mixed = await run('fixture_mixed', png, mixedImage.mimeType);
+  assert.deepEqual(
+    mixed.content.map((item) => item.type),
+    ['text', 'image', 'text'],
+  );
+  assert.equal(
+    await readFile(join(workspace.path, mixed.content[0]!.path).replace(prefix, root), 'utf8'),
+    mixedText,
+  );
+  assert.equal(
+    await readFile(join(workspace.path, mixed.content[2]!.path).replace(prefix, root), 'utf8'),
+    trailingText,
+  );
+  const nativeRead = createSandbox(workspace).find((tool) => tool.name === 'read')!;
+  const reread = await nativeRead.execute(
+    'read-image',
+    { path: mixed.content[1]!.path },
+    undefined,
+    undefined,
+    undefined as never,
+  );
+  assert.ok(reread.content.some((part) => part.type === 'image'));
+  const bitmap = await run('fixture_bmp', bmp, 'image/bmp');
+  assert.match(bitmap.content[0]!.path, /\.bmp$/);
+  const bitmapRead = await nativeRead.execute(
+    'read-bmp',
+    { path: bitmap.content[0]!.path },
+    undefined,
+    undefined,
+    undefined as never,
+  );
+  assert.ok(bitmapRead.content.some((part) => part.type === 'image'));
+  assert.equal(existsSync(prefix), false);
 });
 
 test('codemode app calls keep untrusted output and stop after an approval', async (t) => {
@@ -1151,6 +1387,130 @@ test('a restarted proactive check within the hour reads its stable context from 
   }
 });
 
+test('fresh scheduled sessions put their stable first request on a one-hour Anthropic cache', async (t) => {
+  const backend = createPiModelBackend({
+    fetch: async () => {
+      throw new Error('No live catalog request is allowed.');
+    },
+  });
+  const definition = (await backend.catalog('anthropic', 'api_key')).find(
+    ({ choice }) => choice.id === 'claude-opus-5-5',
+  )!;
+  const directory = await mkdtemp(join(tmpdir(), 'nod-pi-scheduled-cache-'));
+  const bodies: Array<Record<string, any>> = [];
+  const stream = [
+    {
+      type: 'message_start',
+      message: {
+        id: 'msg_fixture',
+        type: 'message',
+        role: 'assistant',
+        model: 'claude-opus-5-5',
+        content: [],
+        stop_reason: null,
+        usage: { input_tokens: 10, output_tokens: 1 },
+      },
+    },
+    { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } },
+    { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'Checked.' } },
+    { type: 'content_block_stop', index: 0 },
+    { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 2 } },
+    { type: 'message_stop' },
+  ]
+    .map((event) => 'event: ' + event.type + '\ndata: ' + JSON.stringify(event) + '\n\n')
+    .join('');
+  t.mock.method(globalThis, 'fetch', async (input: string | URL | Request, init?: RequestInit) => {
+    const url = input instanceof Request ? input.url : String(input);
+    if (!url.includes('/v1/messages')) throw new Error('Unexpected request to ' + url);
+    bodies.push(JSON.parse(String(init?.body)));
+    return new Response(stream, { headers: { 'content-type': 'text/event-stream' } });
+  });
+  const runtime = createAgentRuntime({
+    agent: createPiAgent({
+      provider: 'anthropic',
+      resolve: async () => ({
+        provider: 'anthropic',
+        method: 'api_key',
+        definition,
+        effort: 'low',
+        read: async () => ({ type: 'api_key', key: 'fixture-key' }),
+      }),
+      sessionRoot: join(directory, 'sessions'),
+    }),
+    computer: fakeComputer(),
+    workspace: fakeWorkspace(),
+  });
+  const threadId = 'test-' + randomUUID();
+  const fire = (label: string) =>
+    runtime.runTurn({
+      ...({} as RuntimeContext),
+      ...({ scheduleCache: 'long' } as { scheduleCache: 'long' }),
+      threadId,
+      turnId: randomUUID(),
+      sessionId: randomUUID(),
+      background: true,
+      resumed: false,
+      prompt: 'Scheduled task: synthetic status check ' + label,
+      memory: 'about/name: The owner is Alex.',
+      credentialRequests: [
+        {
+          turnId: 'fixture-sign-in-turn',
+          origin: 'https://sign-in.fixture.test',
+          label: 'Synthetic sign-in',
+          kind: 'password',
+          status: label === 'FIRST-RUN' ? 'pending' : 'expired',
+        },
+      ],
+      history: [
+        { role: 'user', text: 'Earlier owner message', createdAt: new Date().toISOString() },
+      ],
+      workspacePath: directory,
+      signal: new AbortController().signal,
+      attachments: [],
+      emit: async () => {},
+      reply: async () => {},
+      delta: () => {},
+    });
+  try {
+    await fire('FIRST-RUN');
+    await fire('SECOND-RUN');
+  } finally {
+    await runtime.dispose();
+    await rm(directory, { recursive: true, force: true });
+  }
+  assert.equal(bodies.length, 2);
+  const blocks = (body: Record<string, any>) =>
+    body.messages.flatMap((message: { content: unknown }) =>
+      Array.isArray(message.content) ? message.content : [],
+    );
+  const stable = bodies.map((body) =>
+    blocks(body).filter((block: any) => block.cache_control?.ttl === '1h'),
+  );
+  assert.equal(stable[0].length, 2);
+  assert.match(stable[0][0].text, /^Owner context/);
+  assert.match(stable[0][1].text, /^Respond to currentInstruction/);
+  assert.deepEqual(
+    stable[0].map((block: any) => block.text),
+    stable[1].map((block: any) => block.text),
+  );
+  assert.ok(
+    stable.every((blocks) =>
+      blocks.every((block: any) => !block.text.includes('sign-in.fixture.test')),
+    ),
+  );
+  for (const [index, body] of bodies.entries()) {
+    const tail = blocks(body).at(-1);
+    assert.match(tail.text, index ? /SECOND-RUN/ : /FIRST-RUN/);
+    assert.match(JSON.stringify(body), /Only pending means open/);
+    const status = JSON.stringify(`"status":"${index ? 'expired' : 'pending'}"`).slice(1, -1);
+    assert.ok(tail.text.includes(status));
+    assert.deepEqual(tail.cache_control, { type: 'ephemeral' });
+    assert.equal('cache_control' in body.system[0], false);
+    assert.ok(JSON.stringify(body).split('"cache_control"').length - 1 <= 4);
+  }
+  assert.equal(JSON.stringify(bodies[1]).includes('FIRST-RUN'), false);
+});
+
 test('messages taken after a Pi turn each reach a new request and not after a question', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'nod-pi-steer-'));
   const requests: string[] = [];
@@ -1622,8 +1982,9 @@ async function hostSandbox(t: test.TestContext) {
   const host = await mkdtemp(join(tmpdir(), 'nod-sandbox-'));
   const bin = join(host, 'bin');
   const root = join(host, 'root');
+  const cwd = join(root, 'workspace');
   await mkdir(bin);
-  await mkdir(join(root, 'workspace'), { recursive: true });
+  await mkdir(cwd, { recursive: true });
   if (process.platform !== 'linux') {
     await writeFile(join(bin, 'timeout'), timeoutShim);
     await chmod(join(bin, 'timeout'), 0o755);
@@ -1638,11 +1999,15 @@ async function hostSandbox(t: test.TestContext) {
       calls.push(command);
       return new Promise((resolve) => {
         const child = spawn('bash', ['-c', command.replaceAll(prefix, root)], {
-          cwd: join(root, 'workspace'),
+          cwd,
           env: { PATH: `${bin}:/usr/bin:/bin` },
         });
         const deliver = (chunk: Buffer) =>
-          options.onData?.(Buffer.from(chunk.toString('utf8').replaceAll(root, prefix)));
+          options.onData?.(
+            chunk.includes(root)
+              ? Buffer.from(chunk.toString('utf8').replaceAll(root, prefix))
+              : chunk,
+          );
         child.stdout.on('data', deliver);
         child.stderr.on('data', deliver);
         child.stdin.on('error', () => {});
@@ -1653,13 +2018,13 @@ async function hostSandbox(t: test.TestContext) {
     },
   };
   const tools = Object.fromEntries(createSandbox(workspace).map((tool) => [tool.name, tool]));
-  const run = async (name: string, params: Record<string, unknown>) => {
+  const run = async (name: string, params: Record<string, unknown>, context?: { cwd: string }) => {
     const result = await (tools[name] as ToolDefinition).execute(
       randomUUID(),
       params,
       undefined,
       undefined,
-      undefined as never,
+      context as never,
     );
     return result.content.map((part) => (part.type === 'text' ? part.text : part.type)).join('');
   };
@@ -1680,6 +2045,41 @@ test('native Pi tools run only through workspace exec on sandbox paths that do n
   await assert.rejects(run('read', { path: 'missing.txt' }));
   assert.ok(calls.length >= 8);
   assert.equal(existsSync(prefix), false);
+});
+
+test('native Pi tools use Linux workspace paths on a Windows host', async (t) => {
+  const { prefix, calls, run } = await hostSandbox(t);
+  const platform = Object.getOwnPropertyDescriptor(process, 'platform')!;
+  const posix = Object.getOwnPropertyDescriptor(path, 'posix')!;
+  Object.defineProperty(path, 'posix', { value: { ...path.posix } });
+  Object.defineProperty(process, 'platform', { value: 'win32' });
+  for (const name of ['join', 'dirname', 'isAbsolute', 'relative'] as const)
+    t.mock.method(path, name, win32[name]);
+  t.mock.method(path, 'resolve', (...parts: string[]) => win32.resolve('C:\\nod', ...parts));
+  syncBuiltinESMExports();
+  t.after(() => {
+    Object.defineProperty(process, 'platform', platform);
+    t.mock.restoreAll();
+    Object.defineProperty(path, 'posix', posix);
+    syncBuiltinESMExports();
+  });
+  const context = { cwd: `C:${prefix.replaceAll('/', '\\')}\\workspace` };
+  const execute = (name: string, params: Record<string, unknown>) => run(name, params, context);
+  await execute('write', { path: 'notes/a.txt', content: 'alpha\nbeta\n' });
+  assert.equal(await execute('read', { path: 'notes/a.txt' }), 'alpha\nbeta\n');
+  await execute('edit', { path: 'notes/a.txt', edits: [{ oldText: 'beta', newText: 'gamma' }] });
+  assert.equal(
+    await execute('read', { path: `${prefix}/workspace/notes/a.txt` }),
+    'alpha\ngamma\n',
+  );
+  assert.equal(await execute('ls', {}), 'notes/');
+  assert.equal(await execute('ls', { path: 'notes' }), 'a.txt');
+  assert.equal(await execute('find', { pattern: '*.txt' }), 'notes/a.txt');
+  assert.equal((await execute('bash', { command: 'pwd' })).trim(), `${prefix}/workspace`);
+  assert.deepEqual(
+    calls.filter((command) => command.includes('C:') || command.includes('\\workspace')),
+    [],
+  );
 });
 
 test('bash output larger than Pi limits stays in the sandbox and never creates host temp files', async (t) => {
@@ -1712,6 +2112,91 @@ test('bash output larger than Pi limits stays in the sandbox and never creates h
   await assert.rejects(run('bash', { command: 'sleep 5', timeout: 1 }));
   const after = (await readdir(tmpdir())).filter((name) => name.startsWith('pi-bash-'));
   assert.deepEqual(after, before);
+});
+
+test('the owner command stream records exit status and output without known secrets', async (t) => {
+  const { workspace } = await hostSandbox(t);
+  const directory = await mkdtemp(join(tmpdir(), 'nod-command-stream-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const secret = 'synthetic-workspace-secret-4417';
+  const calls: Array<Record<string, string | number>> = [
+    { command: `echo ${secret}; echo password=synthetic-assigned-value; exit 3` },
+    { command: `echo late-${secret}; sleep 5`, timeout: 1 },
+  ];
+  const run = async (redactCommand?: (text: string) => string) => {
+    let step = 0;
+    const events: Array<{ type: string; command?: WorkspaceCommandRecord }> = [];
+    const runtime = createAgentRuntime({
+      agent: createPiAgent({
+        provider: 'openai',
+        apiKey: 'fixture',
+        sessionRoot: join(directory, randomUUID()),
+        createSession: async (options) => {
+          const result = await createAgentSession(options);
+          result.session.setActiveToolsByName(
+            result.session.getAllTools().map((tool) => tool.name),
+          );
+          result.session.agent.streamFunction = (model) => {
+            const call = calls[step++];
+            const message: AssistantMessage = {
+              role: 'assistant',
+              api: model.api,
+              provider: model.provider,
+              model: model.id,
+              timestamp: Date.now(),
+              stopReason: call ? 'toolUse' : 'stop',
+              content: call
+                ? [{ type: 'toolCall', id: `bash-${step}`, name: 'bash', arguments: call }]
+                : [{ type: 'text', text: 'Done' }],
+              usage: {
+                input: 1,
+                output: 1,
+                cacheRead: 0,
+                cacheWrite: 0,
+                totalTokens: 2,
+                cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+              },
+            };
+            const stream = createAssistantMessageEventStream();
+            stream.push({ type: 'start', partial: message });
+            stream.push({ type: 'done', reason: call ? 'toolUse' : 'stop', message });
+            return stream;
+          };
+          return result;
+        },
+      }),
+      computer: fakeComputer(),
+      workspace: fakeWorkspace({ open: () => workspace }),
+      redactCommand,
+    });
+    try {
+      await runtime.runTurn({
+        ...context(directory),
+        threadId: randomUUID(),
+        turnId: randomUUID(),
+        emit: async (type, _summary, event) => {
+          events.push({ type, command: event?.command });
+        },
+      });
+    } finally {
+      await runtime.dispose();
+    }
+    return events.filter((event) => event.command);
+  };
+  const records = await run(createCommandRedactor([secret]));
+  assert.deepEqual(
+    records.map(({ type, command }) => [type, command?.command, command?.exitCode]),
+    [
+      ['tool_start', 'echo [redacted]; echo password=[redacted]; exit 3', undefined],
+      ['tool_complete', undefined, 3],
+      ['tool_start', 'echo late-[redacted]; sleep 5', undefined],
+      ['tool_failed', undefined, undefined],
+    ],
+  );
+  assert.match(records[1].command!.output!, /^\[redacted\]\npassword=\[redacted\]/);
+  assert.match(records[3].command!.output!, /late-\[redacted\][\s\S]*timed out/);
+  assert.equal(JSON.stringify(records).includes('synthetic-'), false);
+  assert.deepEqual(await run(), []);
 });
 
 // Runtime: one active turn, stop and shutdown drain.
@@ -1888,6 +2373,202 @@ test('a turn posts its opening line and final reply, shows the lines between as 
   }
 });
 
+test('task handoff does not repeat acknowledgements and keeps independent final answers and steered requests', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'nod-task-handoff-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const acknowledgement =
+    "On it! I'll review your synthetic inbox, flag anything urgent, and save reply drafts. Nothing gets sent without your OK.";
+  const startMessage =
+    "I've started reviewing your synthetic inbox. I'll flag urgent email and save draft replies. Nothing gets sent without your OK.";
+  const cases = [
+    {
+      name: 'earlier update',
+      earlyUpdate: true,
+      steer: false,
+      final:
+        "I've started reviewing your synthetic inbox. I'll save draft replies and flag urgent email. Nothing gets sent without your OK.",
+      expected: [acknowledgement],
+    },
+    {
+      name: 'task start alone',
+      earlyUpdate: false,
+      steer: false,
+      final:
+        "I've started reviewing your synthetic inbox. I'll flag urgent email and save draft replies. Nothing gets sent without your OK.",
+      expected: [],
+    },
+    {
+      name: 'Spanish task start alone',
+      earlyUpdate: false,
+      steer: false,
+      start:
+        'Ya he empezado a revisar tu buzón y preparar borradores de respuesta. No enviaré nada sin tu aprobación.',
+      final:
+        'Ya he empezado a revisar tu buzón y preparando borradores de respuesta. No enviaré nada sin tu aprobación.',
+      expected: [],
+    },
+    {
+      name: 'independent answer',
+      earlyUpdate: true,
+      steer: false,
+      final: 'The synthetic invoice is due Friday for €450. I flagged it for review.',
+      expected: [
+        acknowledgement,
+        'The synthetic invoice is due Friday for €450. I flagged it for review.',
+      ],
+    },
+    {
+      name: 'new finding after the task starts',
+      earlyUpdate: true,
+      steer: false,
+      final:
+        "I've started reviewing your synthetic inbox. I'll flag urgent email and save draft replies. Nothing gets sent without your OK. I found 3 urgent messages.",
+      expected: [
+        acknowledgement,
+        "I've started reviewing your synthetic inbox. I'll flag urgent email and save draft replies. Nothing gets sent without your OK. I found 3 urgent messages.",
+      ],
+    },
+    {
+      name: 'negated finding after task start',
+      earlyUpdate: false,
+      steer: false,
+      start: "I've started checking the synthetic invoices. Every invoice is approved.",
+      final: "I've started checking the synthetic invoices. Every invoice is not approved.",
+      expected: ["I've started checking the synthetic invoices. Every invoice is not approved."],
+    },
+    {
+      name: 'removed negation after task start',
+      earlyUpdate: false,
+      steer: false,
+      start: "I've started checking the synthetic invoices. No invoice is approved.",
+      final: "I've started checking the synthetic invoices. Every invoice is approved.",
+      expected: ["I've started checking the synthetic invoices. Every invoice is approved."],
+    },
+    {
+      name: 'changed count after task start',
+      earlyUpdate: false,
+      steer: false,
+      start: "I've started checking all 12 synthetic invoices for overdue items.",
+      final: "I've started checking all 2 synthetic invoices for overdue items.",
+      expected: ["I've started checking all 2 synthetic invoices for overdue items."],
+    },
+    {
+      name: 'qualitative finding after task start',
+      earlyUpdate: false,
+      steer: false,
+      start: "I've started reviewing your synthetic inbox and will flag urgent messages.",
+      final: "I've started reviewing your synthetic inbox and will flag fraudulent messages.",
+      expected: ["I've started reviewing your synthetic inbox and will flag fraudulent messages."],
+    },
+    {
+      name: 'finding borrowed from the owner request',
+      earlyUpdate: false,
+      steer: false,
+      prompt: 'Check the synthetic invoices and tell me which are rejected.',
+      start: "I've started checking the synthetic invoices. Every invoice is approved.",
+      final: "I've started checking the synthetic invoices. Every invoice is rejected.",
+      expected: ["I've started checking the synthetic invoices. Every invoice is rejected."],
+    },
+    {
+      name: 'steered answer',
+      earlyUpdate: true,
+      steer: true,
+      final: 'I started reviewing your synthetic inbox in the account you selected.',
+      expected: [
+        acknowledgement,
+        'I started reviewing your synthetic inbox in the account you selected.',
+      ],
+    },
+    {
+      name: 'steered answer before a task starts',
+      earlyUpdate: true,
+      steer: true,
+      steerBefore: true,
+      final:
+        "I've started reviewing your synthetic Gmail inbox. I'll flag urgent email and save draft replies. Nothing gets sent without your OK.",
+      expected: [
+        acknowledgement,
+        "I've started reviewing your synthetic Gmail inbox. I'll flag urgent email and save draft replies. Nothing gets sent without your OK.",
+      ],
+    },
+  ] as const;
+  for (const scenario of cases)
+    await t.test(scenario.name, async () => {
+      const posted: string[] = [];
+      const incoming: string[] = [];
+      const runtime = createAgentRuntime({
+        agent: {
+          open: async (input) => ({
+            resumed: false,
+            abort() {},
+            dispose() {},
+            prompt: async () => {
+              if (scenario.earlyUpdate)
+                await input.tools
+                  .find((tool) => tool.name === 'send_message')!
+                  .execute({ text: acknowledgement, intent: 'update' });
+              if ('steerBefore' in scenario && scenario.steerBefore)
+                incoming.push(...((await input.nextMessages?.()) ?? []).map((item) => item.text));
+              await input.tools
+                .find((tool) => tool.name === 'task')!
+                .execute({
+                  action: 'start',
+                  title: 'Review synthetic inbox',
+                  doneWhen: 'Urgent messages identified and draft replies saved',
+                  now: 'Reviewing synthetic inbox',
+                  message: 'start' in scenario ? scenario.start : startMessage,
+                });
+              if (!('steerBefore' in scenario && scenario.steerBefore))
+                incoming.push(...((await input.nextMessages?.()) ?? []).map((item) => item.text));
+              input.onEvent({ type: 'message_start' });
+              input.onEvent({ type: 'text_delta', text: scenario.final });
+              input.onEvent({ type: 'final', text: scenario.final });
+              input.onEvent({ type: 'message_end', status: 'succeeded' });
+            },
+          }),
+          dispose() {},
+        },
+        computer: fakeComputer(),
+        workspace: fakeWorkspace(),
+      });
+      try {
+        let steered = false;
+        const result = await runtime.runTurn({
+          ...context(directory),
+          turnId: randomUUID(),
+          prompt:
+            'prompt' in scenario
+              ? scenario.prompt
+              : 'Review my synthetic inbox and report urgent messages.',
+          task: async () => ({ id: randomUUID() }),
+          reply: async (text) => {
+            posted.push(text);
+          },
+          ...(scenario.steer
+            ? {
+                takeMessages: async () =>
+                  steered
+                    ? []
+                    : ((steered = true),
+                      [
+                        {
+                          id: randomUUID(),
+                          text: 'Use the synthetic account I selected.',
+                          attachments: [],
+                        },
+                      ]),
+              }
+            : {}),
+        });
+        assert.equal(result.status, 'succeeded');
+        assert.deepEqual(posted, scenario.expected);
+        assert.equal(incoming.length, scenario.steer ? 1 : 0);
+      } finally {
+        await runtime.dispose();
+      }
+    });
+});
+
 test('a paused turn cannot start a subagent still preparing and failed children return errors', async (t) => {
   const directory = await mkdtemp(join(tmpdir(), 'nod-delegate-stop-'));
   t.after(() => rm(directory, { recursive: true, force: true }));
@@ -2035,6 +2716,7 @@ test('decision routing uses the selected connection and never sends subscription
     NOD_VAULT_KEY: Buffer.alloc(32, 7).toString('base64'),
   });
   const models = adapters.models!;
+  models.setRequestBudget(async () => async () => {});
   let selected: {
     provider: 'openai' | 'openrouter' | 'anthropic' | 'compatible';
     method: 'api_key' | 'oauth' | 'subscription';
@@ -2107,6 +2789,7 @@ test('decision routing uses the selected connection and never sends subscription
     TYPESAFE_API_KEY: 'fixture-explicit-jev-key',
     NOD_FEEDBACK_ENABLED: 'false',
   });
+  overridden.models!.setRequestBudget(async () => async () => {});
   overridden.models!.resolve = async () => {
     throw new Error('The override must not read another connection.');
   };
@@ -2162,6 +2845,7 @@ test('trust mode selects available Jev, Decider and OpenAI before the small LLM'
     NOD_TRUST_MODEL: 'decision',
     NOD_FEEDBACK_ENABLED: 'false',
   });
+  adapters.models!.setRequestBudget(async () => async () => {});
   assert.equal(adapters.trustModel, 'decision');
   const keys = new Map([
     ['openai', 'fixture-openai'],
@@ -2226,6 +2910,7 @@ test('trust mode selects available Jev, Decider and OpenAI before the small LLM'
     TYPESAFE_API_KEY: 'fixture-typesafe',
     NOD_FEEDBACK_ENABLED: 'false',
   });
+  direct.models!.setRequestBudget(async () => async () => {});
   direct.models!.hasApiKey = () => false;
   await check(direct);
   assert.equal(requests.at(-1)?.model, 'jev-1.14.0');
@@ -2234,6 +2919,7 @@ test('trust mode selects available Jev, Decider and OpenAI before the small LLM'
     NOD_TRUST_MODEL: 'decision',
     NOD_FEEDBACK_ENABLED: 'false',
   });
+  router.models!.setRequestBudget(async () => async () => {});
   router.models!.hasApiKey = (provider) => provider === 'openrouter';
   router.models!.apiKey = async () => 'fixture-router';
   await check(router);
@@ -3033,7 +3719,7 @@ test('each model call yields one chat-format trace without image data', async ()
       effort: 'low',
       read: async () => ({ type: 'api_key', key: 'fixture-router-key' }),
     },
-    (call) => calls.push(call),
+    { trace: (call) => calls.push(call) },
   );
   const image = Buffer.from('synthetic-image-bytes').toString('base64');
   const chunk = (value: object) => `data: ${JSON.stringify(value)}\n\n`;
@@ -3258,6 +3944,10 @@ test('a long tool call does not send model requests without usage records', asyn
               capabilities: ['completion', 'tools'],
               model_info: { 'llama.context_length': 200000 },
             });
+          if (request.url !== '/v1/chat/completions') {
+            response.writeHead(404);
+            return response.end();
+          }
           requests++;
           const body = JSON.parse(Buffer.concat(parts).toString());
           if (body.max_tokens === 1 || body.max_completion_tokens === 1) {
@@ -3430,9 +4120,9 @@ test('a long tool call does not send model requests without usage records', asyn
       );
       if (outcome === 'succeeded' && !changeContext) {
         const cancelled: import('../src/ports/provider-usage.ts').ProviderUsageEvent[] = [];
-        const { runtime, model } = await createPiModelRuntime(access, undefined, undefined, (row) =>
-          cancelled.push(row),
-        );
+        const { runtime, model } = await createPiModelRuntime(access, {
+          reportCacheUsage: (row) => cancelled.push(row),
+        });
         holdRefresh = true;
         const received = new Promise<void>((resolve) => {
           refreshStarted = resolve;
@@ -3490,6 +4180,10 @@ test('owner context stays out of the system prompt and compaction summaries and 
           capabilities: ['completion', 'tools'],
           model_info: { 'llama.context_length': 20_000 },
         });
+      if (request.url !== '/v1/chat/completions') {
+        response.writeHead(404);
+        return response.end();
+      }
       bodies.push(JSON.parse(Buffer.concat(parts).toString()));
       response.writeHead(200, { 'content-type': 'text/event-stream' });
       response.end(
@@ -3599,6 +4293,9 @@ test('owner context stays out of the system prompt and compaction summaries and 
       JSON.stringify(six.messages).lastIndexOf('Synthetic request 6'),
   );
   assert.ok(!JSON.stringify(six).includes('Jordi Fixture'));
+  const seven = await turn(owner('Private fixture preferences. '.repeat(8000)), 7);
+  assert.ok(JSON.stringify(seven).includes('workspaceFile'));
+  assert.ok(!JSON.stringify(recorded).includes('Private fixture preferences.'));
 
   assert.ok(recorded.length >= 6);
   assert.ok(JSON.stringify(recorded).includes('[owner context omitted]'));
@@ -3608,12 +4305,13 @@ test('owner context stays out of the system prompt and compaction summaries and 
   assert.equal(recorded[0].metadata.session_id, execution.sessionId);
 });
 
-test('a turn that crosses the compaction line answers first, then compacts at the lowest effort', async (t) => {
+test('Pi compacts at its threshold with the lowest supported summary effort', async (t) => {
   const { createServer } = await import('node:http');
   const chunk = (value: object) => `data: ${JSON.stringify(value)}\n\n`;
   const bodies: Array<{ messages: unknown[]; reasoning_effort?: string }> = [];
   const summary = (body: (typeof bodies)[number]) =>
-    JSON.stringify(body.messages).includes('<conversation>');
+    JSON.stringify(body.messages).includes('<conversation>') ||
+    JSON.stringify(body.messages).includes('## Original Request');
   let agentRequests = 0;
   const server = createServer((request, response) => {
     const parts: Buffer[] = [];
@@ -3713,10 +4411,10 @@ test('a turn that crosses the compaction line answers first, then compacts at th
     await session.dispose();
   }
 
-  assert.deepEqual(bodies.map(summary), [false, false, false, false, true]);
+  assert.deepEqual(bodies.map(summary), [false, false, false, true, false]);
   assert.deepEqual(
     bodies.map((body) => body.reasoning_effort),
-    ['high', 'high', 'high', 'high', 'low'],
+    ['high', 'high', 'high', 'low', 'high'],
   );
   const answered = events.findIndex(
     (event) => event.type === 'final' && event.text === 'Synthetic answer 4',
@@ -3725,7 +4423,1254 @@ test('a turn that crosses the compaction line answers first, then compacts at th
     event.type === 'provider_usage' && event.usage.operation === 'compaction' ? [index] : [],
   );
   assert.equal(compactions.length, 1);
-  assert.ok(answered >= 0 && answered < compactions[0]);
+  assert.ok(answered > compactions[0]);
+});
+
+async function contextRecoveryServer(
+  toolCalls = 0,
+  callsPerStep = 1,
+  overflowStep = 0,
+  summaryOverflow: boolean | 'output-limit' = false,
+  maximumContext?: number,
+  actions?: Array<{ name: string; args: Record<string, unknown> }>,
+) {
+  const { createServer } = await import('node:http');
+  const chunk = (value: object) => `data: ${JSON.stringify(value)}\n\n`;
+  const bodies: Array<{
+    model: string;
+    messages: unknown[];
+    tools?: unknown[];
+    max_tokens: number;
+  }> = [];
+  const summary = (body: (typeof bodies)[number]) =>
+    (toolCalls > 0 && !body.tools?.length) ||
+    JSON.stringify(body.messages).includes('<conversation>') ||
+    JSON.stringify(body.messages).includes('## Original Request');
+  let agentRequests = 0;
+  const server = createServer((request, response) => {
+    const parts: Buffer[] = [];
+    request.on('data', (part) => parts.push(part));
+    request.on('end', () => {
+      const body = JSON.parse(Buffer.concat(parts).toString()) as (typeof bodies)[number];
+      bodies.push(body);
+      const summarizing = summary(body);
+      const step = summarizing ? 0 : ++agentRequests;
+      if (
+        step === overflowStep ||
+        (summarizing && summaryOverflow === true) ||
+        (maximumContext !== undefined &&
+          (Buffer.byteLength(JSON.stringify(body.messages)) +
+            Buffer.byteLength(JSON.stringify(body.tools ?? []))) /
+            4 +
+            body.max_tokens >
+            maximumContext)
+      ) {
+        response.writeHead(400, { 'content-type': 'application/json' });
+        response.end(
+          JSON.stringify({
+            error: { message: 'Context length exceeded: Synthetic fixture request.' },
+          }),
+        );
+        return;
+      }
+      const action = summarizing ? undefined : actions?.[step - 1];
+      const toolCall = Boolean(action) || (step > 0 && step <= toolCalls);
+      const delta = toolCall
+        ? {
+            role: 'assistant',
+            tool_calls: Array.from({ length: callsPerStep }, (_, index) => ({
+              index,
+              id: `inspect-${step}-${index}`,
+              type: 'function',
+              function: {
+                name: action?.name ?? (index ? `inspect_fixture_${index}` : 'inspect_fixture'),
+                arguments: JSON.stringify(action?.args ?? {}),
+              },
+            })),
+          }
+        : {
+            role: 'assistant',
+            content: summarizing
+              ? toolCalls
+                ? 'Synthetic summary: Inspect the synthetic fixture.'
+                : 'Synthetic summary'
+              : 'Synthetic answer',
+          };
+      const promptTokens =
+        body.model === 'fixture-large'
+          ? 100_000
+          : toolCalls
+            ? Math.max(1000, (step - 1) * 13_000 + 1000)
+            : 1000;
+      response.writeHead(200, { 'content-type': 'text/event-stream' });
+      response.end(
+        chunk({
+          id: `context-${bodies.length}`,
+          choices: [{ index: 0, delta }],
+        }) +
+          chunk({
+            id: `context-${bodies.length}`,
+            choices: [
+              {
+                index: 0,
+                delta: {},
+                finish_reason: toolCall
+                  ? 'tool_calls'
+                  : summarizing && summaryOverflow === 'output-limit'
+                    ? 'length'
+                    : 'stop',
+              },
+            ],
+            usage: {
+              prompt_tokens: promptTokens,
+              completion_tokens: 2,
+              total_tokens: promptTokens + 2,
+            },
+          }) +
+          'data: [DONE]\n\n',
+      );
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const url = `http://127.0.0.1:${(server.address() as import('node:net').AddressInfo).port}/v1`;
+  return {
+    bodies,
+    summary,
+    url,
+    close: () => new Promise<void>((resolve) => server.close(() => resolve())),
+  };
+}
+
+test('Pi recovers a text companion overflow under an audio model selection', async (t) => {
+  const { nativeAudioModel } = await import('../src/providers/pi/model-catalog.ts');
+  const { bodies, summary, url, close } = await contextRecoveryServer(0, 1, 1);
+  t.after(close);
+  const directory = await mkdtemp(join(tmpdir(), 'nod-pi-companion-overflow-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const text = smallContextAccess('compatible', 'fixture-text', 8192).definition;
+  text.spec = { ...text.spec, provider: 'openai', baseUrl: url };
+  const events: AgentEvent[] = [];
+  const agent = createPiAgent({
+    provider: 'openai',
+    sessionRoot: directory,
+    resolve: async () => ({
+      provider: 'openai',
+      method: 'api_key',
+      effort: 'off',
+      read: async () => ({ type: 'api_key', key: 'fixture-key' }),
+      definition: {
+        choice: { ...text.choice, id: nativeAudioModel.id, audio: true },
+        spec: { ...nativeAudioModel, baseUrl: url },
+      },
+      textModel: { definition: text, effort: 'off' },
+    }),
+  });
+  t.after(() => agent.dispose());
+  const session = await agent.open({
+    ...fakeExecution(randomUUID()),
+    restricted: true,
+    systemPrompt: 'Synthetic instructions.',
+    workspace: recordingWorkspace().workspace,
+    tools: [],
+    runTool: async (_name, _params, run) => run(),
+    shouldStop: () => false,
+    onEvent: (event) => events.push(event),
+  });
+  t.after(() => session.dispose());
+  await session.prompt('Answer the synthetic typed request.', []);
+  assert.deepEqual(bodies.map(summary), [false, true, false]);
+  assert.ok(bodies.every((body) => body.model === 'fixture-text'));
+  assert.equal(events.findLast((event) => event.type === 'final')?.text, 'Synthetic answer');
+  assert.ok(
+    events.some(
+      (event) =>
+        event.type === 'provider_usage' &&
+        event.usage.operation === 'compaction' &&
+        event.usage.model === 'fixture-text' &&
+        event.usage.status === 'succeeded',
+    ),
+  );
+});
+
+test('a provider-reported mid-turn context overflow compacts without repeating tools', async (t) => {
+  for (const variant of [
+    'summary',
+    'summary-overflow',
+    'summary-output-limit',
+    'short-history',
+  ] as const)
+    await t.test(variant, async (t) => {
+      const count = variant === 'short-history' ? 1 : 7;
+      const { bodies, summary, url, close } = await contextRecoveryServer(
+        count,
+        1,
+        count + 1,
+        variant === 'summary-output-limit' ? 'output-limit' : variant === 'summary-overflow',
+      );
+      t.after(close);
+      const access = smallContextAccess('compatible', 'fixture-context', 131_072);
+      access.read = async () => ({ type: 'endpoint', url, key: 'fixture-key' });
+      access.definition.spec = { ...access.definition.spec, baseUrl: url };
+      const directory = await mkdtemp(join(tmpdir(), 'nod-pi-tool-overflow-'));
+      t.after(() => rm(directory, { recursive: true, force: true }));
+      const sessionId = randomUUID();
+      const events: AgentEvent[] = [];
+      let toolCalls = 0;
+      const agent = createPiAgent({
+        provider: 'compatible',
+        sessionRoot: directory,
+        resolve: async () => access,
+      });
+      t.after(() => agent.dispose());
+      const session = await agent.open({
+        ...fakeExecution(sessionId),
+        restricted: true,
+        systemPrompt: 'Synthetic fixture instructions.',
+        workspace: recordingWorkspace().workspace,
+        runTool: async (_name, _params, run) => run(),
+        tools: [
+          {
+            name: 'inspect_fixture',
+            description: 'Inspect the synthetic fixture.',
+            parameters: Type.Object({}),
+            execute: async () => ({
+              content: [
+                {
+                  type: 'text',
+                  text:
+                    'Synthetic tool result ' +
+                    ++toolCalls +
+                    ': ' +
+                    'filler words '.repeat(variant === 'short-history' ? 1 : 4_615),
+                },
+              ],
+            }),
+          },
+        ],
+        shouldStop: () => false,
+        onEvent: (event) => events.push(event),
+      });
+      await session.prompt('Inspect the synthetic fixture.', []);
+      await session.dispose();
+      assert.equal(toolCalls, count);
+      assert.deepEqual(
+        events.flatMap((event) => (event.type === 'final' ? [event.text] : [])),
+        ['Synthetic answer'],
+        JSON.stringify({
+          errors: events.flatMap((event) => (event.type === 'error' ? [event.message] : [])),
+          requests: bodies.filter((body) => !summary(body)).length,
+        }),
+      );
+      assert.ok(
+        events.some(
+          (event) =>
+            event.type === 'provider_usage' &&
+            event.usage.operation === 'compaction' &&
+            event.usage.status === 'succeeded',
+        ),
+      );
+      assert.equal(bodies.filter(summary).length, 1);
+      if (variant === 'summary-output-limit') {
+        const usages = events.flatMap((event) =>
+          event.type === 'provider_usage' && event.usage.operation === 'compaction'
+            ? [event.usage]
+            : [],
+        );
+        assert.equal(
+          usages.reduce((total, usage) => total + (usage.outputTokens ?? 0), 0),
+          2,
+        );
+        assert.ok(
+          !JSON.stringify(
+            openLocalSession(join(directory, sessionId)).buildSessionContext(),
+          ).includes('Synthetic summary:'),
+        );
+      }
+      const summaryRequest = bodies.find(summary);
+      assert.ok(summaryRequest);
+      assert.ok(JSON.stringify(summaryRequest.messages).includes('Inspect the synthetic fixture.'));
+      const answer = bodies.findLast((body) => !summary(body));
+      assert.ok(answer);
+      const sent = JSON.stringify(answer.messages);
+      assert.ok(sent.includes('Inspect the synthetic fixture.'));
+      if (count > 1) {
+        assert.ok(sent.includes(`Synthetic tool result ${count}:`));
+        assert.ok(!sent.includes('Synthetic tool result 1:'));
+      }
+      const restored = openLocalSession(join(directory, sessionId));
+      assert.ok(restored.getEntries().some((entry) => entry.type === 'compaction'));
+      assert.ok(
+        restored
+          .getEntries()
+          .some(
+            (entry) =>
+              entry.type === 'message' &&
+              entry.message.role === 'toolResult' &&
+              JSON.stringify(entry.message.content).includes('Synthetic tool result 1:'),
+          ),
+      );
+    });
+});
+
+test('oversized owner input stays complete in the workspace and permits later turns', async (t) => {
+  const window = 16_384;
+  const { bodies, url, close } = await contextRecoveryServer(0, 1, -1, false, window);
+  t.after(close);
+  const access = smallContextAccess('compatible', 'fixture-context', window);
+  access.read = async () => ({ type: 'endpoint', url, key: 'fixture-key' });
+  access.definition.spec = { ...access.definition.spec, baseUrl: url };
+  const directory = await mkdtemp(join(tmpdir(), 'nod-pi-owner-capacity-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const { workspace, prefix, root } = await hostSandbox(t);
+  const events: AgentEvent[] = [];
+  const agent = createPiAgent({
+    provider: 'compatible',
+    sessionRoot: directory,
+    resolve: async () => access,
+  });
+  t.after(() => agent.dispose());
+  const sessionId = randomUUID();
+  const owner = 'Inspect these synthetic records.\n' + randomBytes(45_000).toString('hex');
+  for (const text of [owner, 'Reply OK.', 'Reply OK again.', 'A new short request.']) {
+    const session = await agent.open({
+      ...fakeExecution(sessionId),
+      restricted: true,
+      systemPrompt: 'Read the supplied records.',
+      workspace,
+      tools: [],
+      runTool: async (_name, _params, run) => run(),
+      shouldStop: () => false,
+      onEvent: (event) => events.push(event),
+    });
+    await session.prompt(text, []);
+    await session.dispose();
+  }
+  assert.deepEqual(
+    events.flatMap((event) => (event.type === 'final' ? [event.text] : [])),
+    Array(4).fill('Synthetic answer'),
+  );
+  assert.ok(!events.some((event) => event.type === 'error'));
+  assert.equal(bodies.length, 4);
+  const file = JSON.stringify(bodies[0]).match(/workspaceFile\\":\\"([^\\]+)\\"/)![1];
+  assert.equal(await readFile(join(workspace.path, file).replace(prefix, root), 'utf8'), owner);
+  assert.ok(
+    openLocalSession(join(directory, sessionId))
+      .getEntries()
+      .some(
+        (entry) =>
+          entry.type === 'message' &&
+          entry.message.role === 'user' &&
+          (typeof entry.message.content === 'string'
+            ? entry.message.content
+            : entry.message.content
+                .flatMap((part) => (part.type === 'text' ? [part.text] : []))
+                .join('\n')) === owner,
+      ),
+  );
+});
+
+test('a loaded schema that exceeds the request budget returns to deferred tools', async (t) => {
+  const window = 131_072;
+  const { bodies, url, close } = await contextRecoveryServer(2, 1, -1, false, window, [
+    { name: 'nod_tool_search', args: { query: 'synthetic_deferred_schema', limit: 1 } },
+    { name: 'synthetic_deferred_schema', args: {} },
+  ]);
+  t.after(close);
+  const access = smallContextAccess('compatible', 'fixture-context', window);
+  access.read = async () => ({ type: 'endpoint', url, key: 'fixture-key' });
+  access.definition.spec = { ...access.definition.spec, baseUrl: url };
+  const directory = await mkdtemp(join(tmpdir(), 'nod-pi-schema-capacity-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const { workspace, prefix, root } = await hostSandbox(t);
+  const events: AgentEvent[] = [];
+  let executions = 0;
+  const agent = createPiAgent({
+    provider: 'compatible',
+    sessionRoot: directory,
+    resolve: async () => access,
+  });
+  t.after(() => agent.dispose());
+  const description = 'Synthetic description. ' + 'x'.repeat(600_000);
+  const session = await agent.open({
+    ...fakeExecution(randomUUID()),
+    restricted: true,
+    systemPrompt: 'Use synthetic tools.',
+    workspace,
+    runTool: async (_name, _params, run) => run(),
+    tools: [
+      {
+        name: 'synthetic_deferred_schema',
+        description,
+        deferred: { namespace: 'synthetic', description: 'Synthetic tools.' },
+        parameters: Type.Object({}),
+        execute: async () => {
+          executions++;
+          return { content: [{ type: 'text', text: 'Synthetic result.' }] };
+        },
+      },
+    ],
+    shouldStop: () => false,
+    onEvent: (event) => events.push(event),
+  });
+  await session.prompt('Inspect the synthetic record.', []);
+  await session.dispose();
+  assert.equal(executions, 1);
+  assert.deepEqual(
+    events.flatMap((event) => (event.type === 'final' ? [event.text] : [])),
+    ['Synthetic answer'],
+  );
+  assert.ok(!events.some((event) => event.type === 'error'));
+  assert.equal(bodies.length, 3);
+  const files = await readdir(join(workspace.path, '.nod/outputs').replace(prefix, root));
+  const sources = await Promise.all(
+    files.map((file) =>
+      readFile(join(workspace.path, '.nod/outputs', file).replace(prefix, root), 'utf8'),
+    ),
+  );
+  assert.ok(sources.some((source) => source.includes(description)));
+});
+
+test('a failed request cannot remain inside a compaction checkpoint', async (t) => {
+  for (const prior of [false, true])
+    await t.test(prior ? 'with a valid checkpoint' : 'without a checkpoint', async (t) => {
+      const directory = await mkdtemp(join(tmpdir(), 'nod-pi-failed-checkpoint-'));
+      t.after(() => rm(directory, { recursive: true, force: true }));
+      const manager = openLocalSession(directory);
+      const first = manager.appendMessage({
+        role: 'user',
+        content: 'Earlier valid request.',
+        timestamp: 1,
+      });
+      const details = {
+        readFiles: ['synthetic-input.txt'],
+        modifiedFiles: ['synthetic-output.txt'],
+      };
+      if (prior) manager.appendCompaction('Earlier valid facts.', first, 1000, details);
+      manager.appendMessage(fauxAssistantMessage('Earlier valid answer.'));
+      const failed = manager.appendMessage({
+        role: 'user',
+        content: 'Withdraw this failed request.',
+        timestamp: 2,
+      });
+      manager.appendCompaction(
+        'Withdraw this failed request.\n' + 'x'.repeat(90_000),
+        failed,
+        23_000,
+      );
+      manager.appendMessage({
+        ...fauxAssistantMessage(''),
+        stopReason: 'error',
+        errorMessage: 'Context length exceeded.',
+      });
+      assert.equal(dropFailedInput(manager), true);
+      const reopened = openLocalSession(directory);
+      const context = JSON.stringify(reopened.buildSessionContext());
+      assert.ok(!context.includes('Withdraw this failed request.'));
+      assert.ok(context.includes(prior ? 'Earlier valid facts.' : 'Earlier valid request.'));
+      assert.ok(JSON.stringify(reopened.getEntries()).includes('Withdraw this failed request.'));
+      const checkpoint = reopened.getBranch().findLast((entry) => entry.type === 'compaction');
+      assert.ok(checkpoint?.type === 'compaction' && checkpoint.tokensBefore > 0);
+      if (prior) assert.deepEqual(checkpoint.details, details);
+      assert.equal(dropFailedInput(reopened), false);
+    });
+});
+
+test('an oversized saved summary becomes a bounded checkpoint', async (t) => {
+  const window = 16_384;
+  const { bodies, url, close } = await contextRecoveryServer(0, 1, -1, false, window);
+  t.after(close);
+  const access = smallContextAccess('compatible', 'fixture-context', window);
+  access.read = async () => ({ type: 'endpoint', url, key: 'fixture-key' });
+  access.definition.spec = { ...access.definition.spec, baseUrl: url };
+  const directory = await mkdtemp(join(tmpdir(), 'nod-pi-saved-summary-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const sessionId = randomUUID();
+  const saved = join(directory, sessionId);
+  await mkdir(saved);
+  const manager = openLocalSession(saved);
+  manager.appendMessage({ role: 'user', content: 'Earlier synthetic request.', timestamp: 1 });
+  const answer = manager.appendMessage(fauxAssistantMessage('Earlier work finished.'));
+  const summary = 'Earlier synthetic details. ' + 'x'.repeat(90_000);
+  manager.appendCompaction(summary, answer, 23_000);
+  const { workspace, prefix, root } = await hostSandbox(t);
+  const events: AgentEvent[] = [];
+  let piSession: Awaited<ReturnType<typeof createAgentSession>>['session'];
+  const agent = createPiAgent({
+    provider: 'compatible',
+    sessionRoot: directory,
+    resolve: async () => access,
+    createSession: async (options) => {
+      const result = await createAgentSession(options);
+      piSession = result.session;
+      return result;
+    },
+  });
+  t.after(() => agent.dispose());
+  const session = await agent.open({
+    ...fakeExecution(sessionId),
+    restricted: true,
+    systemPrompt: 'Answer the current request.',
+    workspace,
+    tools: [],
+    runTool: async (_name, _params, run) => run(),
+    shouldStop: () => false,
+    onEvent: (event) => events.push(event),
+  });
+  await session.prompt('Reply OK.', []);
+  piSession!.settingsManager.applyOverrides({ compaction: { keepRecentTokens: 0 } });
+  await piSession!.compact();
+  await session.dispose();
+  assert.deepEqual(
+    events.flatMap((event) => (event.type === 'final' ? [event.text] : [])),
+    ['Synthetic answer'],
+  );
+  assert.ok(bodies.length > 0);
+  const checkpoint = openLocalSession(saved)
+    .getBranch()
+    .findLast((entry) => entry.type === 'compaction');
+  assert.ok(checkpoint?.type === 'compaction' && checkpoint.summary.length < 4000);
+  const file = checkpoint.summary.match(/"workspaceFile":"([^"]+)"/)![1];
+  assert.ok(
+    (await readFile(join(workspace.path, file).replace(prefix, root), 'utf8')).includes(summary),
+  );
+});
+
+test('repeated parallel batches compact without repeating completed tools', async (t) => {
+  const window = 131_072;
+  const count = 16;
+  const steps = 12;
+  const { bodies, summary, url, close } = await contextRecoveryServer(
+    steps,
+    count,
+    -1,
+    false,
+    window,
+  );
+  t.after(close);
+  const access = smallContextAccess('compatible', 'fixture-context', window);
+  access.read = async () => ({ type: 'endpoint', url, key: 'fixture-key' });
+  access.definition.spec = { ...access.definition.spec, baseUrl: url };
+  const directory = await mkdtemp(join(tmpdir(), 'nod-pi-repeated-batches-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const events: AgentEvent[] = [];
+  let executions = 0;
+  const agent = createPiAgent({
+    provider: 'compatible',
+    sessionRoot: directory,
+    resolve: async () => access,
+  });
+  t.after(() => agent.dispose());
+  const session = await agent.open({
+    ...fakeExecution(randomUUID()),
+    restricted: true,
+    systemPrompt: 'Inspect synthetic records once.',
+    workspace: recordingWorkspace().workspace,
+    runTool: async (_name, _params, run) => run(),
+    tools: Array.from({ length: count }, (_, index) => ({
+      name: index ? `inspect_fixture_${index}` : 'inspect_fixture',
+      description: 'Read a synthetic record.',
+      parameters: Type.Object({}),
+      parallel: true,
+      execute: async () => {
+        executions++;
+        return { content: [{ type: 'text' as const, text: 'x'.repeat(3000) }] };
+      },
+    })),
+    shouldStop: () => false,
+    onEvent: (event) => events.push(event),
+  });
+  await session.prompt('Inspect the synthetic records.', []);
+  await session.dispose();
+  assert.equal(executions, steps * count);
+  assert.deepEqual(
+    events.flatMap((event) => (event.type === 'final' ? [event.text] : [])),
+    ['Synthetic answer'],
+  );
+  assert.ok(bodies.some(summary));
+});
+
+test('a dense single tool result stays within the model context', async (t) => {
+  const { bodies, summary, url, close } = await contextRecoveryServer(1);
+  t.after(close);
+  const access = smallContextAccess('compatible', 'fixture-context', 131_072);
+  access.read = async () => ({ type: 'endpoint', url, key: 'fixture-key' });
+  access.definition.spec = { ...access.definition.spec, baseUrl: url };
+  const directory = await mkdtemp(join(tmpdir(), 'nod-pi-dense-tool-result-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const events: AgentEvent[] = [];
+  let toolCalls = 0;
+  const agent = createPiAgent({
+    provider: 'compatible',
+    sessionRoot: directory,
+    resolve: async () => access,
+  });
+  t.after(() => agent.dispose());
+  const session = await agent.open({
+    ...fakeExecution(randomUUID()),
+    restricted: true,
+    systemPrompt: 'Synthetic fixture instructions. ' + 'instruction '.repeat(16_000),
+    workspace: recordingWorkspace().workspace,
+    runTool: async (_name, _params, run) => run(),
+    tools: [
+      {
+        name: 'inspect_fixture',
+        description: 'Inspect the synthetic fixture.',
+        parameters: Type.Object({}),
+        execute: async () => {
+          toolCalls++;
+          return { content: [{ type: 'text' as const, text: '漢'.repeat(65_536) }] };
+        },
+      },
+    ],
+    shouldStop: () => false,
+    onEvent: (event) => events.push(event),
+  });
+  await session.prompt('Inspect the synthetic fixture.', []);
+  await session.dispose();
+  assert.equal(
+    toolCalls,
+    1,
+    JSON.stringify(events.flatMap((event) => (event.type === 'error' ? [event.message] : []))),
+  );
+  assert.deepEqual(
+    events.flatMap((event) => (event.type === 'final' ? [event.text] : [])),
+    ['Synthetic answer'],
+    JSON.stringify(events.flatMap((event) => (event.type === 'error' ? [event.message] : []))),
+  );
+  const answer = bodies.findLast((body) => !summary(body));
+  assert.ok(answer);
+  assert.ok(JSON.stringify(answer.messages).includes('workspaceFile'));
+  assert.ok(!JSON.stringify(answer.messages).includes('漢'.repeat(65_536)));
+});
+
+test('large tool results stay in workspace after a completed turn', async (t) => {
+  const { bodies, summary, url, close } = await contextRecoveryServer(1);
+  t.after(close);
+  const access = smallContextAccess('compatible', 'fixture-context', 131_072);
+  access.read = async () => ({ type: 'endpoint', url, key: 'fixture-key' });
+  access.definition.spec = { ...access.definition.spec, baseUrl: url };
+  const directory = await mkdtemp(join(tmpdir(), 'nod-pi-completed-headroom-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const sessionId = randomUUID();
+  const sessionDirectory = join(directory, sessionId);
+  await mkdir(sessionDirectory);
+  const manager = openLocalSession(sessionDirectory);
+  const earlier = '舊'.repeat(105_000);
+  manager.appendMessage({ role: 'user', content: earlier, timestamp: 1 });
+  manager.appendMessage(fauxAssistantMessage('Earlier work ended.'));
+  let toolCalls = 0;
+  const events: AgentEvent[] = [];
+  const agent = createPiAgent({
+    provider: 'compatible',
+    sessionRoot: directory,
+    resolve: async () => access,
+  });
+  t.after(() => agent.dispose());
+  const session = await agent.open({
+    ...fakeExecution(sessionId),
+    restricted: true,
+    systemPrompt: 'Synthetic fixture instructions.',
+    workspace: recordingWorkspace().workspace,
+    runTool: async (_name, _params, run) => run(),
+    tools: [
+      {
+        name: 'inspect_fixture',
+        description: 'Inspect the synthetic fixture.',
+        parameters: Type.Object({}),
+        execute: async () => {
+          toolCalls++;
+          return { content: [{ type: 'text' as const, text: '新'.repeat(30_000) }] };
+        },
+      },
+    ],
+    shouldStop: () => false,
+    onEvent: (event) => events.push(event),
+  });
+  t.after(() => session.dispose());
+  await session.prompt('Inspect the new synthetic fixture.', []);
+  assert.equal(toolCalls, 1);
+  assert.deepEqual(
+    events.flatMap((event) => (event.type === 'final' ? [event.text] : [])),
+    ['Synthetic answer'],
+    JSON.stringify(events.flatMap((event) => (event.type === 'error' ? [event.message] : []))),
+  );
+  assert.equal(bodies.filter(summary).length, 0);
+  const answer = bodies.findLast((body) => !summary(body));
+  assert.ok(answer);
+  const sent = JSON.stringify(answer.messages);
+  assert.ok(sent.includes(earlier));
+  assert.ok(sent.includes('workspaceFile'));
+  assert.ok(!sent.includes('新'.repeat(30_000)));
+});
+
+test('parallel tool results share the remaining model context', async (t) => {
+  const { bodies, summary, url, close } = await contextRecoveryServer(1, 2);
+  t.after(close);
+  const access = smallContextAccess('compatible', 'fixture-context', 131_072);
+  access.read = async () => ({ type: 'endpoint', url, key: 'fixture-key' });
+  access.definition.spec = { ...access.definition.spec, baseUrl: url };
+  const directory = await mkdtemp(join(tmpdir(), 'nod-pi-parallel-tool-results-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const events: AgentEvent[] = [];
+  let toolCalls = 0;
+  const agent = createPiAgent({
+    provider: 'compatible',
+    sessionRoot: directory,
+    resolve: async () => access,
+  });
+  t.after(() => agent.dispose());
+  const tool = (name: string) => ({
+    name,
+    description: 'Inspect a synthetic fixture.',
+    parameters: Type.Object({}),
+    parallel: true,
+    execute: async () => {
+      toolCalls++;
+      return { content: [{ type: 'text' as const, text: '漢'.repeat(50_000) }] };
+    },
+  });
+  const session = await agent.open({
+    ...fakeExecution(randomUUID()),
+    restricted: true,
+    systemPrompt: 'Synthetic fixture instructions. ' + 'instruction '.repeat(10_000),
+    workspace: recordingWorkspace().workspace,
+    runTool: async (_name, _params, run) => run(),
+    tools: [tool('inspect_fixture'), tool('inspect_fixture_1')],
+    shouldStop: () => false,
+    onEvent: (event) => events.push(event),
+  });
+  await session.prompt('Inspect both synthetic fixtures.', []);
+  await session.dispose();
+  assert.equal(toolCalls, 2);
+  assert.deepEqual(
+    events.flatMap((event) => (event.type === 'final' ? [event.text] : [])),
+    ['Synthetic answer'],
+    JSON.stringify(events.flatMap((event) => (event.type === 'error' ? [event.message] : []))),
+  );
+  const answer = bodies.findLast((body) => !summary(body));
+  assert.ok(answer);
+  assert.equal(JSON.stringify(answer.messages).match(/workspaceFile/g)?.length, 2);
+});
+
+test('a parallel batch of individually bounded tool results fits the next model request', async (t) => {
+  const window = 131_072;
+  const count = 16;
+  const { bodies, summary, url, close } = await contextRecoveryServer(1, count, -1, false, window);
+  t.after(close);
+  const access = smallContextAccess('compatible', 'fixture-context', window);
+  access.read = async () => ({ type: 'endpoint', url, key: 'fixture-key' });
+  access.definition.spec = { ...access.definition.spec, baseUrl: url };
+  const directory = await mkdtemp(join(tmpdir(), 'nod-pi-parallel-batch-context-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const events: AgentEvent[] = [];
+  const executions = new Map<string, number>();
+  const workspace = await hostSandbox(t);
+  const agent = createPiAgent({
+    provider: 'compatible',
+    sessionRoot: directory,
+    resolve: async () => access,
+  });
+  t.after(() => agent.dispose());
+  const session = await agent.open({
+    ...fakeExecution(randomUUID()),
+    restricted: true,
+    systemPrompt: 'Inspect each synthetic record once and report the result.',
+    workspace: workspace.workspace,
+    runTool: async (_name, _params, run) => run(),
+    tools: Array.from({ length: count }, (_, index) => {
+      const name = index ? `inspect_fixture_${index}` : 'inspect_fixture';
+      return {
+        name,
+        description: 'Inspect one synthetic record.',
+        parameters: Type.Object({}),
+        parallel: true,
+        execute: async () => {
+          executions.set(name, (executions.get(name) ?? 0) + 1);
+          return {
+            content: [
+              { type: 'text' as const, text: `Synthetic record ${index}: ` + 'x'.repeat(56_000) },
+            ],
+          };
+        },
+      };
+    }),
+    shouldStop: () => false,
+    onEvent: (event) => events.push(event),
+  });
+  await session.prompt('Inspect all sixteen synthetic records.', []);
+  await session.dispose();
+  assert.equal(executions.size, count);
+  assert.ok([...executions.values()].every((calls) => calls === 1));
+  assert.deepEqual(
+    events.flatMap((event) => (event.type === 'final' ? [event.text] : [])),
+    ['Synthetic answer'],
+    JSON.stringify(events.flatMap((event) => (event.type === 'error' ? [event.message] : []))),
+  );
+  const answer = bodies.findLast((body) => !summary(body));
+  assert.ok(answer);
+  assert.ok(bodies.every((body) => Buffer.byteLength(JSON.stringify(body.messages)) / 4 <= window));
+  assert.ok(JSON.stringify(answer.messages).includes('workspaceFile'));
+  const outputs = join(workspace.root, 'workspace', '.nod', 'outputs');
+  const files = await readdir(outputs);
+  assert.equal(files.length, count);
+  assert.deepEqual(
+    (await Promise.all(files.map((file) => readFile(join(outputs, file), 'utf8')))).sort(),
+    Array.from(
+      { length: count },
+      (_, index) => `Synthetic record ${index}: ` + 'x'.repeat(56_000),
+    ).sort(),
+  );
+});
+
+test('Pi recovers saved tool history across final deliveries, waits and model changes', async (t) => {
+  for (const ending of ['final', 'waiting', 'switched', 'switched-summary-overflow'] as const)
+    await t.test(ending, async (t) => {
+      const { bodies, summary, url, close } = await contextRecoveryServer(
+        0,
+        1,
+        1,
+        ending === 'switched-summary-overflow',
+      );
+      t.after(close);
+      const access = smallContextAccess('compatible', 'fixture-context', 272_000);
+      access.read = async () => ({ type: 'endpoint', url, key: 'fixture-key' });
+      access.definition.spec = { ...access.definition.spec, baseUrl: url };
+      const directory = await mkdtemp(join(tmpdir(), 'nod-pi-native-recovery-'));
+      t.after(() => rm(directory, { recursive: true, force: true }));
+      const sessionId = randomUUID();
+      const saved = join(directory, sessionId);
+      await mkdir(saved);
+      const manager = openLocalSession(saved);
+      const model = ending.startsWith('switched') ? 'fixture-previous' : 'fixture-context';
+      const message = {
+        ...fauxAssistantMessage(''),
+        model,
+        provider: 'compatible',
+        api: 'openai-completions' as const,
+        usage: {
+          input: 151_233,
+          output: 30,
+          cacheRead: 0,
+          cacheWrite: 0,
+          totalTokens: 151_263,
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+        },
+      };
+      manager.appendMessage({ role: 'user', content: 'Earlier synthetic request.', timestamp: 1 });
+      manager.appendMessage({
+        ...message,
+        content: [{ type: 'text', text: 'Earlier work finished.' }],
+      });
+      manager.appendMessage({
+        role: 'user',
+        content: 'Review the synthetic records.',
+        timestamp: 2,
+      });
+      for (let index = 0; index < 40; index++) {
+        manager.appendMessage({
+          ...message,
+          stopReason: 'toolUse',
+          content: [{ type: 'toolCall', id: `read-${index}`, name: 'read_fixture', arguments: {} }],
+        });
+        manager.appendMessage({
+          role: 'toolResult',
+          toolCallId: `read-${index}`,
+          toolName: 'read_fixture',
+          content: [
+            { type: 'text', text: `Synthetic record ${index}: ` + 'record data '.repeat(1800) },
+          ],
+          isError: false,
+          timestamp: index + 3,
+        });
+      }
+      const name = ending === 'waiting' ? 'sign_in' : 'send_message';
+      manager.appendMessage({
+        ...message,
+        stopReason: 'toolUse',
+        content: [
+          {
+            type: 'toolCall',
+            id: 'last-call',
+            name,
+            arguments: { intent: 'final', text: 'Complete.' },
+          },
+        ],
+      });
+      manager.appendMessage({
+        role: 'toolResult',
+        toolCallId: 'last-call',
+        toolName: name,
+        content: [
+          {
+            type: 'text',
+            text: ending === 'waiting' ? 'Waiting for private entry.' : '{"delivered":true}',
+          },
+        ],
+        isError: false,
+        timestamp: Date.now(),
+      });
+      assert.ok(
+        Buffer.byteLength(JSON.stringify(manager.buildSessionContext().messages)) / 3 > 272_000,
+      );
+      let toolCalls = 0;
+      const events: AgentEvent[] = [];
+      const agent = createPiAgent({
+        provider: 'compatible',
+        sessionRoot: directory,
+        resolve: async () => access,
+      });
+      t.after(() => agent.dispose());
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const session = await agent.open({
+          ...fakeExecution(sessionId),
+          restricted: true,
+          systemPrompt:
+            'Use the current owner instruction. Check uncertain actions before repeating them.',
+          workspace: recordingWorkspace().workspace,
+          runTool: async (_name, _params, run) => {
+            toolCalls++;
+            return run();
+          },
+          tools: [],
+          shouldStop: () => false,
+          onEvent: (event) => events.push(event),
+        });
+        await session.prompt('Reply OK.', []);
+        await session.dispose();
+      }
+      assert.equal(toolCalls, 0);
+      assert.deepEqual(
+        events.flatMap((event) => (event.type === 'final' ? [event.text] : [])),
+        ['Synthetic answer', 'Synthetic answer'],
+      );
+      assert.ok(
+        events.some(
+          (event) =>
+            event.type === 'provider_usage' &&
+            event.usage.operation === 'compaction' &&
+            event.usage.status === 'succeeded',
+        ),
+      );
+      assert.ok(bodies.some(summary));
+      const final = bodies.findLast((body) => !summary(body));
+      assert.ok(JSON.stringify(final).includes('Reply OK.'));
+      assert.ok(!JSON.stringify(final).includes('Synthetic record 0:'));
+      assert.ok(
+        openLocalSession(saved)
+          .getEntries()
+          .some(
+            (entry) =>
+              entry.type === 'message' &&
+              entry.message.role === 'toolResult' &&
+              JSON.stringify(entry.message.content).includes('Synthetic record 0:'),
+          ),
+      );
+    });
+});
+
+test('Pi stops failed or aborted summaries without a second request', async (t) => {
+  for (const failure of ['token-rate', 'aborted'] as const)
+    await t.test(failure, async (t) => {
+      const directory = await mkdtemp(join(tmpdir(), 'nod-pi-summary-failure-'));
+      t.after(() => rm(directory, { recursive: true, force: true }));
+      const sessionId = randomUUID();
+      const saved = join(directory, sessionId);
+      await mkdir(saved);
+      const manager = openLocalSession(saved);
+      for (const count of [40_000, 80_000]) {
+        manager.appendMessage({
+          role: 'user',
+          content: 'Synthetic earlier records: ' + 'data '.repeat(count),
+          timestamp: 1,
+        });
+        manager.appendMessage(fauxAssistantMessage('Earlier work finished.'));
+      }
+      const access = smallContextAccess('compatible', 'fixture-context', 272_000);
+      const requests: string[] = [];
+      const events: AgentEvent[] = [];
+      let failing = true;
+      const agent = createPiAgent({
+        provider: 'compatible',
+        sessionRoot: directory,
+        resolve: async () => access,
+        createSession: async (options) => {
+          const result = await createAgentSession(options);
+          result.session.agent.streamFunction = (model, context, options) => {
+            options?.signal?.throwIfAborted();
+            const summarizing =
+              JSON.stringify(context.messages).includes('<conversation>') ||
+              JSON.stringify(context.messages).includes('## Original Request');
+            requests.push(summarizing ? 'summary' : 'agent');
+            const message = {
+              ...fauxAssistantMessage(summarizing ? 'Partial summary.' : ''),
+              model: model.id,
+              provider: model.provider,
+              api: model.api,
+            };
+            const stream = createAssistantMessageEventStream();
+            if (!failing) {
+              assert.ok(
+                !JSON.stringify(context.messages).includes('Continue the synthetic request.'),
+              );
+              stream.push({
+                type: 'done',
+                reason: 'stop',
+                message: { ...message, content: [{ type: 'text', text: 'Fresh answer.' }] },
+              });
+              return stream;
+            }
+            if (summarizing && failure === 'aborted') {
+              assert.ok(options?.signal);
+              options.signal.addEventListener('abort', () => {
+                stream.push({
+                  type: 'error',
+                  reason: 'aborted',
+                  error: { ...message, stopReason: 'aborted' },
+                });
+              });
+              queueMicrotask(() => void result.session.abort());
+              return stream;
+            }
+            stream.push(
+              summarizing && failure === 'token-rate'
+                ? {
+                    type: 'error',
+                    reason: 'error',
+                    error: {
+                      ...message,
+                      stopReason: 'error',
+                      errorMessage:
+                        '413 request_too_large: tokens per minute (TPM): Limit 6000, Requested 12000',
+                    },
+                  }
+                : summarizing
+                  ? {
+                      type: 'done',
+                      reason: 'length',
+                      message: { ...message, stopReason: 'length' },
+                    }
+                  : {
+                      type: 'error',
+                      reason: 'error',
+                      error: {
+                        ...message,
+                        stopReason: 'error',
+                        errorMessage: 'Context length exceeded: Synthetic request.',
+                      },
+                    },
+            );
+            return stream;
+          };
+          return result;
+        },
+      });
+      t.after(() => agent.dispose());
+      const open = () =>
+        agent.open({
+          ...fakeExecution(sessionId),
+          restricted: true,
+          systemPrompt: 'Synthetic instructions.',
+          workspace: recordingWorkspace().workspace,
+          runTool: async (_name, _params, run) => run(),
+          tools: [],
+          shouldStop: () => false,
+          onEvent: (event) => events.push(event),
+        });
+      const session = await open();
+      t.after(() => session.dispose());
+      await session.prompt('Continue the synthetic request.', []);
+      assert.deepEqual(requests, ['agent', 'summary']);
+      assert.equal(dropFailedInput(openLocalSession(saved)), false);
+      assert.ok(
+        openLocalSession(saved)
+          .getEntries()
+          .some(
+            (entry) =>
+              entry.type === 'message' &&
+              entry.message.role === 'user' &&
+              JSON.stringify(entry.message.content).includes('Continue the synthetic request.'),
+          ),
+      );
+      assert.ok(
+        !JSON.stringify(openLocalSession(saved).buildSessionContext().messages).includes(
+          'Continue the synthetic request.',
+        ),
+      );
+      if (failure !== 'aborted')
+        assert.match(
+          events.filter((event) => event.type === 'error').at(-1)!.message,
+          /tokens per minute.*Limit 6000/,
+        );
+      assert.ok(
+        !openLocalSession(saved)
+          .getEntries()
+          .some((entry) => entry.type === 'compaction'),
+      );
+      assert.ok(
+        events.some(
+          (event) =>
+            event.type === 'provider_usage' &&
+            event.usage.operation === 'compaction' &&
+            event.usage.status === (failure === 'aborted' ? 'cancelled' : 'failed'),
+        ),
+      );
+      assert.ok(!events.some((event) => event.type === 'final'));
+      await session.dispose();
+      failing = false;
+      const fresh = await open();
+      t.after(() => fresh.dispose());
+      await fresh.prompt('Answer only this fresh request.', []);
+      assert.equal(events.findLast((event) => event.type === 'final')?.text, 'Fresh answer.');
+    });
+});
+
+test('inactive deferred tool schemas do not block a small-window pending request', async (t) => {
+  const { bodies, url, close } = await contextRecoveryServer();
+  t.after(close);
+  const access = smallContextAccess('compatible', 'fixture-small', 16_384);
+  access.read = async () => ({ type: 'endpoint', url, key: 'fixture-key' });
+  access.definition.spec = { ...access.definition.spec, baseUrl: url };
+  const directory = await mkdtemp(join(tmpdir(), 'nod-pi-deferred-overhead-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const sessionId = randomUUID();
+  const sessionDirectory = join(directory, sessionId);
+  await mkdir(sessionDirectory);
+  openLocalSession(sessionDirectory).appendMessage({
+    role: 'user',
+    content: 'Pending synthetic request.',
+    timestamp: Date.now() - 1000,
+  });
+  const events: AgentEvent[] = [];
+  const agent = createPiAgent({
+    provider: 'compatible',
+    sessionRoot: directory,
+    resolve: async () => access,
+  });
+  t.after(() => agent.dispose());
+  const session = await agent.open({
+    ...fakeExecution(sessionId),
+    restricted: true,
+    systemPrompt: 'Synthetic fixture instructions.',
+    workspace: recordingWorkspace().workspace,
+    runTool: async (_name, _params, run) => run(),
+    tools: [
+      {
+        name: 'synthetic_deferred_schema',
+        description: 'Synthetic deferred schema '.repeat(5000),
+        parameters: Type.Object({ path: Type.String() }),
+        execute: async () => ({ content: [{ type: 'text', text: 'Synthetic result.' }] }),
+      },
+    ],
+    shouldStop: () => false,
+    onEvent: (event) => events.push(event),
+  });
+  await session.prompt('Short synthetic follow-up.', []);
+  await session.dispose();
+  assert.deepEqual(
+    events.flatMap((event) => (event.type === 'final' ? [event.text] : [])),
+    ['Synthetic answer'],
+  );
+  assert.equal(bodies.length, 1);
+  assert.ok(JSON.stringify(bodies[0]!.messages).includes('Pending synthetic request.'));
+  assert.ok(JSON.stringify(bodies[0]!.messages).includes('Short synthetic follow-up.'));
+  assert.ok(
+    (bodies[0]!.tools ?? []).every(
+      (tool) => !JSON.stringify(tool).includes('synthetic_deferred_schema'),
+    ),
+  );
+});
+
+test('a discovered tool schema reduces the room for its next result', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'nod-pi-discovered-tool-overhead-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const access = smallContextAccess('compatible', 'fixture-small', 16_384);
+  const calls: Array<{ tools: string[]; messages: string }> = [];
+  const events: AgentEvent[] = [];
+  let toolCalls = 0;
+  const agent = createPiAgent({
+    provider: 'compatible',
+    sessionRoot: directory,
+    resolve: async () => access,
+    createSession: async (options) => {
+      const result = await createAgentSession(options);
+      result.session.agent.streamFunction = (_model, context) => {
+        calls.push({
+          tools: result.session.getActiveToolNames(),
+          messages: JSON.stringify(context.messages),
+        });
+        const step = calls.length;
+        const message = fauxAssistantMessage(
+          step === 1
+            ? [
+                {
+                  type: 'toolCall',
+                  id: 'discover',
+                  name: 'nod_tool_search',
+                  arguments: { query: 'synthetic_deferred_schema', limit: 1 },
+                },
+              ]
+            : step === 2
+              ? [
+                  {
+                    type: 'toolCall',
+                    id: 'inspect',
+                    name: 'synthetic_deferred_schema',
+                    arguments: {},
+                  },
+                ]
+              : 'Synthetic answer',
+          { stopReason: step < 3 ? 'toolUse' : 'stop' },
+        );
+        const stream = createAssistantMessageEventStream();
+        stream.push({ type: 'start', partial: message });
+        stream.push({ type: 'done', reason: step < 3 ? 'toolUse' : 'stop', message });
+        return stream;
+      };
+      return result;
+    },
+  });
+  t.after(() => agent.dispose());
+  const session = await agent.open({
+    ...fakeExecution(randomUUID()),
+    restricted: true,
+    systemPrompt: 'Synthetic fixture instructions.',
+    workspace: recordingWorkspace().workspace,
+    runTool: async (_name, _params, run) => run(),
+    tools: [
+      {
+        name: 'synthetic_deferred_schema',
+        description: 'Inspect synthetic results. ' + '漢'.repeat(8_000),
+        parameters: Type.Object({}),
+        execute: async () => {
+          toolCalls++;
+          return {
+            content: [{ type: 'text' as const, text: 'Synthetic result: ' + '漢'.repeat(4_000) }],
+          };
+        },
+      },
+    ],
+    shouldStop: () => false,
+    onEvent: (event) => events.push(event),
+  });
+  await session.prompt('Inspect the synthetic result. ' + '漢'.repeat(4_000), []);
+  await session.dispose();
+  assert.equal(toolCalls, 1);
+  assert.equal(calls.length, 3);
+  assert.ok(!calls[0]!.tools.includes('synthetic_deferred_schema'));
+  assert.ok(
+    calls[1]!.tools.includes('synthetic_deferred_schema'),
+    JSON.stringify(calls.map((call) => call.tools)),
+  );
+  const lastResult = (
+    JSON.parse(calls[2]!.messages) as Array<{ role: string; content: unknown }>
+  ).findLast((message) => message.role === 'toolResult');
+  assert.ok(lastResult);
+  assert.ok(JSON.stringify(lastResult.content).includes('workspaceFile'));
+  assert.ok(!JSON.stringify(lastResult.content).includes('漢'.repeat(2_000)));
+  assert.deepEqual(
+    events.flatMap((event) => (event.type === 'final' ? [event.text] : [])),
+    ['Synthetic answer'],
+  );
 });
 
 test('model requests repair incomplete assistant blocks for both OpenRouter APIs', async (t) => {
@@ -4047,6 +5992,170 @@ test('Anthropic continues a rebased Pi session with incomplete assistant blocks'
   assert.ok(sent.includes('redacted_thinking'));
 });
 
+test('a connected tool schema outside draft 2020-12 neither fails nor sticks to later Anthropic turns', async (t) => {
+  const { createServer } = await import('node:http');
+  const { Compile } = await import('typebox/compile');
+  const { Meta } = await import('typebox/schema');
+  const draft = Compile(Meta['https://json-schema.org/draft/2020-12/schema'] as never);
+  const replies: Array<Record<string, unknown>> = [
+    { type: 'tool_use', id: 'toolu_search', name: 'nod_tool_search', input: { query: 'board' } },
+    { type: 'text', text: 'Loaded.' },
+    { type: 'text', text: 'Second turn.' },
+  ];
+  const sent: Array<Record<string, any>> = [];
+  const schemas = (value: unknown): Array<Record<string, unknown>> =>
+    Array.isArray(value)
+      ? value.flatMap(schemas)
+      : value && typeof value === 'object'
+        ? Object.entries(value).flatMap(([key, item]) =>
+            key === 'input_schema' ? [item as Record<string, unknown>] : schemas(item),
+          )
+        : [];
+  const server = createServer((request, response) => {
+    const parts: Buffer[] = [];
+    request.on('data', (part) => parts.push(part));
+    request.on('end', () => {
+      const body = JSON.parse(Buffer.concat(parts).toString());
+      sent.push(body);
+      if (!schemas(body).every((schema) => draft.Check(schema))) {
+        response.writeHead(400, { 'content-type': 'application/json' });
+        response.end(
+          JSON.stringify({
+            type: 'error',
+            error: {
+              type: 'invalid_request_error',
+              message:
+                'messages.3.content.0.tool.definition.input_schema: JSON schema is invalid. It must match JSON Schema draft 2020-12 (https://json-schema.org/draft/2020-12).',
+            },
+          }),
+        );
+        return;
+      }
+      const block = replies.shift()!;
+      const events = [
+        {
+          type: 'message_start',
+          message: {
+            id: 'synthetic-schema',
+            type: 'message',
+            role: 'assistant',
+            model: 'fixture-anthropic',
+            content: [],
+            stop_reason: null,
+            stop_sequence: null,
+            usage: { input_tokens: 10, output_tokens: 0 },
+          },
+        },
+        {
+          type: 'content_block_start',
+          index: 0,
+          content_block:
+            block.type === 'tool_use' ? { ...block, input: {} } : { ...block, text: '' },
+        },
+        {
+          type: 'content_block_delta',
+          index: 0,
+          delta:
+            block.type === 'tool_use'
+              ? { type: 'input_json_delta', partial_json: JSON.stringify(block.input) }
+              : { type: 'text_delta', text: block.text },
+        },
+        { type: 'content_block_stop', index: 0 },
+        {
+          type: 'message_delta',
+          delta: {
+            stop_reason: block.type === 'tool_use' ? 'tool_use' : 'end_turn',
+            stop_sequence: null,
+          },
+          usage: { output_tokens: 2 },
+        },
+        { type: 'message_stop' },
+      ];
+      response.writeHead(200, { 'content-type': 'text/event-stream' });
+      response.end(
+        events
+          .map((event) => 'event: ' + event.type + '\ndata: ' + JSON.stringify(event) + '\n\n')
+          .join(''),
+      );
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise<void>((resolve) => server.close(() => resolve())));
+  const url = 'http://127.0.0.1:' + (server.address() as import('node:net').AddressInfo).port;
+  const access = smallContextAccess('compatible', 'fixture-anthropic', 200_000);
+  access.provider = 'anthropic';
+  access.read = async () => ({ type: 'api_key', key: 'synthetic-key' });
+  access.definition.spec = {
+    ...access.definition.spec,
+    provider: 'anthropic',
+    api: 'anthropic-messages',
+    baseUrl: url,
+    compat: { supportsMidConvoSystemMessages: true, supportsMidConvoToolChanges: true },
+  };
+  const directory = await mkdtemp(join(tmpdir(), 'nod-anthropic-schema-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const agent = createPiAgent({
+    provider: 'anthropic',
+    sessionRoot: directory,
+    resolve: async () => access,
+  });
+  t.after(() => agent.dispose());
+  const execution = fakeExecution(randomUUID());
+  const observed: AgentEvent[] = [];
+  const open = () =>
+    agent.open({
+      ...execution,
+      restricted: true,
+      systemPrompt: 'Use synthetic tools.',
+      workspace: recordingWorkspace().workspace,
+      runTool: async (_name, _params, run) => run(),
+      tools: [
+        {
+          name: 'mcp__synthetic__board_edit',
+          description: 'Synthetic board tool.',
+          deferred: { namespace: 'synthetic', description: 'Synthetic board server.' },
+          parameters: {
+            type: 'object',
+            properties: {
+              board: { type: 'string', minLength: 1 },
+              point: { type: 'array', items: [{ type: 'number' }, { type: 'number' }] },
+              scale: { type: 'number', minimum: 0, exclusiveMinimum: true },
+            },
+            required: ['board'],
+          } as never,
+          execute: async () => ({ content: [{ type: 'text', text: 'Synthetic result.' }] }),
+        },
+      ],
+      shouldStop: () => false,
+      onEvent: (event) => observed.push(event),
+    });
+  for (const prompt of ['Open the synthetic board.', 'Continue.']) {
+    const session = await open();
+    await session.prompt(prompt, []);
+    await session.dispose();
+  }
+  assert.deepEqual(
+    observed.flatMap((event) => (event.type === 'error' ? [event] : [])),
+    [],
+  );
+  assert.deepEqual(
+    observed.flatMap((event) => (event.type === 'final' ? [event.text] : [])),
+    ['Loaded.', 'Second turn.'],
+  );
+  const added = schemas(sent.at(-1)!.messages).find(
+    (schema) => (schema.properties as Record<string, unknown> | undefined)?.board,
+  );
+  assert.deepEqual(added, {
+    type: 'object',
+    properties: {
+      board: { type: 'string', minLength: 1 },
+      point: { type: 'array' },
+      scale: { type: 'number', minimum: 0 },
+    },
+    required: ['board'],
+  });
+});
+
 test('full 32k Pi sessions distinguish context exhaustion from output truncation on continue', async (t) => {
   const { createServer } = await import('node:http');
   const { createPiModelBackend } = await import('../src/providers/pi/models.ts');
@@ -4201,6 +6310,7 @@ test('full 32k Pi sessions distinguish context exhaustion from output truncation
   assert.ok(outputLimit.outcome.failure);
   assert.deepEqual(outputLimit.ending, { type: 'message_end', status: 'incomplete' });
   assert.equal(bodies.length, 1);
+  assert.equal(bodies[0].max_tokens, 8192);
   assert.equal(outputLimit.usage[0].outputTokens, bodies[0].max_tokens);
   assert.ok(outputLimit.usage[0].totalTokens < 32_768);
 
@@ -4208,8 +6318,8 @@ test('full 32k Pi sessions distinguish context exhaustion from output truncation
   const exhausted = [];
   for (const prompt of ['yes', 'continue', 'continue'])
     exhausted.push(await turn('fixture-full-context', prompt));
-  assert.equal(scripts.length, 1);
-  assert.ok(scripts[0].includes('fixture-list-calendars'));
+  assert.ok(bodies.some((body) => !body.tools?.length));
+  assert.equal(scripts.filter((script) => script.includes('fixture-list-calendars')).length, 1);
   for (const attempt of exhausted)
     assert.ok(
       attempt.usage.some((usage) => usage.inputTokens === 32_750 && usage.outputTokens === 17),
@@ -4227,6 +6337,121 @@ test('full 32k Pi sessions distinguish context exhaustion from output truncation
       contextExhausted: true,
     });
   }
+});
+
+test('the live line shows a model retry and the text before a tool call while the call streams', async (t) => {
+  const { createServer } = await import('node:http');
+  const { createPiModelBackend } = await import('../src/providers/pi/models.ts');
+  const directory = await mkdtemp(join(tmpdir(), 'nod-pi-live-line-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const preamble = 'Checking the synthetic notes.';
+  let stepShown!: () => void;
+  const shown = new Promise<'step'>((resolve) => (stepShown = () => resolve('step')));
+  let released: 'step' | 'timeout' | undefined;
+  let requests = 0;
+  const server = createServer((request, response) => {
+    request.resume();
+    request.on('end', async () => {
+      const send = (delta: object, finish?: string) =>
+        response.write(
+          `data: ${JSON.stringify({
+            id: `fixture-live-${requests}`,
+            choices: [{ index: 0, delta, ...(finish ? { finish_reason: finish } : {}) }],
+            ...(finish
+              ? { usage: { prompt_tokens: 100, completion_tokens: 10, total_tokens: 110 } }
+              : {}),
+          })}\n\n`,
+        );
+      if (request.url === '/v1/models')
+        return response.end(
+          JSON.stringify({ data: [{ id: 'fixture-qwen', context_length: 32_768 }] }),
+        );
+      if (request.url !== '/v1/chat/completions') {
+        response.writeHead(404);
+        return response.end('{}');
+      }
+      if (++requests === 1) {
+        response.writeHead(503, { 'content-type': 'application/json' });
+        return response.end(
+          JSON.stringify({ error: { message: 'The synthetic model is overloaded.' } }),
+        );
+      }
+      response.writeHead(200, { 'content-type': 'text/event-stream' });
+      if (requests === 3) {
+        send({ role: 'assistant', content: 'Partial synthetic update.' });
+        return response.end();
+      }
+      if (requests > 3) {
+        send({ role: 'assistant', content: 'The synthetic notes are read.' });
+        send({}, 'stop');
+        return response.end('data: [DONE]\n\n');
+      }
+      send({ role: 'assistant', content: preamble });
+      send({
+        tool_calls: [
+          {
+            index: 0,
+            id: 'fixture-notes',
+            type: 'function',
+            function: { name: 'bash', arguments: '' },
+          },
+        ],
+      });
+      let timer: ReturnType<typeof globalThis.setTimeout> | undefined;
+      released = await Promise.race([
+        shown,
+        new Promise<'timeout'>(
+          (resolve) => (timer = globalThis.setTimeout(() => resolve('timeout'), 5000)),
+        ),
+      ]);
+      clearTimeout(timer);
+      send({
+        tool_calls: [
+          { index: 0, function: { arguments: JSON.stringify({ command: 'fixture-read-notes' }) } },
+        ],
+      });
+      send({}, 'tool_calls');
+      response.end('data: [DONE]\n\n');
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise<void>((resolve) => server.close(() => resolve())));
+  const { port } = server.address() as import('node:net').AddressInfo;
+  const credential = { type: 'endpoint' as const, url: `http://127.0.0.1:${port}/v1` };
+  const [definition] = await createPiModelBackend().catalog('compatible', 'api_key', credential);
+  const agent = createPiAgent({
+    provider: 'compatible',
+    sessionRoot: join(directory, 'sessions'),
+    resolve: async () => ({
+      provider: 'compatible',
+      method: 'api_key',
+      definition,
+      effort: 'off',
+      read: async () => credential,
+    }),
+  });
+  const { workspace, scripts } = recordingWorkspace();
+  const runtime = createAgentRuntime({
+    agent,
+    computer: fakeComputer(),
+    workspace: fakeWorkspace({ open: () => workspace }),
+  });
+  t.after(() => runtime.dispose());
+  const emitted: Array<[string, string]> = [];
+  await runtime.runTurn({
+    ...context(directory),
+    sessionId: 'fixture-live-line',
+    turnId: randomUUID(),
+    prompt: 'Read the synthetic notes.',
+    emit: async (type, summary) => {
+      emitted.push([type, summary]);
+      if (type === 'step' && summary === preamble) stepShown();
+    },
+  });
+  assert.equal(released, 'step');
+  assert.equal(scripts.filter((script) => script.includes('fixture-read-notes')).length, 1);
+  assert.equal(requests, 4);
+  assert.ok(emitted.find(([type]) => type === 'retry')?.[1].includes(definition.choice.name));
 });
 
 test('OpenAI cache boundaries cover shared instructions and keep task paths outside them', async () => {
@@ -4303,6 +6528,66 @@ test('OpenAI cache boundaries cover shared instructions and keep task paths outs
   assert.ok(!JSON.stringify(bodies[2]).includes('prompt_cache_breakpoint'));
   assert.deepEqual(instructions[3].content, [instructions[0].content[0]]);
   assert.equal(bodies.length, 4);
+});
+
+test('a model request with no response after it is sent times out for a retry, while a stop stays a cancellation', async (t) => {
+  const { createPiModelBackend, createPiModelRuntime, modelFirstEventMs } =
+    await import('../src/providers/pi/models.ts');
+  const { isRetryableAssistantError } = await import('@earendil-works/pi-ai');
+  const backend = createPiModelBackend({
+    fetch: async () => {
+      throw new Error('No live catalog request is allowed.');
+    },
+  });
+  const definition = (await backend.catalog('openai', 'api_key')).find(
+    ({ choice }) => choice.id === 'gpt-6.1-sol',
+  )!;
+  const { runtime, model } = await createPiModelRuntime({
+    provider: 'openai',
+    method: 'api_key',
+    definition,
+    effort: 'low',
+    read: async () => ({ type: 'api_key', key: 'fixture-key' }),
+  });
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  let abortedAtSend: boolean | undefined;
+  const silent = async (stop?: AbortController, slowPreparation = false) => {
+    abortedAtSend = undefined;
+    let sent!: () => void;
+    const requested = new Promise<void>((resolve) => (sent = resolve));
+    const result = runtime.completeSimple(
+      model,
+      { messages: [{ role: 'user', content: 'Synthetic request', timestamp: 1 }] },
+      {
+        signal: stop?.signal,
+        ...(slowPreparation
+          ? { onPayload: async () => void t.mock.timers.tick(modelFirstEventMs) }
+          : {}),
+        fetch: (_input, init) =>
+          new Promise<Response>((_resolve, reject) => {
+            const abort = () =>
+              reject(Object.assign(new Error('Synthetic abort'), { name: 'AbortError' }));
+            abortedAtSend = init?.signal?.aborted;
+            if (abortedAtSend) abort();
+            init?.signal?.addEventListener('abort', abort);
+            sent();
+          }),
+      },
+    );
+    await Promise.race([requested, result]);
+    if (stop) stop.abort();
+    else t.mock.timers.tick(modelFirstEventMs);
+    return result;
+  };
+  const timedOut = await silent();
+  assert.equal(timedOut.stopReason, 'error');
+  assert.match(timedOut.errorMessage!, /sent no response for 90 seconds, so the request timed out/);
+  assert.equal(isRetryableAssistantError(timedOut), true);
+  const slow = await silent(undefined, true);
+  assert.equal(abortedAtSend, false);
+  assert.match(slow.errorMessage!, /sent no response for 90 seconds/);
+  const stopped = await silent(new AbortController());
+  assert.equal(stopped.stopReason, 'aborted');
 });
 
 test('Anthropic cache boundaries preserve the shared text, workspace suffix, lifetime and marker budget', async () => {
@@ -4547,8 +6832,19 @@ test('OpenAI-compatible servers get tool models, a system message and one attemp
       parameters: 'num_ctx 65536',
       thinking: { values: ['low', 'medium', 'high'] },
     },
-    'fixture-chat:1b': { capabilities: ['completion'], model_info: {} },
-    'fixture-embed': { capabilities: ['embedding'], model_info: {} },
+    'fixture-unknown': {
+      model_info: { 'llama.context_length': 32768 },
+      thinking: { values: [false, true] },
+    },
+    'fixture-no-details': {},
+    'fixture-invalid': { capabilities: null, model_info: { 'llama.context_length': 16384 } },
+    'fixture-tools-only': {
+      capabilities: ['tools', 'vision'],
+      thinking: { values: [false, true] },
+    },
+    'fixture-empty': { capabilities: [] },
+    'fixture-chat:1b': { capabilities: ['completion'] },
+    'fixture-embed': { capabilities: ['embedding'] },
   };
   const bodies: Record<string, unknown>[] = [];
   const headers: (string | undefined)[] = [];
@@ -4594,6 +6890,34 @@ test('OpenAI-compatible servers get tool models, a system message and one attemp
         efforts: ['low', 'medium', 'high'],
         images: true,
         contextWindow: 65536,
+      },
+      {
+        id: 'fixture-unknown',
+        name: 'fixture-unknown',
+        efforts: ['off', 'high'],
+        images: false,
+        contextWindow: 32768,
+      },
+      {
+        id: 'fixture-no-details',
+        name: 'fixture-no-details',
+        efforts: ['off'],
+        images: false,
+        contextWindow: 128_000,
+      },
+      {
+        id: 'fixture-invalid',
+        name: 'fixture-invalid',
+        efforts: ['off'],
+        images: false,
+        contextWindow: 16384,
+      },
+      {
+        id: 'fixture-tools-only',
+        name: 'fixture-tools-only',
+        efforts: ['off'],
+        images: true,
+        contextWindow: 128_000,
       },
     ],
   );
@@ -4673,12 +6997,147 @@ test('OpenAI-compatible servers get tool models, a system message and one attemp
   );
   assert.equal(nativeRedirect.stopReason, 'error');
   assert.equal(bodies.length, 2);
+  const called = (id: string, from: string, timestamp: number) => [
+    {
+      ...fauxAssistantMessage(''),
+      provider: model.provider,
+      api: model.api,
+      model: from,
+      stopReason: 'toolUse' as const,
+      content: [{ type: 'toolCall' as const, id, name: 'read_fixture', arguments: {} }],
+      timestamp,
+    },
+    {
+      role: 'toolResult' as const,
+      toolCallId: id,
+      toolName: 'read_fixture',
+      content: [{ type: 'text' as const, text: 'Synthetic data' }],
+      isError: false,
+      timestamp,
+    },
+  ];
+  await runtime.completeSimple(
+    model,
+    {
+      messages: [
+        { role: 'user', content: 'Synthetic fixture', timestamp: 1 },
+        ...called('functions.read_fixture:12', 'fixture-other:8b', 2),
+        ...called('functions.read_fixture:13', model.id, 3),
+        { role: 'user', content: 'Synthetic follow-up', timestamp: 4 },
+      ],
+    },
+    {},
+  );
+  assert.equal(bodies.length, 3);
+  const replayed = (
+    bodies[2] as { messages: { tool_calls?: { id: string }[]; tool_call_id?: string }[] }
+  ).messages;
+  const calls = replayed.flatMap(({ tool_calls }) => tool_calls?.map(({ id }) => id) ?? []);
+  assert.match(calls[0], /^[A-Za-z0-9]{9}$/);
+  assert.equal(calls[1], 'functions.read_fixture:13');
+  assert.deepEqual(
+    replayed.flatMap(({ tool_call_id }) => tool_call_id ?? []),
+    calls,
+  );
+});
+
+test('OpenAI-compatible discovery checks each model and respects capabilities without model details', async (t) => {
+  const { createServer } = await import('node:http');
+  const { createPiModelBackend } = await import('../src/providers/pi/models.ts');
+  const ids = [
+    'fixture/no-tools-1',
+    'fixture/no-tools-2',
+    'fixture/no-tools-3',
+    'fixture/tool-model',
+  ];
+  const showRequests: string[] = [];
+  let activeShows = 0;
+  let mode: 'ollama' | 'localai' | 'ollama-no-tools' | 'generic' = 'ollama';
+  const ollamaWithoutTools = ['fixture/chat-model', 'fixture/embedding-model'];
+  const server = createServer((request, response) => {
+    let text = '';
+    request.on('data', (chunk) => (text += chunk));
+    request.on('end', () => {
+      const send = (body: unknown) => {
+        response.writeHead(200, { 'content-type': 'application/json' });
+        response.end(JSON.stringify(body));
+      };
+      if (request.url === '/v1/models')
+        return send({
+          data: (mode === 'ollama-no-tools' ? ollamaWithoutTools : ids).map((id) => ({ id })),
+        });
+      if (request.url === '/api/version' && mode !== 'generic') return send({ version: 'fixture' });
+      if (request.url === '/api/show') {
+        const id = (JSON.parse(text) as { model: string }).model;
+        showRequests.push(id);
+        if (activeShows === 3) {
+          response.writeHead(429, { 'content-type': 'application/json' });
+          return response.end(JSON.stringify({ error: 'fixture-probe-limit' }));
+        }
+        activeShows++;
+        const capabilities =
+          mode === 'ollama-no-tools'
+            ? [id === ollamaWithoutTools[1] ? 'embedding' : 'completion']
+            : id === ids[3] && mode === 'ollama'
+              ? ['completion', 'tools']
+              : ['completion'];
+        void setTimeout(50).then(() => {
+          activeShows--;
+          send({
+            capabilities,
+            ...(mode === 'localai' ? {} : { model_info: {} }),
+          });
+        });
+        return;
+      }
+      response.writeHead(404);
+      response.end();
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise<void>((resolve) => server.close(() => resolve())));
+  const { port } = server.address() as import('node:net').AddressInfo;
+  const credential = { type: 'endpoint' as const, url: `http://127.0.0.1:${port}/v1` };
+  const ollama = await createPiModelBackend().catalog('compatible', 'api_key', credential);
+  assert.deepEqual(
+    ollama.map(({ choice }) => choice.id),
+    [ids[3]],
+  );
+  assert.deepEqual(showRequests, ids);
+  mode = 'localai';
+  showRequests.length = 0;
+  const compatible = await createPiModelBackend().catalog('compatible', 'api_key', credential);
+  assert.deepEqual(compatible, []);
+  assert.deepEqual(showRequests, ids);
+  mode = 'ollama-no-tools';
+  showRequests.length = 0;
+  const unusable = await createPiModelBackend().catalog('compatible', 'api_key', credential);
+  assert.deepEqual(unusable, []);
+  assert.deepEqual(showRequests, ollamaWithoutTools);
+  mode = 'generic';
+  showRequests.length = 0;
+  const generic = await createPiModelBackend().catalog('compatible', 'api_key', credential);
+  assert.deepEqual(
+    generic.map(({ choice }) => choice.id),
+    ids,
+  );
+  assert.deepEqual(showRequests, []);
 });
 
 test('LM Studio servers list tool-trained chat models with their loaded context and vision', async (t) => {
   const { createServer } = await import('node:http');
   const { createPiModelBackend } = await import('../src/providers/pi/models.ts');
+  let ollamaVersion = false;
   const server = createServer((request, response) => {
+    if (ollamaVersion && (request.url === '/api/version' || request.url === '/api/show')) {
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.end(
+        JSON.stringify(
+          request.url === '/api/version' ? { version: 'fixture' } : { model_info: {} },
+        ),
+      );
+      return;
+    }
     const body =
       request.url === '/v1/models'
         ? {
@@ -4732,6 +7191,12 @@ test('LM Studio servers list tool-trained chat models with their loaded context 
       ['fixture/unlisted', false, 128_000, `http://127.0.0.1:${port}/v1`],
     ],
   );
+  ollamaVersion = true;
+  const aliased = await createPiModelBackend().catalog('compatible', 'api_key', {
+    type: 'endpoint',
+    url: `http://127.0.0.1:${port}`,
+  });
+  assert.deepEqual(aliased, definitions);
 });
 
 test('native provider discovery uses owned keys, bounded Google pagination and tool-capable account models', async () => {
@@ -4795,6 +7260,10 @@ test('native provider discovery uses owned keys, bounded Google pagination and t
             capabilities: { completion_chat: true, function_calling: true },
           },
           {
+            id: 'deepseek-v4-1-flash-1017',
+            capabilities: { completion_chat: true, function_calling: true, vision: true },
+          },
+          {
             id: 'codestral-latest',
             capabilities: { completion_chat: true, function_calling: false },
           },
@@ -4824,11 +7293,14 @@ test('native provider discovery uses owned keys, bounded Google pagination and t
     type: 'api_key',
     key: 'fixture-mistral-key',
   });
-  assert.deepEqual(
-    mistral.map(({ choice }) => choice.id),
-    ['mistral-large-latest'],
-  );
+  assert.deepEqual(mistral.map(({ choice }) => choice.id).sort(), [
+    'deepseek-v4-1-flash-1017',
+    'mistral-large-latest',
+  ]);
   assert.equal(mistral[0].spec.api, 'mistral-conversations');
+  const deepseek = mistral.find(({ choice }) => choice.id === 'deepseek-v4-1-flash-1017')!;
+  assert.equal(deepseek.choice.images, true);
+  assert.ok((deepseek.spec as { input: string[] }).input.includes('image'));
   await assert.rejects(
     backend.catalog('google', 'api_key', { type: 'api_key', key: 'fixture-rejected-key' }),
     (error: Error) =>
@@ -4867,6 +7339,7 @@ test('native account catalogs never send a provider key to a different service o
     ['moonshotai', 'https://api.moonshot.ai/v1/models'],
     ['moonshotai-cn', 'https://api.moonshot.cn/v1/models'],
     ['together', 'https://api.together.xyz/v1/models'],
+    ['nvidia', 'https://integrate.api.nvidia.com/v1/models'],
   ] as const;
   for (const [provider, destination] of cases) {
     let status = 200;
@@ -4876,7 +7349,17 @@ test('native account catalogs never send a provider key to a different service o
         assert.equal(String(input), destination);
         assert.equal(new Headers(init?.headers).get('authorization'), `Bearer ${key}`);
         assert.equal(init?.redirect, 'error');
-        if (status !== 200) return Response.json({ message: `Synthetic ${key}` }, { status });
+        if (status !== 200)
+          return Response.json(
+            { message: `Synthetic ${key}` },
+            {
+              status,
+              headers: {
+                'content-type':
+                  status === 503 ? 'application/problem+json' : 'Application/JSON; charset=utf-8',
+              },
+            },
+          );
         const [allowed, unavailable] = await backend.catalog(provider, 'api_key');
         const data = [
           { id: allowed.choice.id },
@@ -4892,7 +7375,12 @@ test('native account catalogs never send a provider key to a different service o
     for (status of [401, 403, 429, 503, 307]) {
       await assert.rejects(
         backend.catalog(provider, 'api_key', { type: 'api_key', key }),
-        (error: Error) => !error.message.includes(key),
+        (error: Error) => {
+          assert.ok(!error.message.includes(key));
+          assert.ok(error.message.includes(`HTTP ${status}`));
+          assert.match(error.message, /Synthetic \[redacted\]/);
+          return true;
+        },
       );
     }
   }
@@ -5535,6 +8023,7 @@ test('the Pi transcript keeps model changes for the next turn and leaves backgro
     const failed = await open();
     await failed.prompt('Synthetic switched provider failure', []);
     await failed.dispose();
+    assert.equal(requests.length, 5);
     assert.equal(requests[4].provider, 'anthropic');
     assert.match(errors.at(-1) ?? '', /^anthropic \/ claude-opus-5-5: 413 Request too large/);
     assert.doesNotMatch(errors.at(-1) ?? '', /openai/);
@@ -5542,6 +8031,90 @@ test('the Pi transcript keeps model changes for the next turn and leaves backgro
     await agent.dispose();
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+test('each session opens on its work model and the observer starts fresh after a switch', async (t) => {
+  const { createPiModelBackend } = await import('../src/providers/pi/models.ts');
+  const backend = createPiModelBackend({
+    fetch: async () => {
+      throw new Error('Network access is disabled.');
+    },
+  });
+  const catalog = await backend.catalog('openai', 'api_key');
+  const directory = await mkdtemp(join(tmpdir(), 'nod-work-model-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const chosen: Array<string | undefined> = [];
+  const requests: Array<{ model: string; history: string }> = [];
+  const agent = createPiAgent({
+    provider: 'openai',
+    resolve: async (choice) => {
+      chosen.push(choice?.modelId);
+      return {
+        provider: 'openai',
+        method: 'api_key',
+        definition: catalog.find((item) => item.choice.id === (choice?.modelId ?? 'gpt-6.1-sol'))!,
+        effort: choice?.effort ?? 'high',
+        read: async () => ({ type: 'api_key', key: 'fixture-openai-key' }),
+      };
+    },
+    sessionRoot: directory,
+    createSession: async (options) => {
+      const result = await createAgentSession(options);
+      result.session.agent.streamFunction = (model, context) => {
+        requests.push({ model: model.id, history: JSON.stringify(context.messages) });
+        const stream = createAssistantMessageEventStream();
+        stream.push({
+          type: 'done',
+          reason: 'stop',
+          message: {
+            ...fauxAssistantMessage([{ type: 'text', text: 'Synthetic check' }]),
+            provider: model.provider,
+            model: model.id,
+            api: model.api,
+          },
+        });
+        return stream;
+      };
+      return result;
+    },
+  });
+  t.after(() => agent.dispose());
+  const threadId = randomUUID();
+  const observer = randomUUID();
+  const light: ModelSelection = {
+    connectionId: randomUUID(),
+    modelId: 'gpt-6-luna',
+    effort: 'low',
+  };
+  const main: ModelSelection = { ...light, modelId: 'gpt-6.1-sol', effort: 'high' };
+  const check = async (prompt: string, model?: ModelSelection) => {
+    const session = await agent.open({
+      ...fakeExecution(threadId),
+      sessionId: observer,
+      ...(model ? { model } : {}),
+      restricted: true,
+      restartable: true,
+      systemPrompt: 'Fixture system',
+      ...sandbox,
+      tools: [],
+      shouldStop: () => false,
+      onEvent() {},
+    });
+    await session.prompt(prompt, []);
+    await session.dispose();
+  };
+  await check('Synthetic first batch', light);
+  await check('Synthetic second batch', light);
+  await check('Synthetic third batch', main);
+  await check('Synthetic fourth batch');
+  assert.deepEqual(chosen, ['gpt-6-luna', 'gpt-6-luna', 'gpt-6.1-sol', undefined]);
+  assert.deepEqual(
+    requests.map((request) => request.model),
+    ['gpt-6-luna', 'gpt-6-luna', 'gpt-6.1-sol', 'gpt-6.1-sol'],
+  );
+  assert.ok(requests[1]!.history.includes('Synthetic first batch'));
+  assert.ok(!requests[2]!.history.includes('Synthetic second batch'));
+  assert.ok(requests[3]!.history.includes('Synthetic third batch'));
 });
 
 test('a failed model request leaves none of its unanswered input for later turns', async (t) => {
@@ -5645,64 +8218,65 @@ test('a failed model request leaves none of its unanswered input for later turns
   assert.ok(requests[4].includes('Hi'));
 });
 
-test('task classification has a small request budget and never retries or records conversation traces', async (t) => {
+test('task and batch classification have a small request budget and never retries or records conversation traces', async (t) => {
   const deadlines: number[] = [];
   t.mock.method(AbortSignal, 'timeout', (milliseconds: number) => {
     deadlines.push(milliseconds);
     return new AbortController().signal;
   });
-  for (const result of ['stop', 'error', 'aborted', 'length', 'transport'] as const)
-    await t.test(result, async () => {
-      let calls = 0;
-      let traces = 0;
-      const usage: Array<Partial<ProviderUsageEvent>> = [];
-      const runtime = {
-        setRuntimeApiKey: async () => {},
-        getModel: () => ({ provider: 'openai', id: 'gpt-6-luna' }),
-        completeSimple: async (
-          _model: unknown,
-          context: { messages: Array<{ content: unknown }> },
-          options: {
-            maxTokens: number;
-            maxRetries: number;
-            timeoutMs: number;
-            signal: AbortSignal;
+  for (const task of ['classify', 'attention'] as const)
+    for (const result of ['stop', 'error', 'aborted', 'length', 'transport'] as const)
+      await t.test(`${task}: ${result}`, async () => {
+        let calls = 0;
+        let traces = 0;
+        const usage: Array<Partial<ProviderUsageEvent>> = [];
+        const runtime = {
+          setRuntimeApiKey: async () => {},
+          getModel: () => ({ provider: 'openai', id: 'gpt-6-luna' }),
+          completeSimple: async (
+            _model: unknown,
+            context: { messages: Array<{ content: unknown }> },
+            options: {
+              maxTokens: number;
+              maxRetries: number;
+              timeoutMs: number;
+              signal: AbortSignal;
+            },
+          ) => {
+            calls++;
+            assert.equal(options.maxTokens, 512);
+            assert.equal(options.maxRetries, 0);
+            assert.equal(options.timeoutMs, 10_000);
+            assert.equal(deadlines.at(-1), 10_000);
+            assert.equal(options.signal.aborted, false);
+            assert.equal(context.messages[0].content, '{"request":"Compare synthetic products"}');
+            if (result === 'transport') throw new Error('Synthetic transport failure');
+            return { ...fauxAssistantMessage('{"task_type":"research"}'), stopReason: result };
           },
-        ) => {
-          calls++;
-          assert.equal(options.maxTokens, 512);
-          assert.equal(options.maxRetries, 0);
-          assert.equal(options.timeoutMs, 10_000);
-          assert.equal(deadlines.at(-1), 10_000);
-          assert.equal(options.signal.aborted, false);
-          assert.equal(context.messages[0].content, '{"request":"Compare synthetic products"}');
-          if (result === 'transport') throw new Error('Synthetic transport failure');
-          return { ...fauxAssistantMessage('{"task_type":"research"}'), stopReason: result };
-        },
-      };
-      const curator = createPiMemoryCurator({
-        provider: 'openai',
-        model: 'gpt-6-luna',
-        apiKey: 'fixture',
-        runtime: runtime as never,
-        traces: { active: () => true, record: () => traces++ },
+        };
+        const curator = createPiMemoryCurator({
+          provider: 'openai',
+          model: 'gpt-6-luna',
+          apiKey: 'fixture',
+          runtime: runtime as never,
+          traces: { active: () => true, record: () => traces++ },
+        });
+        const run = () =>
+          curator.curate(
+            {
+              task,
+              instructions: 'Choose a fixed task category.',
+              input: { request: 'Compare synthetic products' },
+            },
+            undefined,
+            (event) => usage.push(event),
+          );
+        if (result === 'stop') assert.deepEqual(await run(), { task_type: 'research' });
+        else await assert.rejects(run(), /classification model is unavailable|Synthetic transport/);
+        assert.equal(calls, 1);
+        assert.equal(usage.length, 1);
+        assert.equal(traces, 0);
       });
-      const run = () =>
-        curator.curate(
-          {
-            task: 'classify',
-            instructions: 'Choose a fixed task category.',
-            input: { request: 'Compare synthetic products' },
-          },
-          undefined,
-          (event) => usage.push(event),
-        );
-      if (result === 'stop') assert.deepEqual(await run(), { task_type: 'research' });
-      else await assert.rejects(run(), /classification model is unavailable|Synthetic transport/);
-      assert.equal(calls, 1);
-      assert.equal(usage.length, 1);
-      assert.equal(traces, 0);
-    });
 });
 
 test('action review failures identify the task, model, provider, and bounded provider reason', async (t) => {
@@ -5776,7 +8350,7 @@ test('action review failures identify the task, model, provider, and bounded pro
       return true;
     },
   );
-  assert.equal(calls, 3);
+  assert.equal(calls, 1);
   assert.ok(sessions[0]);
   assert.equal(new Set(sessions).size, 1);
 });
@@ -5841,7 +8415,11 @@ test('image analysis passes image blocks to Pi and does not retry a failed charg
 });
 
 test('failed model requests keep unknown costs and remain separate from their retries', async () => {
-  const failed = { ...fauxAssistantMessage(''), stopReason: 'error' as const };
+  const failed = {
+    ...fauxAssistantMessage(''),
+    stopReason: 'error' as const,
+    errorMessage: 'Synthetic service is unavailable (HTTP 503).',
+  };
   const succeeded = {
     ...fauxAssistantMessage('{"saved":true}'),
     usage: {
@@ -5895,6 +8473,10 @@ test('failed model requests keep unknown costs and remain separate from their re
     ],
   );
   assert.equal(new Set(reports.map((report) => report.id)).size, 2);
+  assert.deepEqual(
+    reports.map((report) => report.attempt),
+    [1, 2],
+  );
   runtime.completeSimple = async () => {
     throw new Error('Synthetic transport failure');
   };
@@ -5909,6 +8491,7 @@ test('failed model requests keep unknown costs and remain separate from their re
   assert.equal(reports.length, 3);
   assert.equal(reports[2].costUsd, null);
   assert.equal(reports[2].status, 'failed');
+  assert.equal(reports[2].attempt, 1);
 });
 
 test('subscription image analysis retains an API-price estimate for the task check-in', async (t) => {
@@ -6027,39 +8610,12 @@ test('restricted Pi sessions load no sandbox, web, or code tools', async () => {
   }
 });
 
-test('the chat prompt leaves room for an image in a small context window', async () => {
-  const { modelContextBudget, estimateModelTokens } = await import('../src/providers/pi/models.ts');
-  const { systemPrompt, coreSkills } = await import('../src/runtime/prompt.ts');
-  const { createSkillLibrary } = await import('../src/providers/pi/skills.ts');
-  const skills = createSkillLibrary(join(process.cwd(), 'src/runtime/skills'), coreSkills);
-  const budget = modelContextBudget({
-    provider: 'compatible',
-    id: 'fixture-small',
-    contextWindow: 8192,
-    maxTokens: 4096,
-  });
-  const prompt = systemPrompt({ ...sandbox.workspace, path: '/workspace/fixture' }, skills);
-  const room = (content: unknown) =>
-    budget.window -
-    estimateModelTokens({
-      messages: [
-        { role: 'system', content: prompt },
-        { role: 'user', content },
-      ],
-      tools: [],
-    }) -
-    budget.margin;
-  assert.ok(room('Synthetic request.') >= 128, 'the prompt must fit a small text-only window');
-  assert.ok(
-    room([{ type: 'image', data: 'fixture', mimeType: 'image/png' }]) >= 128,
-    'the prompt must leave room for an image in a small window',
-  );
-});
-
 test('native audio reaches the selected Pi model with tools and survives a reopened session', async (t) => {
   const { createServer } = await import('node:http');
   const bodies: Array<{
     model: string;
+    max_tokens?: number;
+    max_completion_tokens?: number;
     messages: Array<{ role: string; content: unknown }>;
     tools?: unknown[];
   }> = [];
@@ -6091,9 +8647,12 @@ test('native audio reaches the selected Pi model with tools and survives a reope
           ((body as { max_tokens?: number }).max_tokens ?? 0) >
           8192
       ) {
-        contractRejections++;
         response.writeHead(400, { 'content-type': 'application/json' });
-        response.end(JSON.stringify({ error: { message: 'The text companion context is full.' } }));
+        response.end(
+          JSON.stringify({
+            error: { message: 'Context length exceeded: The text companion context is full.' },
+          }),
+        );
         return;
       }
       if (
@@ -6293,6 +8852,10 @@ test('native audio reaches the selected Pi model with tools and survives a reope
   await first.dispose();
   assert.equal(calls, 1);
   assert.ok(bodies[0].tools?.length);
+  assert.equal(
+    bodies[0].max_tokens ?? bodies[0].max_completion_tokens,
+    piSession!.model!.maxTokens,
+  );
   const audio = (body: (typeof bodies)[number]) =>
     body.messages.flatMap((message) =>
       Array.isArray(message.content)
@@ -6458,9 +9021,12 @@ test('native audio reaches the selected Pi model with tools and survives a reope
     systemPrompt: 'Large synthetic owner context. '.repeat(3000),
     compactInstructions: { systemPrompt: 'Answer the synthetic typed request briefly.' },
   });
+  assert.equal(piSession!.model!.contextWindow, 8192);
+  assert.equal(piSession!.model!.maxTokens, 2048);
   await small.prompt('A typed request using the small text companion.', []);
   await small.dispose();
   assert.equal(bodies.length, beforeSmall + 1);
+  assert.equal(bodies.at(-1)!.max_tokens ?? bodies.at(-1)!.max_completion_tokens, 2048);
   assert.equal(bodies.at(-1)!.model, 'fixture-text-model');
   assert.equal(audio(bodies.at(-1)!).length, 0);
   assert.equal(
@@ -6517,7 +9083,13 @@ test('native audio reaches the selected Pi model with tools and survives a reope
     await reopenedPending.prompt('Continue with the queued recordings.', []);
     await reopenedPending.dispose();
     const expectedIds = ['edited', 'deleted'].includes(change) ? pendingIds.slice(1) : pendingIds;
-    assert.equal(bodies.length, beforeReopen + 1);
+    const resumedRequests = bodies.slice(beforeReopen);
+    assert.equal(resumedRequests.filter((body) => audio(body).length > 0).length, 1);
+    assert.ok(
+      resumedRequests
+        .slice(0, -1)
+        .every((body) => body.model === 'fixture-text-model' && audio(body).length === 0),
+    );
     assert.equal(audio(bodies.at(-1)!).length, expectedIds.length);
     assert.deepEqual(new Set(readIds.slice(beforeReadIds)), new Set(expectedIds));
     const submitted = JSON.stringify(bodies.at(-1));
@@ -6612,13 +9184,12 @@ test('native audio reaches the selected Pi model with tools and survives a reope
 test('the runtime sends a recording caption natively while retaining its trusted transcript and text-only fallback', async (t) => {
   const directory = await mkdtemp(join(tmpdir(), 'nod-native-context-'));
   t.after(() => rm(directory, { recursive: true, force: true }));
-  for (const [native, contextWindow] of [
-    [false, 32_000],
-    [true, 32_000],
-    [false, 131_072],
-    [true, 131_072],
+  for (const [native, compact] of [
+    [false, true],
+    [true, true],
+    [false, false],
+    [true, false],
   ] as const) {
-    const compact = contextWindow < 65_536;
     const prompts: Array<{
       text: string;
       audio?: import('../src/ports/agent.ts').AgentAudioInput;
@@ -6630,7 +9201,7 @@ test('the runtime sends a recording caption natively while retaining its trusted
       agent: {
         open: async (input) => ({
           resumed: compact,
-          contextWindow,
+          compactContext: compact,
           readsAudio: native,
           abort() {},
           dispose() {},
@@ -7139,6 +9710,43 @@ function reply(content: Record<string, unknown>, finish = 'stop') {
   );
 }
 
+test('model requests reach the provider and retain transport causes', async (t) => {
+  const original = globalThis.fetch;
+  t.after(() => {
+    globalThis.fetch = original;
+  });
+  let calls = 0;
+  globalThis.fetch = async () => {
+    calls++;
+    throw new TypeError('fetch failed', {
+      cause: Object.assign(new Error('Synthetic socket closed.'), { code: 'ECONNRESET' }),
+    });
+  };
+  for (const window of [8192, 131072]) {
+    const { runtime, model, requestFacts } = await createPiModelRuntime(
+      smallContextAccess('compatible', 'fixture-payload-limit', window),
+    );
+    const oversized = await runtime.completeSimple(model, {
+      messages: [{ role: 'user', content: 'Synthetic text '.repeat(window), timestamp: 1 }],
+    });
+    assert.equal(oversized.stopReason, 'error');
+    assert.match(oversized.errorMessage ?? '', /ECONNRESET/);
+    assert.equal(requestFacts(oversized)!.requestPhase, 'request');
+  }
+  for (const [index, provider] of (['compatible', 'openrouter'] as const).entries()) {
+    const { runtime, model } = await createPiModelRuntime(
+      smallContextAccess(provider, 'fixture-disconnect', 131072),
+    );
+    const failed = await runtime.completeSimple(model, {
+      messages: [{ role: 'user', content: 'Read synthetic data.', timestamp: 1 }],
+    });
+    assert.equal(failed.stopReason, 'error');
+    assert.equal(calls, index + 3);
+    assert.match(failed.errorMessage ?? '', /transport cause: ECONNRESET/);
+    assert.match(failed.errorMessage ?? '', /request phase: request/);
+  }
+});
+
 test('Groq Qwen finishes a task through a tool call with supported message roles', async (t) => {
   const original = globalThis.fetch;
   t.after(() => (globalThis.fetch = original));
@@ -7309,6 +9917,7 @@ test('Ollama models with on or off thinking complete tasks without a named effor
       const path = new URL(request.url).pathname;
       if (path === '/v1/models') return Response.json({ data: [{ id: 'qwen3:8b' }] });
       if (path === '/api/version') return Response.json({ version: 'fixture' });
+      if (path === '/api/v1/models') return new Response(null, { status: 404 });
       if (path === '/api/show')
         return Response.json({
           capabilities: ['completion', 'tools', 'thinking'],
@@ -7345,5 +9954,234 @@ test('Ollama models with on or off thinking complete tasks without a named effor
       assert.equal(result.stopReason, 'stop');
     }
     assert.deepEqual(enabled, thinking ? [true, onlyOn] : [undefined, undefined]);
+  }
+});
+
+test('a rewritten tool call id never takes an id already in the conversation', async (t) => {
+  const original = globalThis.fetch;
+  t.after(() => (globalThis.fetch = original));
+  const taken = createHash('sha256').update('functions.browser:12').digest('hex').slice(0, 9);
+  const bodies: Array<{
+    messages: Array<{ tool_calls?: Array<{ id: string }>; tool_call_id?: string }>;
+  }> = [];
+  globalThis.fetch = async (input, init) => {
+    const request = new Request(input, init);
+    const path = new URL(request.url).pathname;
+    if (path === '/v1/models') return Response.json({ data: [{ id: 'devstral-small-2507' }] });
+    if (path !== '/v1/chat/completions') return new Response(null, { status: 404 });
+    bodies.push(await request.json());
+    return reply({ role: 'assistant', content: 'The synthetic page says hello.' });
+  };
+  const credential = { type: 'endpoint' as const, url: 'http://127.0.0.1:1/v1' };
+  const [definition] = await createPiModelBackend({ fetch: globalThis.fetch }).catalog(
+    'compatible',
+    'api_key',
+    credential,
+  );
+  assert.ok(definition);
+  const step = (id: string, timestamp: number): Context['messages'] => [
+    {
+      ...fauxAssistantMessage(''),
+      provider: 'compatible',
+      api: 'openai-completions',
+      model: 'moonshotai/Kimi-K2.6',
+      stopReason: 'toolUse',
+      content: [{ type: 'toolCall', id, name: 'browser', arguments: {} }],
+      timestamp,
+    },
+    {
+      role: 'toolResult',
+      toolCallId: id,
+      toolName: 'browser',
+      content: [{ type: 'text', text: 'Synthetic page text.' }],
+      isError: false,
+      timestamp,
+    },
+  ];
+  const { runtime, model } = await createPiModelRuntime({
+    provider: 'compatible',
+    method: 'api_key',
+    definition,
+    effort: 'off',
+    read: async () => credential,
+  });
+  const result = await runtime.completeSimple(
+    model,
+    {
+      messages: [
+        { role: 'user', content: 'Open the synthetic page.', timestamp: 1 },
+        ...step(taken, 2),
+        ...step('functions.browser:12', 3),
+        { role: 'user', content: 'What did it say?', timestamp: 4 },
+      ],
+    },
+    {},
+  );
+  assert.equal(result.stopReason, 'stop');
+  const replayed = bodies[0]!.messages;
+  const calls = replayed.flatMap(({ tool_calls }) => tool_calls?.map(({ id }) => id) ?? []);
+  assert.equal(calls[0], taken);
+  assert.match(calls[1]!, /^[A-Za-z0-9]{9}$/);
+  assert.notEqual(calls[1], taken);
+  assert.deepEqual(
+    replayed.flatMap(({ tool_call_id }) => tool_call_id ?? []),
+    calls,
+  );
+});
+
+test('invalid tool calls stop before another model request and a valid repair resets the limit', async (t) => {
+  for (const [repair, toolName] of [
+    [false, 'task'],
+    [true, 'task'],
+    [false, 'sign_in'],
+  ] as const)
+    await t.test(`${toolName} ${repair ? 'repair' : 'stop'}`, async () => {
+      const directory = await mkdtemp(join(tmpdir(), 'nod-tool-recovery-'));
+      t.after(() => rm(directory, { recursive: true, force: true }));
+      let requests = 0;
+      let writes = 0;
+      const runtime = createAgentRuntime({
+        agent: createPiAgent({
+          provider: 'openai',
+          apiKey: 'fixture-key-never-live',
+          sessionRoot: join(directory, 'sessions'),
+          createSession: async (options) => {
+            const result = await createAgentSession(options);
+            result.session.setActiveToolsByName([toolName]);
+            result.session.agent.streamFunction = () => {
+              requests++;
+              assert.ok(requests <= 11, 'The invalid call loop must stop.');
+              const done = repair && requests === 11;
+              const valid = repair && requests % 5 === 0;
+              const message = fauxAssistantMessage(
+                done
+                  ? 'Synthetic work was accepted.'
+                  : [
+                      {
+                        type: 'toolCall',
+                        id: `fixture-task-${requests}`,
+                        name: toolName,
+                        arguments:
+                          toolName === 'sign_in'
+                            ? {
+                                origin: 'https://signin.example.test',
+                                label: 'Synthetic login',
+                                message: 'Sign in to the synthetic account.',
+                                action: 'Sign in',
+                                kind: 'method',
+                              }
+                            : valid
+                              ? {
+                                  action: 'start',
+                                  title: 'Synthetic task',
+                                  doneWhen: 'The synthetic result exists.',
+                                  now: 'Read the synthetic source.',
+                                  message: 'Starting the synthetic task.',
+                                }
+                              : { action: 'start' },
+                      },
+                    ],
+                { stopReason: done ? 'stop' : 'toolUse' },
+              );
+              const stream = createAssistantMessageEventStream();
+              stream.push({ type: 'start', partial: message });
+              stream.push({ type: 'done', reason: done ? 'stop' : 'toolUse', message });
+              return stream;
+            };
+            return result;
+          },
+        }),
+        computer: fakeComputer(),
+        workspace: fakeWorkspace(),
+      });
+      t.after(() => runtime.dispose());
+      const run = () =>
+        runtime.runTurn({
+          ...context(directory),
+          turnId: randomUUID(),
+          task: async () => {
+            writes++;
+            return { id: randomUUID(), status: 'running' };
+          },
+        });
+      if (repair) {
+        assert.equal((await run()).status, 'succeeded');
+        assert.equal(requests, 11);
+        assert.equal(writes, 2);
+      } else {
+        for (let attempt = 0; attempt < 2; attempt++) {
+          requests = 0;
+          await assert.rejects(run(), (error: Error) => {
+            assert.match(error.message, /failed five times/);
+            assert.match(error.message, toolName === 'sign_in' ? /\/methods:/ : /\/doneWhen:/);
+            return true;
+          });
+          assert.equal(requests, 5);
+          assert.equal(writes, 0);
+        }
+      }
+    });
+});
+
+test('preparation reserves model cost before dispatch and blocks a request without a price', async () => {
+  for (const price of ['known', 'missing', 'negative']) {
+    const priced = price === 'known';
+    let calls = 0;
+    let reservations = 0;
+    const settlements: Array<number | null> = [];
+    const base = smallContextAccess('compatible', 'fixture-budget', 8192);
+    const access: ModelAccess = {
+      ...base,
+      definition: {
+        ...base.definition!,
+        spec: {
+          ...base.definition!.spec,
+          cost: priced
+            ? { input: 1, output: 2, cacheRead: 0.1, cacheWrite: 2 }
+            : {
+                input: price === 'negative' ? -1 : 0,
+                output: price === 'negative' ? 2 : 0,
+                cacheRead: 0,
+                cacheWrite: 0,
+              },
+        },
+      },
+      reserve: async (estimate) => {
+        const maximum = typeof estimate === 'function' ? estimate() : estimate;
+        reservations++;
+        assert.equal(calls, 0);
+        if (!priced) {
+          assert.equal(maximum, null);
+          throw new Error('Synthetic preparation price is unknown.');
+        }
+        assert.ok(maximum !== null && maximum > 0 && maximum < 0.02);
+        return async (spent) => {
+          settlements.push(spent);
+        };
+      },
+    };
+    const { runtime, model } = await createPiModelRuntime(access);
+    const result = await runtime.completeSimple(
+      model,
+      {
+        messages: [{ role: 'user', content: 'Synthetic budget check', timestamp: 1 }],
+      },
+      {
+        maxTokens: 100,
+        maxRetries: 0,
+        fetch: async () => {
+          calls++;
+          return Response.json(
+            { error: { message: 'Synthetic provider failure' } },
+            { status: 503 },
+          );
+        },
+      },
+    );
+    assert.equal(reservations, 1);
+    assert.equal(calls, priced ? 1 : 0);
+    assert.equal(result.stopReason, 'error');
+    assert.equal(settlements.length, priced ? 1 : 0);
+    if (!priced) assert.match(result.errorMessage!, /Synthetic preparation price is unknown/);
   }
 });
