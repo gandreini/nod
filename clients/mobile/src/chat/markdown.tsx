@@ -4,6 +4,7 @@ import {
   Image,
   Linking,
   Pressable,
+  ScrollView,
   Text,
   View,
   type ImageStyle,
@@ -37,6 +38,18 @@ class NodRenderer extends Renderer {
     private show: (file: Artifact) => void,
   ) {
     super();
+  }
+
+  code(text: string, _language?: string, containerStyle?: ViewStyle, textStyle?: TextStyle) {
+    return (
+      <View key={this.getKey()} style={containerStyle}>
+        <ScrollView horizontal style={{ flexGrow: 0 }} showsHorizontalScrollIndicator={false}>
+          <Text selectable style={textStyle}>
+            {text}
+          </Text>
+        </ScrollView>
+      </View>
+    );
   }
 
   link(
@@ -94,7 +107,7 @@ class NodRenderer extends Renderer {
               width: 240,
               height: 240,
               borderRadius: radius.bubble,
-              backgroundColor: this.theme.muted,
+              backgroundColor: this.theme.inset,
             },
             style,
           ]}
@@ -143,14 +156,14 @@ class NodRenderer extends Renderer {
 }
 
 function markdownStyles(theme: Theme) {
-  const body = { fontFamily: font.regular, fontSize: 16, lineHeight: 24, color: theme.foreground };
+  const body = { fontFamily: font.regular, fontSize: 18, lineHeight: 26, color: theme.foreground };
   const heading = { fontFamily: font.semibold, color: theme.foreground, letterSpacing: -0.3 };
   return {
     theme: {
       colors: {
         text: theme.foreground,
         link: theme.link,
-        code: theme.muted,
+        code: theme.inset,
         border: theme.border,
       },
     },
@@ -164,10 +177,10 @@ function markdownStyles(theme: Theme) {
         textDecorationLine: 'underline' as const,
         fontStyle: 'normal' as const,
       },
-      h1: { ...heading, fontSize: 24, lineHeight: 32, marginBottom: 8 },
-      h2: { ...heading, fontSize: 20, lineHeight: 28, marginBottom: 8 },
-      h3: { ...heading, fontSize: 18, lineHeight: 26, marginBottom: 8 },
-      h4: { ...heading, fontSize: 16, lineHeight: 24, marginBottom: 8 },
+      h1: { ...heading, fontSize: 26, lineHeight: 34, marginBottom: 8 },
+      h2: { ...heading, fontSize: 22, lineHeight: 30, marginBottom: 8 },
+      h3: { ...heading, fontSize: 20, lineHeight: 28, marginBottom: 8 },
+      h4: { ...heading, fontSize: 18, lineHeight: 26, marginBottom: 8 },
       li: body,
       blockquote: {
         borderLeftWidth: 3,
@@ -179,12 +192,12 @@ function markdownStyles(theme: Theme) {
       codespan: {
         fontFamily: font.mono,
         fontStyle: 'normal' as const,
-        fontSize: 14,
-        backgroundColor: theme.muted,
+        fontSize: 16,
+        backgroundColor: theme.inset,
         color: theme.foreground,
       },
       code: {
-        backgroundColor: theme.muted,
+        backgroundColor: theme.inset,
         borderRadius: radius.control,
         padding: 12,
         marginBottom: 12,
@@ -192,8 +205,8 @@ function markdownStyles(theme: Theme) {
       codeText: {
         fontFamily: font.mono,
         fontStyle: 'normal' as const,
-        fontSize: 13,
-        lineHeight: 20,
+        fontSize: 15,
+        lineHeight: 22,
         color: theme.foreground,
       },
       hr: { backgroundColor: theme.border, height: 1, marginVertical: 16 },
@@ -218,7 +231,7 @@ export const Markdown = memo(function Markdown({ text, theme }: { text: string; 
   );
   const elements = useMarkdown(text, options);
   return (
-    <View style={{ paddingRight: 16, marginBottom: -12 }}>
+    <View style={{ marginBottom: -12 }}>
       {elements.map((element, index) => (
         <Fragment key={index}>{element}</Fragment>
       ))}

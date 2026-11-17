@@ -208,7 +208,7 @@ export function UserBubble({
           style={[
             styles.userBubble,
             audio ? styles.audioBubble : null,
-            { backgroundColor: theme.muted },
+            { backgroundColor: theme.chatSent },
           ]}
         >
           {audio}
@@ -332,7 +332,11 @@ export function AssistantMessage({
           theme={theme}
         />
       ) : null}
-      {text ? <Markdown text={text} theme={theme} /> : null}
+      {text ? (
+        <View style={[styles.assistantBubble, { backgroundColor: theme.chatReceived }]}>
+          <Markdown text={text} theme={theme} />
+        </View>
+      ) : null}
       {message.approval ? (
         <ApprovalCard message={message} question={question} theme={theme} onAnswer={onAnswer} />
       ) : asking ? (
@@ -383,7 +387,12 @@ const ChatRow = memo(function ChatRow({
   onDiscard(id: string): void;
   onOpenBrowser(messageId: string): void;
 }) {
-  if (stream !== undefined) return <Markdown text={stream} theme={theme} />;
+  if (stream !== undefined)
+    return (
+      <View style={[styles.assistantBubble, { backgroundColor: theme.chatReceived }]}>
+        <Markdown text={stream} theme={theme} />
+      </View>
+    );
   if (outgoing)
     return (
       <UserMessage
@@ -720,7 +729,17 @@ const styles = StyleSheet.create({
     borderBottomLeftRadius: radius.bubble,
     borderBottomRightRadius: 4,
   },
-  messageText: { fontFamily: font.regular, fontSize: 16, lineHeight: 24 },
+  assistantBubble: {
+    alignSelf: 'flex-start',
+    maxWidth: '92%',
+    paddingHorizontal: 16,
+    paddingVertical: 12,
+    borderTopLeftRadius: radius.bubble,
+    borderTopRightRadius: radius.bubble,
+    borderBottomRightRadius: radius.bubble,
+    borderBottomLeftRadius: 4,
+  },
+  messageText: { fontFamily: font.regular, fontSize: 18, lineHeight: 26 },
   failed: { marginTop: 4, alignItems: 'flex-end', gap: 2 },
   statusLine: { flexDirection: 'row', alignItems: 'center', gap: 6 },
   reason: {
