@@ -193,8 +193,8 @@ const styles = StyleSheet.create({
     maxHeight: 160,
     paddingVertical: 8,
     fontFamily: font.regular,
-    fontSize: 16,
-    lineHeight: 22,
+    fontSize: 17,
+    lineHeight: 23,
   },
   sendButton: {
     width: 36,

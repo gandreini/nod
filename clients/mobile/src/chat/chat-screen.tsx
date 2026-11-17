@@ -746,7 +746,7 @@ const styles = StyleSheet.create({
     borderBottomRightRadius: radius.bubble,
     borderBottomLeftRadius: 4,
   },
-  messageText: { fontFamily: font.regular, fontSize: 18, lineHeight: 26 },
+  messageText: { fontFamily: font.regular, fontSize: 17, lineHeight: 25 },
   failed: { marginTop: 4, alignItems: 'flex-end', gap: 2 },
   statusLine: { flexDirection: 'row', alignItems: 'center', gap: 6 },
   reason: {

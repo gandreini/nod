@@ -159,7 +159,7 @@ class NodRenderer extends Renderer {
 }
 
 function markdownStyles(theme: Theme) {
-  const body = { fontFamily: font.regular, fontSize: 18, lineHeight: 26, color: theme.foreground };
+  const body = { fontFamily: font.regular, fontSize: 17, lineHeight: 25, color: theme.foreground };
   const heading = { fontFamily: font.semibold, color: theme.foreground, letterSpacing: -0.3 };
   return {
     theme: {
@@ -183,7 +183,7 @@ function markdownStyles(theme: Theme) {
       h1: { ...heading, fontSize: 26, lineHeight: 34, marginBottom: 8 },
       h2: { ...heading, fontSize: 22, lineHeight: 30, marginBottom: 8 },
       h3: { ...heading, fontSize: 20, lineHeight: 28, marginBottom: 8 },
-      h4: { ...heading, fontSize: 18, lineHeight: 26, marginBottom: 8 },
+      h4: { ...heading, fontSize: 17, lineHeight: 25, marginBottom: 8 },
       li: body,
       blockquote: {
         borderLeftWidth: 3,
