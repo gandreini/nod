@@ -805,7 +805,6 @@ export function ChatScreen() {
           key={handoffs.open.turnId}
           turnId={handoffs.open.turnId}
           connection={connection}
-          theme={theme}
           onClose={handoffs.close}
           onReturned={() => handoffs.markReturned(handoffs.open!.messageId)}
         />

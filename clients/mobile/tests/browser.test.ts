@@ -1,7 +1,15 @@
 import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
 import { frameReader, maxFrameBytes, toBase64 } from '../src/browser/frames.ts';
-import { pointAt, queueInput, textEdits, type HandoffInput } from '../src/browser/input.ts';
+import {
+  clampZoom,
+  pinchZoom,
+  pointAt,
+  queueInput,
+  textEdits,
+  unzoom,
+  type HandoffInput,
+} from '../src/browser/input.ts';
 
 function framed(...frames: Uint8Array[]) {
   const parts = frames.flatMap((frame) => {
@@ -112,6 +120,49 @@ describe('browser input', () => {
     assert.deepEqual(pointAt({ x: 125, y: 300 }, box, tall), { x: 0, y: 0.5 });
     assert.equal(pointAt({ x: 50, y: 300 }, box, tall), null);
     assert.equal(pointAt({ x: 200, y: 300 }, box, { width: 0, height: 0 }), null);
+  });
+
+  test('a tap on the zoomed page clicks the spot under the finger', () => {
+    const box = { width: 400, height: 600 };
+    const page = { width: 1280, height: 800 };
+    const zoomed = { scale: 2, x: 0, y: 0 };
+    assert.deepEqual(pointAt(unzoom({ x: 200, y: 300 }, box, zoomed), box, page), {
+      x: 0.5,
+      y: 0.5,
+    });
+    assert.deepEqual(pointAt(unzoom({ x: 0, y: 300 }, box, zoomed), box, page), {
+      x: 0.25,
+      y: 0.5,
+    });
+    const moved = { scale: 2, x: 200, y: 0 };
+    assert.deepEqual(pointAt(unzoom({ x: 200, y: 300 }, box, moved), box, page), {
+      x: 0.25,
+      y: 0.5,
+    });
+  });
+
+  test('zoom stays between the whole page and four times, and the page never leaves the panel', () => {
+    const box = { width: 400, height: 600 };
+    const page = { width: 1280, height: 800 };
+    assert.deepEqual(clampZoom({ scale: 0.5, x: 30, y: 30 }, box, page), { scale: 1, x: 0, y: 0 });
+    assert.equal(clampZoom({ scale: 9, x: 0, y: 0 }, box, page).scale, 4);
+    assert.deepEqual(clampZoom({ scale: 2, x: 999, y: 999 }, box, page), {
+      scale: 2,
+      x: 200,
+      y: 0,
+    });
+  });
+
+  test('a pinch zooms around the point between the fingers', () => {
+    const box = { width: 400, height: 600 };
+    const page = { width: 1280, height: 800 };
+    const start = { scale: 1, x: 0, y: 0 };
+    const view = pinchZoom(start, { x: 100, y: 300 }, 100, { x: 100, y: 300 }, 200, box, page);
+    assert.equal(view.scale, 2);
+    assert.deepEqual(
+      pointAt(unzoom({ x: 100, y: 300 }, box, view), box, page),
+      pointAt({ x: 100, y: 300 }, box, page),
+    );
   });
 
   test('turns edits in the text bar into typing and backspaces', () => {

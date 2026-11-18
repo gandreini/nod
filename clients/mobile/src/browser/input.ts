@@ -49,6 +49,47 @@ export function pageScale(box: Size, image: Size) {
   return image.width / fit(box, image).width;
 }
 
+export type Zoom = { scale: number; x: number; y: number };
+type Point = { x: number; y: number };
+
+export const maxZoom = 4;
+
+export function unzoom(touch: Point, box: Size, zoom: Zoom): Point {
+  const cx = box.width / 2;
+  const cy = box.height / 2;
+  return {
+    x: cx + (touch.x - cx - zoom.x) / zoom.scale,
+    y: cy + (touch.y - cy - zoom.y) / zoom.scale,
+  };
+}
+
+export function clampZoom(zoom: Zoom, box: Size, image: Size): Zoom {
+  const scale = Math.min(maxZoom, Math.max(1, zoom.scale));
+  if (!box.width || !image.width) return { scale, x: 0, y: 0 };
+  const shown = fit(box, image);
+  const maxX = Math.max(0, (shown.width * scale - box.width) / 2);
+  const maxY = Math.max(0, (shown.height * scale - box.height) / 2);
+  const limit = (value: number, max: number) => Math.min(max, Math.max(-max, value)) || 0;
+  return { scale, x: limit(zoom.x, maxX), y: limit(zoom.y, maxY) };
+}
+
+export function pinchZoom(
+  start: Zoom,
+  startMid: Point,
+  startDistance: number,
+  mid: Point,
+  distance: number,
+  box: Size,
+  image: Size,
+): Zoom {
+  const cx = box.width / 2;
+  const cy = box.height / 2;
+  const scale = Math.min(maxZoom, Math.max(1, (start.scale * distance) / startDistance));
+  const ux = (startMid.x - cx - start.x) / start.scale;
+  const uy = (startMid.y - cy - start.y) / start.scale;
+  return clampZoom({ scale, x: mid.x - cx - ux * scale, y: mid.y - cy - uy * scale }, box, image);
+}
+
 export function tap(at: { x: number; y: number }): HandoffInput[] {
   return [
     { type: 'mouse', event: 'move', ...at },

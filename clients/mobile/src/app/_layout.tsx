@@ -6,6 +6,7 @@ import {
 } from '@expo-google-fonts/geist';
 import { GeistMono_400Regular } from '@expo-google-fonts/geist-mono';
 import { Stack } from 'expo-router';
+import * as ScreenOrientation from 'expo-screen-orientation';
 import { StatusBar } from 'expo-status-bar';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { View } from 'react-native';
@@ -38,6 +39,7 @@ function Root() {
   });
 
   useEffect(() => {
+    void ScreenOrientation.lockAsync(ScreenOrientation.OrientationLock.PORTRAIT_UP).catch(() => {});
     clearDownloads();
     loadConnection()
       .then((connection) =>

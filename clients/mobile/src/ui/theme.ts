@@ -100,6 +100,8 @@ const dark: typeof light = {
 
 export type Theme = typeof light;
 
+export const darkTheme: Theme = dark;
+
 export function useTheme(): Theme {
   return useColorScheme() === 'dark' ? dark : light;
 }

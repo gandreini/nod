@@ -1,15 +1,37 @@
+import * as ScreenOrientation from 'expo-screen-orientation';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Image, Keyboard, PanResponder, StyleSheet, Text, TextInput, View } from 'react-native';
+import {
+  Animated,
+  Image,
+  Keyboard,
+  Modal,
+  PanResponder,
+  StatusBar,
+  StyleSheet,
+  Text,
+  TextInput,
+  View,
+  type GestureResponderEvent,
+} from 'react-native';
 import { KeyboardAvoidingView } from 'react-native-keyboard-controller';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import type { Connection } from '../connection/connection';
 import type { Turn } from '../connection/contracts';
 import { useNod } from '../connection/nod-context';
-import { ArrowLeft, Globe2, RefreshCw } from '../ui/icons';
-import { IconButton, Sheet, SheetTitle, sheetStyles } from '../ui/sheet';
-import { font, radius, type Theme } from '../ui/theme';
+import { ArrowLeft, Globe2, RefreshCw, X } from '../ui/icons';
+import { IconButton } from '../ui/sheet';
+import { darkTheme, font, radius, type Theme } from '../ui/theme';
 import { Button, Loading } from '../ui/ui';
-import { pageScale, pointAt, tap, textEdits } from './input';
+import {
+  clampZoom,
+  pageScale,
+  pinchZoom,
+  pointAt,
+  tap,
+  textEdits,
+  unzoom,
+  type Zoom,
+} from './input';
 import { useBrowserHandoff, type BrowserHandoff, type Frame } from './use-browser-handoff';
 
 export type HandoffState = 'active' | 'returned';
@@ -90,60 +112,70 @@ export function BrowserCard({
 export function BrowserSheet({
   turnId,
   connection,
-  theme,
   onClose,
   onReturned,
 }: {
   turnId: string;
   connection: Connection;
-  theme: Theme;
   onClose(): void;
   onReturned(): void;
 }) {
+  const theme = darkTheme;
   const { refused } = useNod();
   const insets = useSafeAreaInsets();
   const handoff = useBrowserHandoff(connection, turnId, refused);
   const off = !handoff.live || Boolean(handoff.busy) || Boolean(handoff.end);
+  useEffect(() => {
+    void ScreenOrientation.unlockAsync().catch(() => {});
+    return () => {
+      void ScreenOrientation.lockAsync(ScreenOrientation.OrientationLock.PORTRAIT_UP).catch(
+        () => {},
+      );
+    };
+  }, []);
   return (
-    <Sheet
-      theme={theme}
-      handleTestID="browser-sheet-handle"
-      onClose={onClose}
-      header={(close) => (
-        <>
-          <SheetTitle
-            icon={Globe2}
-            title="Browser"
-            meta={handoff.end ? 'Ended' : handoff.status}
-            closeLabel="Close the browser"
-            theme={theme}
-            onClose={() => close()}
-          />
-          <View style={sheetStyles.toolbar}>
-            <IconButton
-              icon={ArrowLeft}
-              label="Back"
-              theme={theme}
-              disabled={off}
-              onPress={() => void handoff.navigate('back')}
-            />
-            <IconButton
-              icon={RefreshCw}
-              label="Reload"
-              theme={theme}
-              disabled={off}
-              onPress={() => void handoff.navigate('reload')}
-            />
-          </View>
-        </>
-      )}
+    <Modal
+      visible
+      animationType="fade"
+      statusBarTranslucent
+      navigationBarTranslucent
+      supportedOrientations={['portrait', 'landscape-left', 'landscape-right']}
+      onRequestClose={onClose}
     >
-      {(close) => (
-        <KeyboardAvoidingView
-          behavior="padding"
-          keyboardVerticalOffset={insets.top + 12}
-          style={styles.fill}
-        >
+      <StatusBar barStyle="light-content" />
+      <View
+        style={[
+          styles.fill,
+          styles.theater,
+          { paddingTop: insets.top, paddingLeft: insets.left, paddingRight: insets.right },
+        ]}
+      >
+        <View style={styles.top}>
+          <IconButton
+            icon={ArrowLeft}
+            label="Back"
+            theme={theme}
+            disabled={off}
+            onPress={() => void handoff.navigate('back')}
+          />
+          <IconButton
+            icon={RefreshCw}
+            label="Reload"
+            theme={theme}
+            disabled={off}
+            onPress={() => void handoff.navigate('reload')}
+          />
+          <View style={styles.heading}>
+            <Text style={[styles.title, { color: theme.foreground }]} numberOfLines={1}>
+              Browser
+            </Text>
+            <Text style={[styles.caption, { color: theme.mutedForeground }]} numberOfLines={1}>
+              {handoff.end ? 'Ended' : handoff.status}
+            </Text>
+          </View>
+          <IconButton icon={X} label="Close the browser" theme={theme} onPress={onClose} />
+        </View>
+        <KeyboardAvoidingView behavior="padding" style={styles.fill}>
           {handoff.end ? (
             <View style={[styles.center, { paddingBottom: insets.bottom + 24 }]}>
               <Text style={[styles.message, { color: theme.mutedForeground }]}>
@@ -160,13 +192,181 @@ export function BrowserSheet({
               onReturn={async () => {
                 if (!(await handoff.done())) return;
                 onReturned();
-                close();
+                onClose();
               }}
             />
           )}
         </KeyboardAvoidingView>
+      </View>
+    </Modal>
+  );
+}
+
+type Gesture = {
+  mode: 'tap' | 'scroll' | 'pan' | 'pinch';
+  x: number;
+  y: number;
+  sentX: number;
+  sentY: number;
+  zoom: Zoom;
+  mid?: { x: number; y: number };
+  distance?: number;
+};
+
+function fingers(event: GestureResponderEvent) {
+  const [a, b] = event.nativeEvent.touches;
+  if (!a || !b) return null;
+  return {
+    mid: { x: (a.locationX + b.locationX) / 2, y: (a.locationY + b.locationY) / 2 },
+    distance: Math.max(1, Math.hypot(a.locationX - b.locationX, a.locationY - b.locationY)),
+  };
+}
+
+function BrowserScreen({
+  handoff,
+  theme,
+  dark,
+}: {
+  handoff: BrowserHandoff;
+  theme: Theme;
+  dark?: boolean;
+}) {
+  const box = useRef({ width: 0, height: 0 });
+  const current = useRef(handoff);
+  current.current = handoff;
+  const zoom = useRef<Zoom>({ scale: 1, x: 0, y: 0 });
+  const scale = useRef(new Animated.Value(1)).current;
+  const shiftX = useRef(new Animated.Value(0)).current;
+  const shiftY = useRef(new Animated.Value(0)).current;
+  const gesture = useRef<Gesture | null>(null);
+
+  const show = useCallback(
+    (next: Zoom) => {
+      zoom.current = next;
+      scale.setValue(next.scale);
+      shiftX.setValue(next.x);
+      shiftY.setValue(next.y);
+    },
+    [scale, shiftX, shiftY],
+  );
+
+  const touch = useMemo(
+    () =>
+      PanResponder.create({
+        onStartShouldSetPanResponder: () => true,
+        onMoveShouldSetPanResponder: () => true,
+        onPanResponderTerminationRequest: () => false,
+        onPanResponderGrant: (event) => {
+          const { locationX: x, locationY: y } = event.nativeEvent;
+          gesture.current = { mode: 'tap', x, y, sentX: 0, sentY: 0, zoom: zoom.current };
+        },
+        onPanResponderMove: (event, move) => {
+          const now = gesture.current;
+          const { size, send } = current.current;
+          if (!now || !size.width) return;
+          const pair = fingers(event);
+          if (pair) {
+            if (now.mode !== 'pinch' || !now.mid || !now.distance) {
+              gesture.current = { ...now, mode: 'pinch', zoom: zoom.current, ...pair };
+              return;
+            }
+            show(
+              pinchZoom(
+                now.zoom,
+                now.mid,
+                now.distance,
+                pair.mid,
+                pair.distance,
+                box.current,
+                size,
+              ),
+            );
+            return;
+          }
+          if (now.mode === 'pinch') return;
+          if (now.mode === 'tap') {
+            if (Math.abs(move.dx) + Math.abs(move.dy) < dragStart) return;
+            now.mode = zoom.current.scale > 1 ? 'pan' : 'scroll';
+            now.zoom = zoom.current;
+          }
+          if (now.mode === 'pan') {
+            show(
+              clampZoom(
+                { ...now.zoom, x: now.zoom.x + move.dx, y: now.zoom.y + move.dy },
+                box.current,
+                size,
+              ),
+            );
+            return;
+          }
+          const ratio = pageScale(box.current, size) / zoom.current.scale;
+          const x = Math.round(-move.dx * ratio);
+          const y = Math.round(-move.dy * ratio);
+          if (x === now.sentX && y === now.sentY) return;
+          send([{ type: 'wheel', deltaX: x - now.sentX, deltaY: y - now.sentY }]);
+          now.sentX = x;
+          now.sentY = y;
+        },
+        onPanResponderRelease: () => {
+          const now = gesture.current;
+          gesture.current = null;
+          if (!now || now.mode !== 'tap') return;
+          const at = pointAt(
+            unzoom(now, box.current, zoom.current),
+            box.current,
+            current.current.size,
+          );
+          if (at) current.current.send(tap(at));
+        },
+        onPanResponderTerminate: () => {
+          gesture.current = null;
+        },
+      }),
+    [show],
+  );
+
+  return (
+    <View
+      {...touch.panHandlers}
+      collapsable={false}
+      style={[styles.screen, { backgroundColor: dark ? '#000000' : theme.muted }]}
+      onLayout={(event) => {
+        const { width, height } = event.nativeEvent.layout;
+        box.current = { width, height };
+        show(clampZoom(zoom.current, box.current, current.current.size));
+      }}
+    >
+      {handoff.unavailable ? (
+        <View style={styles.center} pointerEvents="box-none">
+          <Text style={[styles.title, { color: dark ? '#ffffff' : theme.foreground }]}>
+            The browser view could not connect.
+          </Text>
+          <Text style={[styles.message, { color: theme.mutedForeground }]}>
+            {[handoff.streamError, 'Your task is waiting. The page can close after 30 minutes.']
+              .filter(Boolean)
+              .join(' ')}
+          </Text>
+          <Button label="Reconnect view" icon={RefreshCw} onPress={handoff.reconnect} />
+        </View>
+      ) : (
+        <>
+          <Animated.View
+            pointerEvents="none"
+            style={[
+              StyleSheet.absoluteFill,
+              { transform: [{ translateX: shiftX }, { translateY: shiftY }, { scale }] },
+            ]}
+          >
+            <FrameImages frame={handoff.frame} onShown={handoff.shown} onMissed={handoff.missed} />
+          </Animated.View>
+          {handoff.frame ? null : (
+            <View style={styles.center} pointerEvents="none">
+              <Loading />
+            </View>
+          )}
+        </>
       )}
-    </Sheet>
+    </View>
   );
 }
 
@@ -182,86 +382,10 @@ function BrowserBody({
   onReturn(): void;
 }) {
   const [typed, setTyped] = useState('');
-  const box = useRef({ width: 0, height: 0 });
-  const current = useRef(handoff);
-  current.current = handoff;
-  const start = useRef<{ x: number; y: number; sentX: number; sentY: number; moved: boolean }>(
-    null,
-  );
-
-  const touch = useMemo(
-    () =>
-      PanResponder.create({
-        onStartShouldSetPanResponder: () => true,
-        onMoveShouldSetPanResponder: () => true,
-        onPanResponderTerminationRequest: () => false,
-        onPanResponderGrant: (event) => {
-          const { locationX: x, locationY: y } = event.nativeEvent;
-          start.current = { x, y, sentX: 0, sentY: 0, moved: false };
-        },
-        onPanResponderMove: (_, move) => {
-          const from = start.current;
-          const { size, send } = current.current;
-          if (!from || !size.width) return;
-          if (!from.moved && Math.abs(move.dx) + Math.abs(move.dy) < dragStart) return;
-          from.moved = true;
-          const scale = pageScale(box.current, size);
-          const x = Math.round(-move.dx * scale);
-          const y = Math.round(-move.dy * scale);
-          if (x === from.sentX && y === from.sentY) return;
-          send([{ type: 'wheel', deltaX: x - from.sentX, deltaY: y - from.sentY }]);
-          from.sentX = x;
-          from.sentY = y;
-        },
-        onPanResponderRelease: () => {
-          const from = start.current;
-          start.current = null;
-          if (!from || from.moved) return;
-          const at = pointAt(from, box.current, current.current.size);
-          if (at) current.current.send(tap(at));
-        },
-        onPanResponderTerminate: () => {
-          start.current = null;
-        },
-      }),
-    [],
-  );
-
   const busy = Boolean(handoff.busy);
   return (
     <>
-      <View
-        {...touch.panHandlers}
-        collapsable={false}
-        style={[styles.screen, { backgroundColor: theme.muted }]}
-        onLayout={(event) => {
-          const { width, height } = event.nativeEvent.layout;
-          box.current = { width, height };
-        }}
-      >
-        {handoff.unavailable ? (
-          <View style={styles.center} pointerEvents="box-none">
-            <Text style={[styles.title, { color: theme.foreground }]}>
-              The browser view could not connect.
-            </Text>
-            <Text style={[styles.message, { color: theme.mutedForeground }]}>
-              {[handoff.streamError, 'Your task is waiting. The page can close after 30 minutes.']
-                .filter(Boolean)
-                .join(' ')}
-            </Text>
-            <Button label="Reconnect view" icon={RefreshCw} onPress={handoff.reconnect} />
-          </View>
-        ) : (
-          <>
-            <FrameImages frame={handoff.frame} onShown={handoff.shown} onMissed={handoff.missed} />
-            {handoff.frame ? null : (
-              <View style={styles.center} pointerEvents="none">
-                <Loading />
-              </View>
-            )}
-          </>
-        )}
-      </View>
+      <BrowserScreen handoff={handoff} theme={theme} dark />
       <View style={[styles.bar, { paddingBottom: bottom }]}>
         {handoff.error ? (
           <Text
@@ -378,6 +502,15 @@ const styles = StyleSheet.create({
     padding: 32,
   },
   screen: { flex: 1, overflow: 'hidden' },
+  theater: { backgroundColor: '#000000' },
+  top: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+    paddingHorizontal: 8,
+    paddingVertical: 6,
+  },
+  heading: { flex: 1, alignItems: 'center', paddingHorizontal: 8 },
   bar: { paddingHorizontal: 16, paddingTop: 12, gap: 10 },
   input: {
     minHeight: 44,
