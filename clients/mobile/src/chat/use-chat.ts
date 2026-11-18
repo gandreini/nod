@@ -5,6 +5,7 @@ import {
   ApiError,
   errorText,
   getState,
+  messageArrived,
   olderMessages,
   refusedAccess,
   sendText,
@@ -37,6 +38,7 @@ export function useChat(connection: Connection, onRefused: (notice: string) => v
   const [streams, dispatch] = useReducer(streamReducer, initialStreamState);
   const [error, setError] = useState<string>();
   const [voiceError, setVoiceError] = useState<string>();
+  const [notice, setNotice] = useState<string>();
   const [version, setVersion] = useState(0);
   const threadId = useRef<string | null>(null);
   const stateRef = useRef<AppState | null>(null);
@@ -143,17 +145,13 @@ export function useChat(connection: Connection, onRefused: (notice: string) => v
   );
 
   const { live, reconnect: reconnectEvents } = useServerEvents(connection, {
-    opened: () => {
-      void refresh();
-      void outbox.current?.revive();
-    },
+    opened: () => void refresh(),
     received,
     refused,
     failed: setError,
     resumed: () => {
       void refresh();
       setVersion((value) => value + 1);
-      void outbox.current?.revive();
     },
   });
 
@@ -180,20 +178,25 @@ export function useChat(connection: Connection, onRefused: (notice: string) => v
         await prepareTranscription(connection);
         await sendAudio(connection, { id: sendId, threadId: thread, ...item.audio! });
       },
-      arrived: (sendId) =>
-        getState(connection).then((next) => next.messages.some((message) => message.id === sendId)),
+      arrived: (sendId) => messageArrived(connection, sendId),
       newId: randomUUID,
       later,
       onChange: (items) => {
         if (alive.current) setOutgoing(items);
       },
       onRefused: (status) => refusedRef.current(status),
+      onDropped: () => {
+        if (alive.current) setNotice('Your voice message was empty, so it wasn’t sent.');
+      },
       onDelivered: () => deliveredRef.current(),
     });
   useEffect(() => () => outbox.current?.stop(), []);
+  useEffect(() => {
+    outbox.current?.setOnline(live);
+  }, [live]);
 
   const send = useCallback((text: string, attachments: Draft[] = []) => {
-    void outbox.current!.add({
+    outbox.current!.add({
       id: randomUUID(),
       text,
       ...(attachments.length
@@ -207,7 +210,7 @@ export function useChat(connection: Connection, onRefused: (notice: string) => v
             attachmentIds: attachmentIds(attachments),
           }
         : {}),
-      status: 'sending',
+      status: 'queued',
       createdAt: sendTime(new Date(), stateRef.current?.messages ?? []),
     });
   }, []);
@@ -217,28 +220,32 @@ export function useChat(connection: Connection, onRefused: (notice: string) => v
     const uri = await keepRecording(audio.uri, id).catch(() => audio.uri);
     if (uri !== audio.uri) dropRecording(audio.uri, true);
     if (!alive.current) return;
-    void outbox.current!.add({
+    outbox.current!.add({
       id,
       text: '',
       audio: { ...audio, uri },
-      status: 'sending',
+      status: 'queued',
       createdAt: sendTime(new Date(), stateRef.current?.messages ?? []),
     });
   }, []);
 
-  const retry = useCallback((id: string) => void outbox.current!.retry(id), []);
+  const clearNotice = useCallback(() => setNotice(undefined), []);
+  const retry = useCallback(
+    (id: string) =>
+      outbox.current!.retry(id, sendTime(new Date(), stateRef.current?.messages ?? [])),
+    [],
+  );
   const discard = useCallback((id: string) => outbox.current!.discard(id), []);
 
   const kept = useRef(new Set<string>());
   const [hydrated, setHydrated] = useState(false);
   useEffect(() => {
     if (!hydrated) return;
-    const voices = outgoing.filter((item) => item.audio && item.status !== 'sent');
-    savePending(connection.origin, voices).catch((problem) => {
-      if (alive.current)
-        setVoiceError(`Could not keep the unsent voice message: ${errorText(problem)}`);
+    const pending = outgoing.filter((item) => item.status !== 'sent');
+    savePending(connection.origin, pending).catch((problem) => {
+      if (alive.current) setVoiceError(`Could not keep the unsent messages: ${errorText(problem)}`);
     });
-    const now = new Set(voices.map((item) => item.audio!.uri));
+    const now = new Set(pending.flatMap((item) => (item.audio ? [item.audio.uri] : [])));
     kept.current.forEach((uri) => {
       if (!now.has(uri)) dropRecording(uri);
     });
@@ -252,13 +259,12 @@ export function useChat(connection: Connection, onRefused: (notice: string) => v
       (items) => {
         if (!alive.current) return;
         setHydrated(true);
-        const arrived = new Set(stateRef.current?.messages.map((message) => message.id));
-        void outbox.current!.restore(items, arrived);
+        outbox.current!.restore(items, stateRef.current?.messages ?? []);
       },
       (problem) => {
         if (!alive.current) return;
         setHydrated(true);
-        setVoiceError(`Unsent voice messages could not be read: ${errorText(problem)}`);
+        setVoiceError(`Unsent messages could not be read: ${errorText(problem)}`);
       },
     );
   }, [connection.origin]);
@@ -357,6 +363,8 @@ export function useChat(connection: Connection, onRefused: (notice: string) => v
     live,
     version,
     error: error ?? voiceError,
+    notice,
+    clearNotice,
     hasEarlier,
     loadingOlder,
     pendingQuestions,

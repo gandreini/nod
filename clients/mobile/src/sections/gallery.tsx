@@ -62,7 +62,7 @@ const drafts: Draft[] = [
     mimeType: 'application/octet-stream',
     size: 3100000,
     state: 'failed',
-    error: 'Could not reach the server',
+    error: "Can't reach the server. Check your connection.",
   },
 ];
 
@@ -70,7 +70,7 @@ const unsent: Outgoing = {
   id: 'unsent',
   text: '',
   status: 'failed',
-  error: 'Could not reach the server: Network request failed',
+  error: "Can't reach the server. Check your connection.",
   createdAt: '2026-11-06T12:00:00.000Z',
 };
 const answer: Answer = () => new Promise((resolve) => setTimeout(() => resolve('sent'), 800));
@@ -275,7 +275,7 @@ export function GalleryScreen() {
 
       <Section title="Notices and meta">
         <Notice
-          text="Schedules did not load: Could not reach the server (HTTP 502)."
+          text="Schedules did not load: the server answered with an error (HTTP 502)."
           onRetry={noop}
         />
         <Notice text="Saving the limit failed: Enter a limit of at least $1." />
@@ -334,10 +334,10 @@ export function GalleryScreen() {
 
       <Section title="Chat messages">
         <UserBubble text="What's on my calendar tomorrow?" theme={theme} />
-        <UserBubble text="Sending…" theme={theme} dim={0.6} />
-        <UserBubble text="This one is being sent again" theme={theme} dim={0.6}>
+        <UserBubble text="Sending…" theme={theme} dim={0.5} />
+        <UserBubble text="This one is waiting for the connection" theme={theme} dim={0.5}>
           <Unsent
-            outgoing={{ ...unsent, status: 'sending', attempts: 1 }}
+            outgoing={{ ...unsent, status: 'waiting' }}
             theme={theme}
             onRetry={() => {}}
             onDiscard={() => {}}

@@ -13,6 +13,7 @@ export function Composer({
   ready,
   working,
   recording,
+  micBlocked,
   onSubmit,
   onStop,
   onRecord,
@@ -29,6 +30,7 @@ export function Composer({
   ready: boolean;
   working: boolean;
   recording?: { seconds: number; levels: number[] };
+  micBlocked?: boolean;
   onSubmit(): void;
   onStop(): void;
   onRecord(): void;
@@ -153,7 +155,7 @@ export function Composer({
                 disabled={!ready}
                 label="Record a voice message"
               >
-                <Mic size={20} color={theme.foreground} />
+                <Mic size={20} color={micBlocked ? theme.placeholder : theme.foreground} />
               </ActionButton>
             )}
           </>

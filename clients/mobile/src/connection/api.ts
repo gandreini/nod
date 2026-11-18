@@ -72,7 +72,14 @@ export async function read<T>(response: Response): Promise<T> {
 }
 
 export function unreachable(connection: Connection, error: unknown) {
-  return new ApiError(0, `Could not reach ${new URL(connection.origin).host}: ${String(error)}`);
+  const host = new URL(connection.origin).host;
+  return new ApiError(
+    0,
+    `Can't reach ${host}. Check your connection.`,
+    undefined,
+    undefined,
+    String(error),
+  );
 }
 
 export async function request<T>(
@@ -110,7 +117,7 @@ export async function request<T>(
       if (late)
         throw new ApiError(
           0,
-          `${new URL(connection.origin).host} did not answer within ${Math.round(timeout / 1000)} s`,
+          `${new URL(connection.origin).host} didn't answer within ${Math.round(timeout / 1000)} seconds. Check your connection.`,
         );
       if (error instanceof ApiError) throw error;
       throw unreachable(connection, error);
@@ -127,6 +134,16 @@ function api<T>(connection: Connection, path: string, body?: unknown) {
 
 export function getState(connection: Connection) {
   return api<AppState>(connection, '/api/state');
+}
+
+export async function messageArrived(connection: Connection, id: string) {
+  try {
+    await api<unknown>(connection, `/api/messages/around/${encodeURIComponent(id)}`);
+    return true;
+  } catch (problem) {
+    if (problem instanceof ApiError && problem.status === 404) return false;
+    throw problem;
+  }
 }
 
 export function olderMessages(connection: Connection, threadId: string, oldest: Message) {

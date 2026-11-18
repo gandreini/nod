@@ -1,8 +1,15 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { describe, test } from 'node:test';
-import { getState, postAudio, postUpload, sendText } from '../src/connection/api.ts';
-import type { Outgoing } from '../src/chat/chat-state.ts';
+import {
+  ApiError,
+  getState,
+  messageArrived,
+  postAudio,
+  postUpload,
+  sendText,
+} from '../src/connection/api.ts';
+import { sendTime, type Outgoing } from '../src/chat/chat-state.ts';
 import type { Connection } from '../src/connection/connection.ts';
 import { createOutbox } from '../src/chat/outbox.ts';
 import { startFakeServer } from './fake-server.ts';
@@ -17,46 +24,61 @@ async function harness(
   const server = await startFakeServer();
   const connection: Connection = { origin: server.origin, token: server.token, owner: 'synthetic' };
   if (faults.length) await server.control('/fixture/audio-faults', { faults });
+  const dropped: string[] = [];
+  const net = { up: true };
+  const reachable = () => {
+    if (!net.up) throw new ApiError(0, 'Could not reach the synthetic server: offline');
+  };
   const outbox = createOutbox({
     thread: () => threadId,
-    sendText: (item, thread) =>
-      sendText(connection, {
+    sendText: async (item, thread) => {
+      reachable();
+      return sendText(connection, {
         id: item.id,
         text: item.text,
         threadId: thread,
         attachmentIds: item.attachmentIds,
-      }),
-    sendAudio: (_item, thread, sendId) =>
-      postAudio(
+      });
+    },
+    sendAudio: async (_item, thread, sendId) => {
+      reachable();
+      return postAudio(
         connection,
         { id: sendId, threadId: thread },
         new Blob([recording], { type: 'audio/wav' }),
         'voice.wav',
         300,
-      ),
-    arrived: (sendId) =>
-      getState(connection).then((state) => state.messages.some((message) => message.id === sendId)),
+      );
+    },
+    arrived: (sendId) => messageArrived(connection, sendId),
     newId: randomUUID,
     later,
     onChange: () => {},
     onRefused: () => {},
+    onDropped: (reason) => dropped.push(reason),
     onDelivered: () => void getState(connection).then((state) => outbox.settle(state.messages)),
   });
+  outbox.setOnline(true);
   const settled = async () => {
-    for (let round = 0; round < 200; round++) {
-      if (!outbox.items().some((item) => item.status === 'sending')) return;
+    for (let round = 0; round < 300; round++) {
+      const moving = (item: Outgoing) =>
+        item.status === 'queued' ||
+        item.status === 'sending' ||
+        (item.status === 'waiting' && net.up);
+      if (!outbox.items().some(moving)) return;
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
     throw new Error('The outbox did not settle.');
   };
+  const messages = async () => (await getState(connection)).messages;
   const voices = async () =>
-    (await getState(connection)).messages.filter((message) =>
+    (await messages()).filter((message) =>
       message.attachments?.some((file) => file.mimeType === 'audio/wav'),
     );
-  return { server, connection, outbox, settled, voices };
+  return { server, connection, outbox, settled, messages, voices, dropped, net };
 }
 
-function voice(): Outgoing {
+function voice(createdAt = new Date().toISOString()): Outgoing {
   return {
     id: randomUUID(),
     text: '',
@@ -66,9 +88,13 @@ function voice(): Outgoing {
       name: 'voice.wav',
       durationMillis: 1200,
     },
-    status: 'sending',
-    createdAt: new Date().toISOString(),
+    status: 'queued',
+    createdAt,
   };
+}
+
+function text(value: string, createdAt = new Date().toISOString()): Outgoing {
+  return { id: randomUUID(), text: value, status: 'queued', createdAt };
 }
 
 describe('message delivery', () => {
@@ -76,12 +102,11 @@ describe('message delivery', () => {
     const { server, outbox, settled, voices } = await harness(['drop-response']);
     try {
       const item = voice();
-      await outbox.add(item);
+      outbox.add(item);
       await settled();
       const arrived = await voices();
       assert.equal(arrived.length, 1);
       assert.equal(arrived[0].id, item.id);
-      assert.ok(outbox.items().every((entry) => entry.status === 'sent'));
     } finally {
       await server.stop();
     }
@@ -91,7 +116,7 @@ describe('message delivery', () => {
     const { server, outbox, settled, voices } = await harness(['abort-after-claim']);
     try {
       const item = voice();
-      await outbox.add(item);
+      outbox.add(item);
       await settled();
       const arrived = await voices();
       assert.equal(arrived.length, 1);
@@ -105,23 +130,7 @@ describe('message delivery', () => {
     const { server, outbox, settled, voices } = await harness(['busy']);
     try {
       const item = voice();
-      await outbox.add(item);
-      await settled();
-      const arrived = await voices();
-      assert.deepEqual(
-        arrived.map((message) => message.id),
-        [item.id],
-      );
-    } finally {
-      await server.stop();
-    }
-  });
-
-  test('a voice send the server never answers gives up on that attempt and arrives once', async () => {
-    const { server, outbox, settled, voices } = await harness(['hang']);
-    try {
-      const item = voice();
-      await outbox.add(item);
+      outbox.add(item);
       await settled();
       assert.deepEqual(
         (await voices()).map((message) => message.id),
@@ -132,15 +141,121 @@ describe('message delivery', () => {
     }
   });
 
-  test('a voice message discarded while it waits to be sent again is never sent', async () => {
+  test('a server that stays busy leaves the message not sent, with the reason', async () => {
+    const { server, outbox, settled, voices } = await harness(['busy', 'busy', 'busy', 'busy']);
+    try {
+      outbox.add(voice());
+      await settled();
+      assert.equal((await voices()).length, 0);
+      const [item] = outbox.items();
+      assert.equal(item.status, 'failed');
+      assert.match(item.error ?? '', /busy/i);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  test('a voice send the server never answers is sent again and arrives once', async () => {
+    const { server, outbox, settled, voices } = await harness(['hang']);
+    try {
+      const item = voice();
+      outbox.add(item);
+      await settled();
+      assert.deepEqual(
+        (await voices()).map((message) => message.id),
+        [item.id],
+      );
+    } finally {
+      await server.stop();
+    }
+  });
+
+  test('a voice message with no speech leaves the chat and says why', async () => {
+    const { server, outbox, settled, voices, dropped } = await harness(['silent']);
+    try {
+      outbox.add(voice());
+      await settled();
+      assert.equal(outbox.items().length, 0);
+      assert.equal((await voices()).length, 0);
+      assert.equal(dropped.length, 1);
+      assert.match(dropped[0], /no speech/i);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  test('a voice message the owner stopped is not sent again, even when the connection returns', async () => {
+    const { server, outbox, settled, voices } = await harness(['cancel']);
+    try {
+      outbox.add(voice());
+      await settled();
+      outbox.setOnline(false);
+      outbox.setOnline(true);
+      await settled();
+      assert.equal((await voices()).length, 0);
+      const [item] = outbox.items();
+      assert.equal(item.status, 'failed');
+      assert.match(item.error ?? '', /cancelled/);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  test('offline, messages wait in order and go out when the connection returns', async () => {
+    const { server, outbox, settled, messages, net } = await harness();
+    try {
+      net.up = false;
+      outbox.setOnline(false);
+      const first = text('first');
+      const second = text('second', new Date(Date.now() + 1).toISOString());
+      outbox.add(first);
+      outbox.add(second);
+      for (let round = 0; round < 100 && outbox.items()[0].status !== 'waiting'; round++)
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      assert.deepEqual(
+        outbox.items().map((item) => item.status),
+        ['waiting', 'queued'],
+      );
+      net.up = true;
+      outbox.setOnline(true);
+      await settled();
+      const sent = (await messages()).map((message) => message.id);
+      assert.ok(sent.indexOf(first.id) >= 0 && sent.indexOf(first.id) < sent.indexOf(second.id));
+    } finally {
+      await server.stop();
+    }
+  });
+
+  test('a message deleted while it waits for the connection is never sent', async () => {
+    const { server, outbox, settled, messages, net } = await harness();
+    try {
+      net.up = false;
+      outbox.setOnline(false);
+      const item = text('never');
+      outbox.add(item);
+      await settled();
+      assert.equal(outbox.items()[0].status, 'waiting');
+      outbox.discard(item.id);
+      net.up = true;
+      outbox.setOnline(true);
+      await settled();
+      assert.equal(outbox.items().length, 0);
+      assert.ok(!(await messages()).some((message) => message.id === item.id));
+    } finally {
+      await server.stop();
+    }
+  });
+
+  test('a voice message deleted while it waits to be sent again is never sent', async () => {
     const queued: (() => void)[] = [];
     const { server, outbox, voices } = await harness(['busy'], (run) => void queued.push(run));
     try {
       const item = voice();
-      await outbox.add(item);
-      assert.equal(outbox.items()[0].status, 'sending');
+      outbox.add(item);
+      for (let round = 0; round < 100 && !queued.length; round++)
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      assert.equal(outbox.items()[0].status, 'queued');
       outbox.discard(item.id);
-      assert.equal(outbox.items().length, 0);
       queued.splice(0).forEach((run) => run());
       await new Promise((resolve) => setTimeout(resolve, 200));
       assert.equal((await voices()).length, 0);
@@ -150,30 +265,31 @@ describe('message delivery', () => {
     }
   });
 
-  test('a voice message the owner stopped is not sent again, even when the app comes back', async () => {
-    const { server, outbox, settled, voices } = await harness(['cancel']);
+  test('after a restart, only the last unsent message goes out by itself', async () => {
+    const { server, outbox, settled, messages } = await harness();
     try {
-      await outbox.add(voice());
+      const history = await messages();
+      const older = text('written before Nod answered', '2026-01-01T00:00:00.000Z');
+      const last = text('written last', sendTime(new Date(), history));
+      outbox.restore([older, last], history);
       await settled();
-      await outbox.revive();
-      await settled();
-      assert.equal((await voices()).length, 0);
-      const [item] = outbox.items();
-      assert.equal(item.status, 'failed');
-      assert.equal(item.final, true);
-      assert.match(item.error ?? '', /cancelled/);
+      const sent = (await messages()).map((message) => message.id);
+      assert.ok(sent.includes(last.id));
+      assert.ok(!sent.includes(older.id));
+      const [left] = outbox.items();
+      assert.equal(left.id, older.id);
+      assert.equal(left.status, 'failed');
     } finally {
       await server.stop();
     }
   });
 
   test('after a restart, a saved voice message that already arrived is not sent again', async () => {
-    const { server, connection, outbox, settled, voices } = await harness(['drop-response']);
+    const { server, outbox, settled, messages } = await harness(['drop-response']);
     try {
       const item = voice();
-      await outbox.add(item);
+      outbox.add(item);
       await settled();
-      const saved: Outgoing = { ...item, status: 'sending' };
       const reopened = createOutbox({
         thread: () => threadId,
         sendText: () => Promise.reject(new Error('unexpected text send')),
@@ -183,11 +299,34 @@ describe('message delivery', () => {
         later: (run) => void setTimeout(run, 0),
         onChange: () => {},
         onRefused: () => {},
+        onDropped: () => {},
         onDelivered: () => {},
       });
-      const arrived = new Set((await getState(connection)).messages.map((message) => message.id));
-      await reopened.restore([saved], arrived);
+      reopened.setOnline(true);
+      reopened.restore([{ ...item, status: 'sending' }], await messages());
+      await new Promise((resolve) => setTimeout(resolve, 50));
       assert.equal(reopened.items().length, 0);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  test('Try again moves the message to the end of the chat and sends it', async () => {
+    const { server, outbox, settled, voices, messages } = await harness([
+      'busy',
+      'busy',
+      'busy',
+      'busy',
+    ]);
+    try {
+      const item = voice('2026-01-01T00:00:00.000Z');
+      outbox.add(item);
+      await settled();
+      assert.equal(outbox.items()[0].status, 'failed');
+      const now = sendTime(new Date(), await messages());
+      outbox.retry(item.id, now);
+      assert.equal(outbox.items()[0].createdAt, now);
+      await settled();
       assert.equal((await voices()).length, 1);
     } finally {
       await server.stop();
@@ -195,23 +334,17 @@ describe('message delivery', () => {
   });
 
   test('a message with an attachment reaches the server with that file', async () => {
-    const { server, connection, outbox, settled } = await harness();
+    const { server, connection, outbox, settled, messages } = await harness();
     try {
       const file = await postUpload(
         connection,
         new Blob([new Uint8Array([37, 80, 68, 70])], { type: 'application/pdf' }),
         'Synthetic quote.pdf',
       );
-      const item: Outgoing = {
-        id: randomUUID(),
-        text: 'Here is the quote',
-        attachmentIds: [file.id],
-        status: 'sending',
-        createdAt: new Date().toISOString(),
-      };
-      await outbox.add(item);
+      const item: Outgoing = { ...text('Here is the quote'), attachmentIds: [file.id] };
+      outbox.add(item);
       await settled();
-      const sent = (await getState(connection)).messages.find((message) => message.id === item.id);
+      const sent = (await messages()).find((message) => message.id === item.id);
       assert.deepEqual(
         sent?.attachments?.map((attachment) => attachment.name),
         ['Synthetic quote.pdf'],

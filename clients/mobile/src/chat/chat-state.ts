@@ -28,8 +28,7 @@ export interface Outgoing {
   audio?: Recording;
   files?: LocalFile[];
   attachmentIds?: string[];
-  status: 'sending' | 'sent' | 'failed';
-  final?: boolean;
+  status: 'queued' | 'sending' | 'waiting' | 'failed' | 'sent';
   error?: string;
   createdAt: string;
 }
@@ -74,16 +73,35 @@ export function unsent(outgoing: Outgoing[], messages: Message[]): Outgoing[] {
   return outgoing.filter((item) => !delivered.has(item.sendId ?? item.id));
 }
 
-export type VoiceStep = 'done' | 'retry' | 'renew' | 'stop';
+export function inTail(item: Outgoing, messages: Message[]) {
+  const at = Date.parse(item.createdAt);
+  return !messages.some((message) => Date.parse(message.createdAt) > at);
+}
 
-export function voiceStep(
-  failure: { status: number; retryable?: boolean; reason?: string },
+export type Step = 'done' | 'wait' | 'retry' | 'renew' | 'fail' | 'drop';
+
+export interface Failure {
+  status: number;
+  retryable?: boolean;
+  reason?: string;
+}
+
+export const busyRetries = 3;
+
+export function nextStep(
+  failure: Failure,
   delivered: boolean | undefined,
-): VoiceStep {
+  { voice, attempts }: { voice: boolean; attempts: number },
+): Step {
   if (delivered) return 'done';
   const { status } = failure;
-  if (status === 0 || status === 429 || status >= 500 || failure.retryable === true) return 'retry';
-  if (status === 409 && /may already be in the conversation/i.test(failure.reason ?? ''))
-    return delivered === false ? 'renew' : 'retry';
-  return 'stop';
+  const reason = failure.reason ?? '';
+  if (status === 0) return 'wait';
+  if (voice && status === 400 && /no speech was detected/i.test(reason)) return 'drop';
+  const again = attempts < busyRetries ? 'retry' : 'fail';
+  if (status === 429 || status >= 500) return again;
+  if (status === 409 && /work is stopping/i.test(reason)) return again;
+  if (voice && status === 409 && /may already be in the conversation/i.test(reason))
+    return delivered === false ? 'renew' : again;
+  return 'fail';
 }

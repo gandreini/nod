@@ -47,7 +47,7 @@ export async function loadPending(origin: string): Promise<Outgoing[]> {
     .map((item) =>
       item.audio ? { ...item, audio: { ...item.audio, uri: kept(item.audio.uri) } } : item,
     )
-    .filter((item) => item.audio && new File(item.audio.uri).exists);
+    .filter((item) => !item.audio || new File(item.audio.uri).exists);
 }
 
 export async function forgetPending(origin: string) {

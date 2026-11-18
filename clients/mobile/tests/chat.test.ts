@@ -9,7 +9,8 @@ import {
   sendTime,
   timeline,
   unsent,
-  voiceStep,
+  inTail,
+  nextStep,
   workState,
   type Outgoing,
 } from '../src/chat/chat-state.ts';
@@ -173,43 +174,93 @@ describe('chat state', () => {
     assert.equal(unsent([voice], [message('second', '2026-11-14T12:30:05.000Z')]).length, 0);
   });
 
-  test('a voice send that hits the network or a busy server retries under the same ID', () => {
-    assert.equal(voiceStep({ status: 0 }, undefined), 'retry');
-    assert.equal(voiceStep({ status: 503 }, undefined), 'retry');
-    assert.equal(voiceStep({ status: 429 }, false), 'retry');
+  test('an unreachable server makes a message wait, whatever it is and however often', () => {
+    assert.equal(nextStep({ status: 0 }, undefined, { voice: false, attempts: 0 }), 'wait');
+    assert.equal(nextStep({ status: 0 }, false, { voice: true, attempts: 9 }), 'wait');
   });
 
-  test('a voice message already in the conversation is never sent again', () => {
-    assert.equal(voiceStep({ status: 0 }, true), 'done');
-    assert.equal(voiceStep({ status: 409, reason: claimed }, true), 'done');
-  });
-
-  test('a new ID is used only when the server holds a dead claim and the message is not in the chat', () => {
-    assert.equal(voiceStep({ status: 409, retryable: false, reason: claimed }, false), 'renew');
-    assert.equal(voiceStep({ status: 409, retryable: false, reason: claimed }, undefined), 'retry');
-  });
-
-  test('a voice message the owner stopped, or that the server refused, is not sent again', () => {
+  test('a busy server is tried three more times, then the message is not sent', () => {
+    for (const status of [429, 500, 503])
+      assert.equal(nextStep({ status }, undefined, { voice: false, attempts: 0 }), 'retry');
+    assert.equal(nextStep({ status: 503 }, false, { voice: true, attempts: 2 }), 'retry');
+    assert.equal(nextStep({ status: 503 }, false, { voice: true, attempts: 3 }), 'fail');
     assert.equal(
-      voiceStep(
-        { status: 409, retryable: false, reason: 'This voice message was cancelled.' },
+      nextStep(
+        { status: 409, reason: 'Work is stopping. Send the recording again when it finishes.' },
         false,
+        {
+          voice: true,
+          attempts: 0,
+        },
       ),
-      'stop',
+      'retry',
+    );
+  });
+
+  test('a message already in the conversation is never sent again', () => {
+    assert.equal(nextStep({ status: 0 }, true, { voice: true, attempts: 0 }), 'done');
+    assert.equal(
+      nextStep({ status: 409, reason: claimed }, true, { voice: true, attempts: 0 }),
+      'done',
     );
     assert.equal(
-      voiceStep(
-        { status: 409, reason: 'This conversation has been reset. Reload it before continuing.' },
-        false,
-      ),
-      'stop',
+      nextStep({ status: 409, reason: 'This message ID is already in use.' }, true, {
+        voice: false,
+        attempts: 0,
+      }),
+      'done',
+    );
+  });
+
+  test('a voice message gets a new ID only when the server holds a dead claim and it is not in the chat', () => {
+    assert.equal(
+      nextStep({ status: 409, reason: claimed }, false, { voice: true, attempts: 0 }),
+      'renew',
     );
     assert.equal(
-      voiceStep({ status: 400, reason: 'Send a shorter voice message.' }, false),
-      'stop',
+      nextStep({ status: 409, reason: claimed }, undefined, { voice: true, attempts: 0 }),
+      'retry',
     );
-    assert.equal(voiceStep({ status: 413 }, false), 'stop');
-    assert.equal(voiceStep({ status: 409, retryable: true, reason: 'Busy' }, false), 'retry');
+  });
+
+  test('a recording with no speech is dropped', () => {
+    const silent = {
+      status: 400,
+      retryable: true,
+      reason: 'No speech was detected. Please record again.',
+    };
+    assert.equal(nextStep(silent, false, { voice: true, attempts: 0 }), 'drop');
+    assert.equal(nextStep(silent, undefined, { voice: true, attempts: 0 }), 'drop');
+  });
+
+  test('a refusal is not sent again by itself, even when the server calls it retryable', () => {
+    const refusals = [
+      { status: 409, retryable: false, reason: 'This voice message was cancelled.' },
+      {
+        status: 409,
+        retryable: true,
+        reason: 'This conversation has been reset. Reload it before continuing.',
+      },
+      { status: 400, retryable: true, reason: 'Choose an audio recording.' },
+      { status: 400, reason: 'Send a shorter voice message.' },
+      { status: 404, reason: 'The reply is unavailable in this conversation.' },
+      { status: 413 },
+    ];
+    for (const failure of refusals) {
+      assert.equal(nextStep(failure, false, { voice: true, attempts: 0 }), 'fail');
+      assert.equal(nextStep(failure, false, { voice: false, attempts: 0 }), 'fail');
+    }
+  });
+
+  test('a message is in the tail only while nothing in the chat comes after it', () => {
+    const item: Outgoing = {
+      id: 'o',
+      text: 'hi',
+      status: 'queued',
+      createdAt: '2026-11-18T09:00:00.000Z',
+    };
+    assert.equal(inTail(item, [message('a', '2026-11-18T08:59:00.000Z')]), true);
+    assert.equal(inTail(item, [message('b', '2026-11-18T09:05:00.000Z')]), false);
   });
 });
 

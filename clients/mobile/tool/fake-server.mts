@@ -39,7 +39,7 @@ interface FixtureArtifact {
   url: string;
 }
 
-type AudioFault = 'drop-response' | 'abort-after-claim' | 'cancel' | 'busy' | 'hang';
+type AudioFault = 'drop-response' | 'abort-after-claim' | 'cancel' | 'busy' | 'hang' | 'silent';
 
 interface FixtureStore {
   messages: FixtureMessage[];
@@ -307,6 +307,12 @@ app.get('/api/trust', async () =>
 );
 app.get('/api/state', async () => view());
 app.get('/api/messages', async () => ({ messages: store.messages, hasMore: false }));
+app.get('/api/messages/around/:id', async (request, reply) => {
+  const { id } = request.params as { id: string };
+  const message = store.messages.find((item) => item.id === id);
+  if (!message) return reply.code(404).send({ error: 'Message not found.' });
+  return [message];
+});
 app.post('/api/messages', async (request, reply) => {
   const body = request.body as {
     clientMessageId?: unknown;
@@ -823,6 +829,12 @@ app.post('/api/messages/audio', async (request, reply) => {
   if (fault === 'busy') {
     await persist();
     return reply.code(503).send({ error: 'Synthetic busy server.' });
+  }
+  if (fault === 'silent') {
+    await persist();
+    return reply
+      .code(400)
+      .send({ retryable: true, error: 'No speech was detected. Please record again.' });
   }
   if (fault === 'hang') {
     await persist();
