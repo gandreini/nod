@@ -1,7 +1,8 @@
 import type { Activity, Message } from '../connection/contracts';
 
-export function workState(activity: Activity[], sending: boolean, writing: boolean) {
+export function workState(activity: Activity[], outgoing: Outgoing[], writing: boolean) {
   const working = activity.some((item) => !item.background);
+  const sending = outgoing.some((item) => item.status === 'sending' && !item.attempts);
   return { working, thinking: (working || sending) && !writing };
 }
 
@@ -51,6 +52,21 @@ export function keepOlder(older: Message[], previous: Message[], next: Message[]
     older,
     previous.filter((message) => order(message, start) < 0),
   );
+}
+
+export type TimelineRow = { key: string; message: Message } | { key: string; outgoing: Outgoing };
+
+export function timeline(messages: Message[], outgoing: Outgoing[]): TimelineRow[] {
+  const rows = [
+    ...messages.map((message) => ({ at: Date.parse(message.createdAt), key: message.id, message })),
+    ...outgoing.map((item) => ({ at: Date.parse(item.createdAt), key: item.id, outgoing: item })),
+  ];
+  return rows.sort((a, b) => a.at - b.at).map(({ at: _at, ...row }) => row);
+}
+
+export function sendTime(now: Date, messages: Message[]) {
+  const latest = Math.max(0, ...messages.map((message) => Date.parse(message.createdAt)));
+  return new Date(Math.max(now.getTime(), latest + 1)).toISOString();
 }
 
 export function unsent(outgoing: Outgoing[], messages: Message[]): Outgoing[] {

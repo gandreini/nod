@@ -1,4 +1,4 @@
-import { useEffect, useId, useRef, useState, type ReactNode } from 'react';
+import { useEffect, useRef, useState, type ReactNode } from 'react';
 import {
   Animated,
   ScrollView,
@@ -10,7 +10,7 @@ import {
   type StyleProp,
   type ViewStyle,
 } from 'react-native';
-import Svg, { Defs, LinearGradient, Rect, Stop } from 'react-native-svg';
+import { GradientFill } from './gradient-fill';
 
 const edge = 1;
 
@@ -29,7 +29,6 @@ function Fade({
   shown: boolean;
   width: number;
 }) {
-  const id = useId().replace(/[^a-zA-Z0-9]/g, '');
   const opacity = useRef(new Animated.Value(0)).current;
   useEffect(() => {
     Animated.timing(opacity, {
@@ -43,22 +42,7 @@ function Fade({
       pointerEvents="none"
       style={[styles.fade, side === 'start' ? styles.start : styles.end, { width, opacity }]}
     >
-      <Svg width="100%" height="100%">
-        <Defs>
-          <LinearGradient
-            id={id}
-            x1={side === 'start' ? '0' : '1'}
-            y1="0"
-            x2={side === 'start' ? '1' : '0'}
-            y2="0"
-          >
-            <Stop offset="0" stopColor={color} stopOpacity={1} />
-            <Stop offset="0.35" stopColor={color} stopOpacity={0.9} />
-            <Stop offset="1" stopColor={color} stopOpacity={0} />
-          </LinearGradient>
-        </Defs>
-        <Rect width="100%" height="100%" fill={`url(#${id})`} />
-      </Svg>
+      <GradientFill color={color} opaque={side} mid={{ offset: 0.35, opacity: 0.9 }} />
     </Animated.View>
   );
 }

@@ -15,7 +15,8 @@ import { AppLogo } from './app-logo';
 import { ApprovalCard, ChoiceCard, ConnectAppCard, type Answer } from '../chat/cards';
 import { MessageAttachments } from '../files/attachment-views';
 import type { Draft } from '../files/attachments';
-import { AssistantMessage, ScrollToLatest, UserBubble } from '../chat/chat-screen';
+import { AssistantMessage, ScrollToLatest, Unsent, UserBubble } from '../chat/chat-screen';
+import type { Outgoing } from '../chat/chat-state';
 import { Composer } from '../chat/composer';
 import type { ApprovalState, Message } from '../connection/contracts';
 import { useNod } from '../connection/nod-context';
@@ -65,6 +66,13 @@ const drafts: Draft[] = [
   },
 ];
 
+const unsent: Outgoing = {
+  id: 'unsent',
+  text: '',
+  status: 'failed',
+  error: 'Could not reach the server: Network request failed',
+  createdAt: '2026-11-06T12:00:00.000Z',
+};
 const answer: Answer = () => new Promise((resolve) => setTimeout(() => resolve('sent'), 800));
 const levels = [0.2, 0.5, 0.8, 0.4, 0.9, 0.6, 0.3, 0.7, 1, 0.5, 0.35, 0.6, 0.8, 0.45, 0.25, 0.55];
 
@@ -326,19 +334,17 @@ export function GalleryScreen() {
 
       <Section title="Chat messages">
         <UserBubble text="What's on my calendar tomorrow?" theme={theme} />
-        <UserBubble text="Sending…" theme={theme} faded />
-        <UserBubble text="This one is waiting for the connection" theme={theme} faded>
-          <Text style={[text.small, { color: theme.mutedForeground, marginTop: 4 }]}>
-            Sending… waiting for the connection
-          </Text>
+        <UserBubble text="Sending…" theme={theme} dim={0.6} />
+        <UserBubble text="This one is being sent again" theme={theme} dim={0.6}>
+          <Unsent
+            outgoing={{ ...unsent, status: 'sending', attempts: 1 }}
+            theme={theme}
+            onRetry={() => {}}
+            onDiscard={() => {}}
+          />
         </UserBubble>
-        <UserBubble text="This one could not be sent" theme={theme}>
-          <Text style={[text.small, { color: theme.secondary, marginTop: 4 }]}>
-            Not sent yet · Tap to try again
-          </Text>
-          <Text style={[text.small, { color: theme.mutedForeground }]}>
-            Could not reach the server: Network request failed
-          </Text>
+        <UserBubble text="This one could not be sent" theme={theme} dim={0.5}>
+          <Unsent outgoing={unsent} theme={theme} onRetry={() => {}} onDiscard={() => {}} />
         </UserBubble>
         <UserBubble
           text="Hi Nod, can you check my calendar for tomorrow and move the planning meeting?"

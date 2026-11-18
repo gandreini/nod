@@ -1,15 +1,17 @@
-import { ChevronDown, RefreshCw } from '../ui/icons';
+import { ChevronDown, RefreshCw, Trash2 } from '../ui/icons';
+import {
+  KeyboardAvoidingView,
+  useReanimatedKeyboardAnimation,
+} from 'react-native-keyboard-controller';
+import Reanimated, { useAnimatedStyle } from 'react-native-reanimated';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import Svg, { Defs, LinearGradient, Rect, Stop } from 'react-native-svg';
 import { ChatMenu } from './chat-menu';
 import { memo, useCallback, useEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
+  Alert,
   Animated,
   FlatList,
-  Keyboard,
-  Platform,
-  KeyboardAvoidingView,
   Pressable,
   StyleSheet,
   Text,
@@ -19,11 +21,12 @@ import {
 } from 'react-native';
 import { artifactSource } from '../connection/api';
 import { ApprovalCard, ChoiceCard, ConnectAppCard, connectLink, type Answer } from './cards';
-import type { LocalFile, Outgoing, Recording } from './chat-state';
+import { timeline, type LocalFile, type Outgoing, type Recording } from './chat-state';
 import type { Connection } from '../connection/connection';
 import { splitQuestion, type Activity, type Artifact, type Message } from '../connection/contracts';
 import { Markdown } from './markdown';
 import { NodGlyph, NodMark } from '../ui/nod-mark';
+import { GradientFill } from '../ui/gradient-fill';
 import { Loading } from '../ui/ui';
 import { ownedArtifact } from '../connection/links';
 import { useLiveLine } from './live-line';
@@ -49,6 +52,7 @@ const offlineDelay = 3000;
 const awayOffset = 400;
 const initialComposerHeight = 76;
 const menuGap = 12;
+const unsentSlop = { top: 12, bottom: 12, left: 8, right: 8 };
 
 function Fade({
   theme,
@@ -59,25 +63,62 @@ function Fade({
   edge: 'top' | 'bottom';
   style: StyleProp<ViewStyle>;
 }) {
-  const id = `${edge}-fade`;
   return (
     <View pointerEvents="none" style={style}>
-      <Svg width="100%" height="100%">
-        <Defs>
-          <LinearGradient
-            id={id}
-            x1="0"
-            y1={edge === 'top' ? 0 : 1}
-            x2="0"
-            y2={edge === 'top' ? 1 : 0}
-          >
-            <Stop offset="0" stopColor={theme.background} stopOpacity={1} />
-            <Stop offset="0.5" stopColor={theme.background} stopOpacity={0.88} />
-            <Stop offset="1" stopColor={theme.background} stopOpacity={0} />
-          </LinearGradient>
-        </Defs>
-        <Rect x="0" y="0" width="100%" height="100%" fill={`url(#${id})`} />
-      </Svg>
+      <GradientFill color={theme.background} opaque={edge} mid={{ offset: 0.5, opacity: 0.88 }} />
+    </View>
+  );
+}
+
+export function Unsent({
+  outgoing,
+  theme,
+  onRetry,
+  onDiscard,
+}: {
+  outgoing: Outgoing;
+  theme: Theme;
+  onRetry(id: string): void;
+  onDiscard(id: string): void;
+}) {
+  const failed = outgoing.status === 'failed';
+  const reason = outgoing.error;
+  return (
+    <View style={styles.unsent} accessibilityLiveRegion="polite">
+      <Pressable
+        onPress={() => reason && Alert.alert(failed ? 'Message not sent' : 'Sending again', reason)}
+        disabled={!reason}
+        hitSlop={unsentSlop}
+        accessibilityLabel={`${failed ? 'Not sent' : 'Sending again'}. ${reason ?? ''}`}
+        style={styles.unsentStatus}
+      >
+        {failed ? null : <ActivityIndicator size="small" color={theme.mutedForeground} />}
+        <Text style={[styles.caption, { color: theme.mutedForeground }]}>
+          {failed ? 'Not sent' : 'Sending again…'}
+        </Text>
+      </Pressable>
+      {failed ? (
+        <Pressable
+          onPress={() => onRetry(outgoing.id)}
+          hitSlop={unsentSlop}
+          accessibilityRole="button"
+          accessibilityLabel="Try sending this message again"
+          style={styles.unsentAction}
+        >
+          <RefreshCw size={14} color={theme.link} />
+          <Text style={[styles.caption, styles.unsentLabel, { color: theme.link }]}>Try again</Text>
+        </Pressable>
+      ) : null}
+      <Pressable
+        onPress={() => onDiscard(outgoing.id)}
+        hitSlop={unsentSlop}
+        accessibilityRole="button"
+        accessibilityLabel="Delete this unsent message"
+        style={styles.unsentAction}
+      >
+        <Trash2 size={14} color={theme.link} />
+        <Text style={[styles.caption, styles.unsentLabel, { color: theme.link }]}>Delete</Text>
+      </Pressable>
     </View>
   );
 }
@@ -188,27 +229,27 @@ function Transcript({ text, theme }: { text: string; theme: Theme }) {
 export function UserBubble({
   text,
   theme,
-  faded,
+  dim = 1,
   audio,
   files,
   children,
 }: {
   text: string;
   theme: Theme;
-  faded?: boolean;
+  dim?: number;
   audio?: React.ReactNode;
   files?: React.ReactNode;
   children?: React.ReactNode;
 }) {
   return (
-    <View style={[styles.userRow, styles.userStack, { opacity: faded ? 0.6 : 1 }]}>
-      {files}
+    <View style={[styles.userRow, styles.userStack]}>
+      {files ? <View style={{ opacity: dim }}>{files}</View> : null}
       {text || audio ? (
         <View
           style={[
             styles.userBubble,
             audio ? styles.audioBubble : null,
-            { backgroundColor: theme.chatSent },
+            { backgroundColor: theme.chatSent, opacity: dim },
           ]}
         >
           {audio}
@@ -241,7 +282,7 @@ function UserMessage({
   attachments,
   local,
   recording,
-  faded,
+  dim,
   connection,
   theme,
   children,
@@ -251,7 +292,7 @@ function UserMessage({
   attachments?: Artifact[];
   local?: LocalFile[];
   recording?: Recording;
-  faded?: boolean;
+  dim?: number;
   connection: Connection;
   theme: Theme;
   children?: React.ReactNode;
@@ -261,7 +302,7 @@ function UserMessage({
     <UserBubble
       text={audio ? (transcript ?? text) : text}
       theme={theme}
-      faded={faded}
+      dim={dim}
       files={
         files.length || local?.length ? (
           <MessageAttachments
@@ -406,38 +447,12 @@ const ChatRow = memo(function ChatRow({
         text={outgoing.text}
         local={outgoing.files}
         recording={outgoing.audio}
-        faded={outgoing.status === 'sending'}
+        dim={outgoing.status === 'sending' ? 0.6 : outgoing.status === 'failed' ? 0.5 : 1}
         connection={connection}
         theme={theme}
       >
-        {outgoing.status === 'failed' ? (
-          <Pressable
-            onPress={() => onRetry(outgoing.id)}
-            onLongPress={() => onDiscard(outgoing.id)}
-            accessibilityRole="button"
-            accessibilityLabel={`Not sent yet. ${outgoing.error ?? ''}`}
-            accessibilityHint="Tap to try again, long-press to discard it"
-            style={styles.failed}
-          >
-            <View style={styles.statusLine}>
-              <RefreshCw size={12} color={theme.secondary} />
-              <Text style={[styles.caption, { color: theme.secondary }]}>
-                Not sent yet · Tap to try again
-              </Text>
-            </View>
-            {outgoing.error ? (
-              <Text numberOfLines={2} style={[styles.reason, { color: theme.mutedForeground }]}>
-                {outgoing.error}
-              </Text>
-            ) : null}
-          </Pressable>
-        ) : outgoing.status === 'sending' && outgoing.attempts ? (
-          <View style={[styles.failed, styles.statusLine]} accessibilityLiveRegion="polite">
-            <ActivityIndicator size="small" color={theme.mutedForeground} />
-            <Text style={[styles.caption, { color: theme.mutedForeground }]}>
-              Sending… waiting for the connection
-            </Text>
-          </View>
+        {outgoing.status === 'failed' || (outgoing.status === 'sending' && outgoing.attempts) ? (
+          <Unsent outgoing={outgoing} theme={theme} onRetry={onRetry} onDiscard={onDiscard} />
         ) : null}
       </UserMessage>
     );
@@ -483,22 +498,7 @@ function ChatComposer({
   const voice = useVoiceRecorder();
   const files = useAttachments(connection);
   const [attaching, setAttaching] = useState(false);
-  const [keyboard, setKeyboard] = useState(false);
   const insets = useSafeAreaInsets();
-
-  useEffect(() => {
-    const ios = Platform.OS === 'ios';
-    const shown = Keyboard.addListener(ios ? 'keyboardWillShow' : 'keyboardDidShow', () =>
-      setKeyboard(true),
-    );
-    const hidden = Keyboard.addListener(ios ? 'keyboardWillHide' : 'keyboardDidHide', () =>
-      setKeyboard(false),
-    );
-    return () => {
-      shown.remove();
-      hidden.remove();
-    };
-  }, []);
 
   useEffect(() => {
     if (voice.active && voice.seconds >= maxRecordingSeconds) void finishVoice();
@@ -522,7 +522,7 @@ function ChatComposer({
 
   return (
     <View
-      style={[styles.composerWrap, { paddingBottom: 12 + (keyboard ? 0 : insets.bottom) }]}
+      style={[styles.composerWrap, { paddingBottom: 12 + insets.bottom }]}
       onLayout={(event) => onHeight(event.nativeEvent.layout.height)}
     >
       <Fade theme={theme} edge="bottom" style={styles.bottomFade} />
@@ -585,14 +585,17 @@ export function ChatScreen() {
     return () => clearTimeout(timer);
   }, [chat.live]);
   const host = new URL(connection.origin).host;
+  const keyboard = useReanimatedKeyboardAnimation();
+  const centred = useAnimatedStyle(() => ({
+    transform: [{ translateY: keyboard.height.value / 2 }],
+  }));
 
   const toLatest = useCallback(() => {
     list.current?.scrollToOffset({ offset: 0, animated: true });
   }, []);
 
   const rows: Row[] = [
-    ...chat.messages.map((message) => ({ key: message.id, message })),
-    ...chat.outgoing.map((outgoing) => ({ key: outgoing.id, outgoing })),
+    ...timeline(chat.messages, chat.outgoing),
     ...chat.streams
       .filter((stream) => stream.text)
       .map((stream) => ({ key: stream.id, stream: stream.text })),
@@ -621,21 +624,27 @@ export function ChatScreen() {
   );
 
   return (
-    <KeyboardAvoidingView
-      style={[styles.fill, { backgroundColor: theme.background }]}
-      behavior="padding"
-    >
-      <View style={styles.fill}>
+    <View style={[styles.fill, { backgroundColor: theme.background }]}>
+      {chat.ready && rows.length === 0 ? (
+        <Reanimated.View
+          pointerEvents="none"
+          style={[styles.empty, { paddingBottom: composerHeight }, centred]}
+        >
+          <NodMark size={56} />
+          <Text style={[styles.emptyTitle, { color: theme.foreground }]}>
+            What can I do for you?
+          </Text>
+        </Reanimated.View>
+      ) : null}
+      <KeyboardAvoidingView
+        style={styles.fill}
+        behavior="translate-with-padding"
+        keyboardVerticalOffset={-insets.bottom}
+        enabled={!handoffs.open}
+      >
         {!chat.ready ? (
           <Loading />
-        ) : rows.length === 0 ? (
-          <View style={[styles.empty, { paddingBottom: composerHeight }]}>
-            <NodMark size={56} />
-            <Text style={[styles.emptyTitle, { color: theme.foreground }]}>
-              What can I do for you?
-            </Text>
-          </View>
-        ) : (
+        ) : rows.length === 0 ? null : (
           <FlatList
             inverted
             data={rows}
@@ -663,41 +672,6 @@ export function ChatScreen() {
           />
         )}
 
-        <Fade theme={theme} edge="top" style={[styles.topFade, { height: insets.top + 64 }]} />
-        {chat.error || offline ? (
-          <View style={[styles.status, { top: insets.top + 14 }]} pointerEvents="box-none">
-            <Pressable
-              onPress={chat.reconnect}
-              accessibilityRole="button"
-              accessibilityLabel={chat.error ? `${chat.error}. Retry` : `Reconnecting to ${host}`}
-              style={[
-                styles.statusPill,
-                {
-                  backgroundColor: chat.error ? theme.errorSoft : theme.surface,
-                  borderColor: theme.border,
-                  boxShadow: theme.shadow.floating,
-                },
-              ]}
-            >
-              {chat.error ? (
-                <RefreshCw size={14} color={theme.error} />
-              ) : (
-                <ActivityIndicator size="small" color={theme.mutedForeground} />
-              )}
-              <Text
-                numberOfLines={2}
-                style={[
-                  styles.caption,
-                  styles.statusText,
-                  { color: chat.error ? theme.error : theme.mutedForeground },
-                ]}
-              >
-                {chat.error ?? `Reconnecting to ${host}…`}
-              </Text>
-            </Pressable>
-          </View>
-        ) : null}
-        <ChatMenu theme={theme} />
         <ChatComposer
           theme={theme}
           height={composerHeight}
@@ -705,7 +679,42 @@ export function ChatScreen() {
           onHeight={setComposerHeight}
           onLatest={toLatest}
         />
-      </View>
+      </KeyboardAvoidingView>
+      <Fade theme={theme} edge="top" style={[styles.topFade, { height: insets.top + 64 }]} />
+      {chat.error || offline ? (
+        <View style={[styles.status, { top: insets.top + 14 }]} pointerEvents="box-none">
+          <Pressable
+            onPress={chat.reconnect}
+            accessibilityRole="button"
+            accessibilityLabel={chat.error ? `${chat.error}. Retry` : `Reconnecting to ${host}`}
+            style={[
+              styles.statusPill,
+              {
+                backgroundColor: chat.error ? theme.errorSoft : theme.surface,
+                borderColor: theme.border,
+                boxShadow: theme.shadow.floating,
+              },
+            ]}
+          >
+            {chat.error ? (
+              <RefreshCw size={14} color={theme.error} />
+            ) : (
+              <ActivityIndicator size="small" color={theme.mutedForeground} />
+            )}
+            <Text
+              numberOfLines={2}
+              style={[
+                styles.caption,
+                styles.statusText,
+                { color: chat.error ? theme.error : theme.mutedForeground },
+              ]}
+            >
+              {chat.error ?? `Reconnecting to ${host}…`}
+            </Text>
+          </Pressable>
+        </View>
+      ) : null}
+      <ChatMenu theme={theme} />
       {handoffs.open ? (
         <BrowserSheet
           key={handoffs.open.turnId}
@@ -716,7 +725,7 @@ export function ChatScreen() {
           onReturned={() => handoffs.markReturned(handoffs.open!.messageId)}
         />
       ) : null}
-    </KeyboardAvoidingView>
+    </View>
   );
 }
 
@@ -747,19 +756,20 @@ const styles = StyleSheet.create({
     borderBottomLeftRadius: 4,
   },
   messageText: { fontFamily: font.regular, fontSize: 17, lineHeight: 25 },
-  failed: { marginTop: 4, alignItems: 'flex-end', gap: 2 },
-  statusLine: { flexDirection: 'row', alignItems: 'center', gap: 6 },
-  reason: {
-    fontFamily: font.regular,
-    fontSize: 12,
-    lineHeight: 16,
-    textAlign: 'right',
-    maxWidth: 280,
-  },
+  unsent: { flexDirection: 'row', alignItems: 'center', justifyContent: 'flex-end', gap: 16 },
+  unsentStatus: { flexDirection: 'row', alignItems: 'center', gap: 6 },
+  unsentAction: { flexDirection: 'row', alignItems: 'center', gap: 4 },
+  unsentLabel: { fontFamily: font.medium },
   thinking: { flexDirection: 'row', alignItems: 'center', gap: 8, paddingVertical: 8 },
   workingDetails: { flex: 1, gap: 2 },
   olderSpinner: { paddingVertical: 16 },
-  empty: { flex: 1, alignItems: 'center', justifyContent: 'center', gap: 16, padding: 24 },
+  empty: {
+    ...StyleSheet.absoluteFill,
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 16,
+    padding: 24,
+  },
   emptyTitle: { fontFamily: font.semibold, fontSize: 24, letterSpacing: -0.5 },
   audioBubble: { gap: 8, minWidth: 260 },
   voiceError: { paddingHorizontal: 8, paddingBottom: 8 },

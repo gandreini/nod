@@ -24,6 +24,7 @@ export interface ServerEventHandlers {
 
 const firstDelay = 3000;
 const maxDelay = 30000;
+const silentLimit = 45000;
 
 export function useServerEvents(connection: Connection, handlers: ServerEventHandlers) {
   const [live, setLive] = useState(false);
@@ -66,17 +67,35 @@ export function useServerEvents(connection: Connection, handlers: ServerEventHan
       reopen();
     };
     control.current = reconnect;
-    (events as unknown as { _pollAgain(): void })._pollAgain = () => {
+    let open = false;
+    let heard = Date.now();
+    const inner = events as unknown as { _pollAgain(): void; _handleEvent(text: string): void };
+    inner._pollAgain = () => {
+      open = false;
       setLive(false);
       retry();
     };
+    const handle = inner._handleEvent.bind(events);
+    inner._handleEvent = (text) => {
+      heard = Date.now();
+      handle(text);
+    };
+    const watch = setInterval(() => {
+      if (!open || stopped || Date.now() - heard < silentLimit) return;
+      open = false;
+      setLive(false);
+      reconnect();
+    }, silentLimit / 3);
     events.addEventListener('open', () => {
+      open = true;
+      heard = Date.now();
       clearPending();
       delay = firstDelay;
       setLive(true);
       latest.current.opened();
     });
     events.addEventListener('error', (event) => {
+      open = false;
       setLive(false);
       const status = 'xhrStatus' in event ? event.xhrStatus : undefined;
       if (status === 401) {
@@ -109,6 +128,7 @@ export function useServerEvents(connection: Connection, handlers: ServerEventHan
     return () => {
       stopped = true;
       clearPending();
+      clearInterval(watch);
       lifecycle.remove();
       events.removeAllEventListeners();
       events.close();

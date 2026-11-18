@@ -39,7 +39,7 @@ interface FixtureArtifact {
   url: string;
 }
 
-type AudioFault = 'drop-response' | 'abort-after-claim' | 'cancel' | 'busy';
+type AudioFault = 'drop-response' | 'abort-after-claim' | 'cancel' | 'busy' | 'hang';
 
 interface FixtureStore {
   messages: FixtureMessage[];
@@ -823,6 +823,11 @@ app.post('/api/messages/audio', async (request, reply) => {
   if (fault === 'busy') {
     await persist();
     return reply.code(503).send({ error: 'Synthetic busy server.' });
+  }
+  if (fault === 'hang') {
+    await persist();
+    reply.hijack();
+    return;
   }
   const fingerprint = createHash('sha256').update(recording.bytes).digest('hex');
   const claims = (store.audioClaims ??= {});

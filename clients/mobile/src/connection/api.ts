@@ -81,23 +81,44 @@ export async function request<T>(
   method: Method = 'GET',
   body?: unknown,
   signal?: AbortSignal,
+  timeout = 30_000,
 ): Promise<T> {
   const form = body instanceof FormData;
-  let response: Response;
+  const deadline = new AbortController();
+  let late = false;
+  const timer = setTimeout(() => {
+    late = true;
+    deadline.abort();
+  }, timeout);
+  const cancel = () => deadline.abort();
+  if (signal?.aborted) cancel();
+  signal?.addEventListener('abort', cancel, { once: true });
   try {
-    response = await fetch(`${connection.origin}${path}`, {
-      method,
-      headers: {
-        Authorization: `Bearer ${connection.token}`,
-        ...(body === undefined || form ? {} : { 'Content-Type': 'application/json' }),
-      },
-      ...(body === undefined ? {} : { body: form ? body : JSON.stringify(body) }),
-      signal,
-    });
-  } catch (error) {
-    throw unreachable(connection, error);
+    let response: Response;
+    try {
+      response = await fetch(`${connection.origin}${path}`, {
+        method,
+        headers: {
+          Authorization: `Bearer ${connection.token}`,
+          ...(body === undefined || form ? {} : { 'Content-Type': 'application/json' }),
+        },
+        ...(body === undefined ? {} : { body: form ? body : JSON.stringify(body) }),
+        signal: deadline.signal,
+      });
+      return await read<T>(response);
+    } catch (error) {
+      if (late)
+        throw new ApiError(
+          0,
+          `${new URL(connection.origin).host} did not answer within ${Math.round(timeout / 1000)} s`,
+        );
+      if (error instanceof ApiError) throw error;
+      throw unreachable(connection, error);
+    }
+  } finally {
+    clearTimeout(timer);
+    signal?.removeEventListener('abort', cancel);
   }
-  return read<T>(response);
 }
 
 function api<T>(connection: Connection, path: string, body?: unknown) {
@@ -161,6 +182,7 @@ export function postAudio(
   input: { id: string; threadId: string },
   file: Blob,
   name: string,
+  timeout = 180_000,
 ) {
   const form = new FormData();
   form.append(
@@ -168,11 +190,18 @@ export function postAudio(
     JSON.stringify({ clientMessageId: input.id, threadId: input.threadId, text: '' }),
   );
   form.append('file', file, name);
-  return request<SubmitMessageResponse>(connection, '/api/messages/audio', 'POST', form);
+  return request<SubmitMessageResponse>(
+    connection,
+    '/api/messages/audio',
+    'POST',
+    form,
+    undefined,
+    timeout,
+  );
 }
 
 export function postUpload(connection: Connection, file: Blob, name: string, signal?: AbortSignal) {
   const form = new FormData();
   form.append('file', file, name);
-  return request<Artifact>(connection, '/api/uploads', 'POST', form, signal);
+  return request<Artifact>(connection, '/api/uploads', 'POST', form, signal, 600_000);
 }

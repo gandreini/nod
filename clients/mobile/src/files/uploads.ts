@@ -19,13 +19,18 @@ const preparations = new Map<string, Promise<unknown>>();
 export function prepareTranscription(connection: Connection) {
   let pending = preparations.get(connection.origin);
   if (!pending) {
-    pending = request(connection, '/api/speech/prepare', 'POST', { inputOnly: true }).catch(
-      (error: unknown) => {
-        preparations.delete(connection.origin);
-        if (error instanceof ApiError && error.status === 404) return;
-        throw error;
-      },
-    );
+    pending = request(
+      connection,
+      '/api/speech/prepare',
+      'POST',
+      { inputOnly: true },
+      undefined,
+      300_000,
+    ).catch((error: unknown) => {
+      preparations.delete(connection.origin);
+      if (error instanceof ApiError && error.status === 404) return;
+      throw error;
+    });
     preparations.set(connection.origin, pending);
   }
   return pending;

@@ -9,6 +9,7 @@ import { Stack } from 'expo-router';
 import { StatusBar } from 'expo-status-bar';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { View } from 'react-native';
+import { KeyboardProvider } from 'react-native-keyboard-controller';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import { ConnectScreen } from '../connection/connect-screen';
 import type { Connection } from '../connection/connection';
@@ -121,7 +122,9 @@ export default function Layout() {
   const theme = useTheme();
   return (
     <SafeAreaProvider>
-      <Root />
+      <KeyboardProvider>
+        <Root />
+      </KeyboardProvider>
       <StatusBar style={theme.dark ? 'light' : 'dark'} />
     </SafeAreaProvider>
   );

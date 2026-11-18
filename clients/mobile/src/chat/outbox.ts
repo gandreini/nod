@@ -33,7 +33,7 @@ export function createOutbox(deps: OutboxDeps) {
     }, delay);
 
   async function deliver(item: Outgoing): Promise<void> {
-    if (stopped) return;
+    if (stopped || !items.some((entry) => entry.id === item.id)) return;
     const thread = deps.thread();
     if (!thread) return later(() => void deliver(item), 1000);
     const sendId = item.sendId ?? item.id;
@@ -103,7 +103,7 @@ export function createOutbox(deps: OutboxDeps) {
       return deliver(next);
     },
     discard(id: string) {
-      items = items.filter((entry) => entry.id !== id || entry.status !== 'failed');
+      items = items.filter((entry) => entry.id !== id || entry.status === 'sent');
       publish();
     },
     restore(saved: Outgoing[], arrived: Set<string>) {

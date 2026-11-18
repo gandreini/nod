@@ -14,7 +14,14 @@ import {
 import { prepareTranscription, sendAudio } from '../files/uploads';
 import type { Answer } from './cards';
 import { attachmentIds, type Draft } from '../files/attachments';
-import { keepOlder, mergeMessages, workState, type Outgoing, type Recording } from './chat-state';
+import {
+  keepOlder,
+  mergeMessages,
+  sendTime,
+  workState,
+  type Outgoing,
+  type Recording,
+} from './chat-state';
 import { createOutbox, type Outbox } from './outbox';
 import { dropRecording, keepRecording, loadPending, savePending } from '../voice/pending-voice';
 import type { Connection } from '../connection/connection';
@@ -136,7 +143,10 @@ export function useChat(connection: Connection, onRefused: (notice: string) => v
   );
 
   const { live, reconnect: reconnectEvents } = useServerEvents(connection, {
-    opened: () => void refresh(),
+    opened: () => {
+      void refresh();
+      void outbox.current?.revive();
+    },
     received,
     refused,
     failed: setError,
@@ -198,7 +208,7 @@ export function useChat(connection: Connection, onRefused: (notice: string) => v
           }
         : {}),
       status: 'sending',
-      createdAt: new Date().toISOString(),
+      createdAt: sendTime(new Date(), stateRef.current?.messages ?? []),
     });
   }, []);
 
@@ -212,7 +222,7 @@ export function useChat(connection: Connection, onRefused: (notice: string) => v
       text: '',
       audio: { ...audio, uri },
       status: 'sending',
-      createdAt: new Date().toISOString(),
+      createdAt: sendTime(new Date(), stateRef.current?.messages ?? []),
     });
   }, []);
 
@@ -334,11 +344,7 @@ export function useChat(connection: Connection, onRefused: (notice: string) => v
   const activity = state?.activity ?? [];
   const active = Object.entries(streams.active).map(([id, stream]) => ({ id, ...stream }));
   const writing = active.some((stream) => stream.text);
-  const work = workState(
-    activity,
-    outgoing.some((item) => item.status === 'sending'),
-    writing,
-  );
+  const work = workState(activity, outgoing, writing);
 
   return {
     ready: state !== null,

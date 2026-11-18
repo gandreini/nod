@@ -10,7 +10,10 @@ import { startFakeServer } from './fake-server.ts';
 const threadId = '00000000-0000-4000-8000-000000000001';
 const recording = new Uint8Array([82, 73, 70, 70, 1, 2, 3, 4, 5, 6, 7, 8]);
 
-async function harness(faults: string[] = []) {
+async function harness(
+  faults: string[] = [],
+  later: (run: () => void, delay: number) => void = (run) => void setTimeout(run, 0),
+) {
   const server = await startFakeServer();
   const connection: Connection = { origin: server.origin, token: server.token, owner: 'synthetic' };
   if (faults.length) await server.control('/fixture/audio-faults', { faults });
@@ -29,11 +32,12 @@ async function harness(faults: string[] = []) {
         { id: sendId, threadId: thread },
         new Blob([recording], { type: 'audio/wav' }),
         'voice.wav',
+        300,
       ),
     arrived: (sendId) =>
       getState(connection).then((state) => state.messages.some((message) => message.id === sendId)),
     newId: randomUUID,
-    later: (run) => void setTimeout(run, 0),
+    later,
     onChange: () => {},
     onRefused: () => {},
     onDelivered: () => void getState(connection).then((state) => outbox.settle(state.messages)),
@@ -108,6 +112,39 @@ describe('message delivery', () => {
         arrived.map((message) => message.id),
         [item.id],
       );
+    } finally {
+      await server.stop();
+    }
+  });
+
+  test('a voice send the server never answers gives up on that attempt and arrives once', async () => {
+    const { server, outbox, settled, voices } = await harness(['hang']);
+    try {
+      const item = voice();
+      await outbox.add(item);
+      await settled();
+      assert.deepEqual(
+        (await voices()).map((message) => message.id),
+        [item.id],
+      );
+    } finally {
+      await server.stop();
+    }
+  });
+
+  test('a voice message discarded while it waits to be sent again is never sent', async () => {
+    const queued: (() => void)[] = [];
+    const { server, outbox, voices } = await harness(['busy'], (run) => void queued.push(run));
+    try {
+      const item = voice();
+      await outbox.add(item);
+      assert.equal(outbox.items()[0].status, 'sending');
+      outbox.discard(item.id);
+      assert.equal(outbox.items().length, 0);
+      queued.splice(0).forEach((run) => run());
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      assert.equal((await voices()).length, 0);
+      assert.equal(outbox.items().length, 0);
     } finally {
       await server.stop();
     }

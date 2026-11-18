@@ -1,6 +1,6 @@
 import { ChevronLeft, ChevronRight, RefreshCw } from './icons';
 import { router } from 'expo-router';
-import { useEffect, useState, type ComponentType, type ReactNode } from 'react';
+import { useEffect, useRef, useState, type ComponentType, type ReactNode } from 'react';
 import {
   ActivityIndicator,
   Pressable,
@@ -24,6 +24,7 @@ export function Page({
   back,
   refreshing,
   onRefresh,
+  onEndReached,
   children,
 }: {
   title: string;
@@ -31,10 +32,12 @@ export function Page({
   back?: boolean;
   refreshing?: boolean;
   onRefresh?: () => void;
+  onEndReached?: () => void;
   children: ReactNode;
 }) {
   const theme = useTheme();
   const [pulled, setPulled] = useState(false);
+  const reachedAt = useRef(0);
   useEffect(() => {
     if (!refreshing) setPulled(false);
   }, [refreshing]);
@@ -62,6 +65,18 @@ export function Page({
       </View>
       <ScrollView
         contentContainerStyle={styles.content}
+        scrollEventThrottle={onEndReached ? 100 : undefined}
+        onScroll={
+          onEndReached
+            ? ({ nativeEvent: { contentOffset, contentSize, layoutMeasurement } }) => {
+                const left = contentSize.height - contentOffset.y - layoutMeasurement.height;
+                if (left > layoutMeasurement.height || reachedAt.current === contentSize.height)
+                  return;
+                reachedAt.current = contentSize.height;
+                onEndReached();
+              }
+            : undefined
+        }
         refreshControl={
           onRefresh ? (
             <RefreshControl

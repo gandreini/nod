@@ -6,6 +6,8 @@ import { choiceAnswerText } from '../src/connection/contracts.ts';
 import {
   keepOlder,
   mergeMessages,
+  sendTime,
+  timeline,
   unsent,
   voiceStep,
   workState,
@@ -38,13 +40,35 @@ function work(fields: Partial<Activity>): Activity {
 describe('chat state', () => {
   test('Nod shows it is working whenever Stop is offered, a task it continues included', () => {
     const task = [work({ taskId: 'task', title: 'Synthetic benchmark' })];
-    assert.deepEqual(workState(task, false, false), { working: true, thinking: true });
-    assert.deepEqual(workState(task, false, true), { working: true, thinking: false });
-    assert.deepEqual(workState([work({ background: true })], false, false), {
+    assert.deepEqual(workState(task, [], false), { working: true, thinking: true });
+    assert.deepEqual(workState(task, [], true), { working: true, thinking: false });
+    assert.deepEqual(workState([work({ background: true })], [], false), {
       working: false,
       thinking: false,
     });
-    assert.deepEqual(workState([], true, false), { working: false, thinking: true });
+    const outgoing = (fields: Partial<Outgoing>): Outgoing => ({
+      id: 'o',
+      text: '',
+      status: 'sending',
+      createdAt: '2026-11-15T08:00:00.000Z',
+      ...fields,
+    });
+    assert.deepEqual(workState([], [outgoing({})], false), { working: false, thinking: true });
+  });
+
+  test('a message waiting to be sent again does not show Nod as working', () => {
+    const waiting: Outgoing = {
+      id: 'o',
+      text: '',
+      status: 'sending',
+      attempts: 2,
+      createdAt: '2026-11-15T08:00:00.000Z',
+    };
+    assert.deepEqual(workState([], [waiting], false), { working: false, thinking: false });
+    assert.deepEqual(workState([], [{ ...waiting, status: 'failed' }], false), {
+      working: false,
+      thinking: false,
+    });
   });
 
   test('history and live state merge with each message once, oldest first', () => {
@@ -92,6 +116,37 @@ describe('chat state', () => {
     assert.deepEqual(
       mergeMessages(keepOlder(loaded, window, hidden), hidden).map((item) => item.id),
       ['a', 'b'],
+    );
+  });
+
+  test('a message that was not sent keeps its place when newer messages arrive', () => {
+    const failed: Outgoing = {
+      id: 'o',
+      text: 'not sent',
+      status: 'failed',
+      createdAt: '2026-11-15T08:02:00.000Z',
+    };
+    const rows = timeline(
+      [message('a', '2026-11-15T08:01:00.000Z'), message('b', '2026-11-15T08:03:00.000Z')],
+      [failed],
+    );
+    assert.deepEqual(
+      rows.map((row) => row.key),
+      ['a', 'o', 'b'],
+    );
+  });
+
+  test('a new message goes after the latest one even when the phone clock is behind', () => {
+    const messages = [message('a', '2026-11-15T08:05:00.000Z')];
+    const createdAt = sendTime(new Date('2026-11-15T08:00:00.000Z'), messages);
+    const rows = timeline(messages, [{ id: 'o', text: 'new', status: 'sending', createdAt }]);
+    assert.deepEqual(
+      rows.map((row) => row.key),
+      ['a', 'o'],
+    );
+    assert.equal(
+      sendTime(new Date('2026-11-15T08:09:00.000Z'), messages),
+      '2026-11-15T08:09:00.000Z',
     );
   });
 

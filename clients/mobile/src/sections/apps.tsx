@@ -1,6 +1,7 @@
 import { Blocks, CircleAlert, Plus, Search, X } from '../ui/icons';
-import { useState } from 'react';
-import { Alert, Pressable, StyleSheet, Text, TextInput, View } from 'react-native';
+import * as WebBrowser from 'expo-web-browser';
+import { useEffect, useState } from 'react';
+import { Alert, AppState, Pressable, StyleSheet, Text, TextInput, View } from 'react-native';
 import { searchApps } from '../../../../src/web/lib/app-search';
 import { errorText } from '../connection/api';
 import { AppLogo } from './app-logo';
@@ -9,6 +10,8 @@ import { useNod } from '../connection/nod-context';
 import { radius, useTheme } from '../ui/theme';
 import { Button, Empty, Group, Loaded, Notice, Page, Pill, SectionTitle, text } from '../ui/ui';
 import { useRequest, useResource } from './use-resource';
+
+const page = 40;
 
 function search(items: AppConnection[], query: string) {
   return searchApps(
@@ -100,13 +103,21 @@ function AppRow({
 
 export function AppsScreen() {
   const theme = useTheme();
-  const { ask } = useNod();
+  const { ask, connection } = useNod();
   const send = useRequest();
   const apps = useResource<AppConnection[]>('/api/apps');
   const catalog = useResource<AppConnection[]>('/api/apps/catalog', { optional: true });
   const [busy, setBusy] = useState<string>();
   const [error, setError] = useState<string>();
   const [query, setQuery] = useState('');
+  const [shown, setShown] = useState(page);
+  const reload = apps.reload;
+  useEffect(() => {
+    const subscription = AppState.addEventListener('change', (status) => {
+      if (status === 'active') void reload();
+    });
+    return () => subscription.remove();
+  }, [reload]);
   const searching = query.trim().length > 0;
   const find = (items: AppConnection[]) => (searching ? search(items, query) : items);
   const list = (apps.data ?? []).filter((app) => app.connectionId);
@@ -117,23 +128,40 @@ export function AppsScreen() {
     (app) => !app.connectionId && app.status !== 'not_configured' && !taken.has(app.slug),
   );
   const matches = find(pool);
-  const available = searching ? matches.slice(0, 60) : matches.slice(0, 40);
+  const available = matches.slice(0, shown);
   const connect = () =>
     Alert.alert('Connect an app?', 'Nod asks you which app and opens the sign-in in the chat.', [
       { text: 'Cancel', style: 'cancel' },
       { text: 'Connect', onPress: () => ask('Help me connect a new app. Ask me which one.') },
     ]);
 
+  async function signIn(app: AppConnection, connectionId?: string) {
+    const key = connectionId ?? app.slug;
+    setBusy(key);
+    setError(undefined);
+    try {
+      const { url } = await send<{ url: string }>(
+        `/api/apps/${encodeURIComponent(app.slug)}/connect`,
+        'POST',
+        { returnTo: 'window', ...(connectionId ? { connectionId } : {}) },
+      );
+      await WebBrowser.openBrowserAsync(new URL(url, connection.origin).href, {
+        presentationStyle: WebBrowser.WebBrowserPresentationStyle.PAGE_SHEET,
+      });
+    } catch (problem) {
+      setError(`Connecting ${app.name} failed: ${errorText(problem)}`);
+    } finally {
+      setBusy(undefined);
+      void apps.reload();
+    }
+  }
+
   function manage(app: AppConnection) {
-    if (!app.connectionId)
-      return Alert.alert(`Connect ${app.name}?`, 'Nod opens the sign-in for you in the chat.', [
-        { text: 'Cancel', style: 'cancel' },
-        { text: 'Connect', onPress: () => ask(`Help me connect ${app.name}.`) },
-      ]);
+    if (!app.connectionId) return void signIn(app);
     const who = account(app);
     const label = who ? `${app.name} (${who})` : app.name;
     const reconnect = needsYou(app)
-      ? [{ text: 'Sign in again', onPress: () => ask(`Help me reconnect ${label}.`) }]
+      ? [{ text: 'Sign in again', onPress: () => void signIn(app, app.connectionId) }]
       : [];
     Alert.alert(label, 'Nod uses this account when you ask it to.', [
       ...reconnect,
@@ -169,7 +197,7 @@ export function AppsScreen() {
           key={app.connectionId ?? `${app.slug}:${index}`}
           app={app}
           first={index === 0}
-          busy={busy !== undefined && busy === app.connectionId}
+          busy={busy !== undefined && busy === (app.connectionId ?? app.slug)}
           onPress={() => manage(app)}
         />
       ))}
@@ -182,6 +210,9 @@ export function AppsScreen() {
       back
       refreshing={apps.loading}
       onRefresh={apps.reload}
+      onEndReached={() => {
+        if (matches.length > shown) setShown(shown + page);
+      }}
       action={
         list.length ? (
           <Button label="Connect" icon={Plus} variant="primary" onPress={connect} />
@@ -195,7 +226,10 @@ export function AppsScreen() {
           <Search size={18} color={theme.mutedForeground} />
           <TextInput
             value={query}
-            onChangeText={setQuery}
+            onChangeText={(value) => {
+              setQuery(value);
+              setShown(page);
+            }}
             placeholder={
               pool.length > 12 ? `Search ${pool.length + list.length} apps` : 'Search apps'
             }
@@ -211,7 +245,10 @@ export function AppsScreen() {
           />
           {searching ? (
             <Pressable
-              onPress={() => setQuery('')}
+              onPress={() => {
+                setQuery('');
+                setShown(page);
+              }}
               hitSlop={8}
               accessibilityRole="button"
               accessibilityLabel="Clear search"
@@ -253,13 +290,6 @@ export function AppsScreen() {
                     {searching ? 'Results' : 'All apps'}
                   </SectionTitle>
                   {group(available)}
-                  {matches.length > available.length ? (
-                    <Text style={[text.small, styles.more, { color: theme.mutedForeground }]}>
-                      {searching
-                        ? `Showing ${available.length} of ${matches.length}. Type more to narrow it down.`
-                        : `Showing the first ${available.length}. Search to find the other ${matches.length - available.length}.`}
-                    </Text>
-                  ) : null}
                 </>
               ) : null}
               {searching && !attention.length && !connected.length && !available.length ? (
