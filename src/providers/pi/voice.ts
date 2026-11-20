@@ -5,7 +5,7 @@ import type { VoiceTalker } from '../../ports/voice.ts';
 const askNod = {
   name: 'ask_nod',
   description:
-    'Hand the owner’s request to Nod’s full agent, which can use their apps, memory, files, the web and take actions. The server sends the owner’s own words from this call; you write nothing for it.',
+    'Do the owner’s request with your full abilities: their apps, memory, files, the web and actions. The owner’s own words from this call are used; you pass nothing.',
   parameters: { type: 'object', properties: {}, additionalProperties: false },
 };
 import { createPiModelRuntime } from './models.ts';

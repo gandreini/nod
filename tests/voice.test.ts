@@ -465,7 +465,7 @@ test(
     const turnIds: string[] = [];
     const { talker, calls } = scriptedTalker(
       async function* (call) {
-        if (call.instructions.includes('Nod’s answer:')) yield 'Domani a Milano 14 gradi e sole.';
+        if (call.instructions.includes('The result:')) yield 'Domani a Milano 14 gradi e sole.';
         else if (call.turns.at(-1)!.content.includes('meteo')) yield 'Ok, chiedo a Nod. ';
         else yield 'Certo.';
       },
@@ -507,7 +507,7 @@ test(
     say(5, 'Ciao', 'Che meteo fa domani a Milano?', voiceRelayCue);
     await until(() => received.filter((m) => m.is_final).length === 3);
     const relay = calls.at(-1)!;
-    assert.match(relay.instructions, /Nod’s answer:\n\*\*Milano\*\*, domani: 14°C, sereno\./);
+    assert.match(relay.instructions, /The result:\n\*\*Milano\*\*, domani: 14°C, sereno\./);
     assert.deepEqual(received.slice(-2), [
       {
         type: 'agent_response',
@@ -529,7 +529,7 @@ test(
       event_id: 7,
       is_final: true,
     });
-    assert.equal(calls.filter((call) => call.instructions.includes('Nod’s answer:')).length, 1);
+    assert.equal(calls.filter((call) => call.instructions.includes('The result:')).length, 1);
     socket.terminate();
   },
 );
@@ -538,7 +538,7 @@ test('a failed hand-off is said aloud and a failed Nod turn is reported', databa
   const pool = await disposable(t);
   const { talker } = scriptedTalker(
     async function* (call) {
-      if (call.instructions.includes('Nod’s answer:')) yield 'Nod non ce l’ha fatta.';
+      if (call.instructions.includes('The result:')) yield 'Nod non ce l’ha fatta.';
     },
     () => true,
   );
@@ -553,10 +553,7 @@ test('a failed hand-off is said aloud and a failed Nod turn is reported', databa
     }),
   );
   await until(() => received.some((m) => m.is_final));
-  assert.equal(
-    received[0]!.content,
-    'Ok, lo chiedo a Nod. Resta pure in linea, ti dico appena ho la risposta.',
-  );
+  assert.equal(received[0]!.content, 'Ok, controllo. Un attimo.');
   await pool.query(
     "INSERT INTO turns(id,owner_id,status,error) VALUES($1,'owner-a','failed','The restaurant site did not answer.')",
     [turnIds[0]],
@@ -574,5 +571,59 @@ test('a failed hand-off is said aloud and a failed Nod turn is reported', databa
   );
   await until(() => received.filter((m) => m.is_final).length === 2);
   assert.equal(received.at(-2)!.content, 'Nod non ce l’ha fatta.');
+  socket.terminate();
+});
+
+test('silence after a hand-off stays silent and is never sent to Nod', database, async (t) => {
+  const pool = await disposable(t);
+  const submitted: string[] = [];
+  const { talker, calls } = scriptedTalker(
+    async function* () {
+      yield 'Ok, controllo. ';
+    },
+    () => true,
+  );
+  const { app, secret } = await voiceApp(pool, { agents: fakeAgents().agents, talker, submitted });
+  const { socket, received } = await engineSocket(app, secret);
+  const history = [
+    { role: 'user', content: 'Guardami su Slack se ci sono messaggi' },
+    { role: 'agent', content: 'Ok, controllo.' },
+  ];
+  socket.send(
+    JSON.stringify({ type: 'user_transcript', user_transcript: history.slice(0, 1), event_id: 1 }),
+  );
+  await until(() => submitted.length === 1 && received.some((m) => m.is_final));
+  for (const [index, silence] of ['...', ' … ', ''].entries())
+    socket.send(
+      JSON.stringify({
+        type: 'user_transcript',
+        user_transcript: [...history, { role: 'user', content: silence }],
+        event_id: index + 2,
+      }),
+    );
+  await until(() => received.filter((m) => m.is_final).length === 4);
+  assert.deepEqual(received.slice(-3), [
+    { type: 'agent_response', content: '', event_id: 2, is_final: true },
+    { type: 'agent_response', content: '', event_id: 3, is_final: true },
+    { type: 'agent_response', content: '', event_id: 4, is_final: true },
+  ]);
+  assert.equal(calls.length, 1);
+  assert.deepEqual(submitted, ['Guardami su Slack se ci sono messaggi']);
+  socket.send(
+    JSON.stringify({
+      type: 'user_transcript',
+      user_transcript: [
+        ...history,
+        { role: 'user', content: '...' },
+        { role: 'agent', content: '' },
+        { role: 'user', content: 'Grazie' },
+      ],
+      event_id: 5,
+    }),
+  );
+  await until(() => calls.length === 2);
+  await until(() => received.filter((m) => m.is_final).length === 5);
+  assert.ok(!calls[1]!.turns.some((turn) => turn.content === '...'));
+  assert.deepEqual(submitted, ['Guardami su Slack se ci sono messaggi', 'Grazie']);
   socket.terminate();
 });
