@@ -209,6 +209,9 @@ import { createVaultAccess } from './vault-access.ts';
 import { createPayments } from './payments.ts';
 import { BrowserConnectionError, createBrowserConnections } from './browser-connections.ts';
 import { cachedIcons, registerLinkOpened } from './link-previews.ts';
+import type { PushSender } from '../ports/push.ts';
+import { createFcmSender, parseServiceAccount } from '../providers/fcm/index.ts';
+import { createPush } from './push.ts';
 export interface ApplicationAdapters {
   analytics?: ProductAnalytics;
   onboardingEmail?: OnboardingEmailDelivery;
@@ -238,6 +241,7 @@ export interface ApplicationAdapters {
   trustDecisions?: DecisionModel;
   trustCurator?: MemoryCurator;
   messaging?: MessagingTransport;
+  push?: PushSender;
   linkPreviews?: LinkPreviewProvider;
   feedback?: FeedbackDelivery;
   traces?: ModelTraceGate;
@@ -482,6 +486,9 @@ export function createDefaultAdapters(
   const integrations = createComposioProvider({ proxy: integrationProxy });
   return {
     ...(analyticsEnabled(env) ? { analytics: createPostHogAnalytics() } : {}),
+    push: env.NOD_FCM_SERVICE_ACCOUNT
+      ? createFcmSender(parseServiceAccount(env.NOD_FCM_SERVICE_ACCOUNT))
+      : undefined,
     telemetry: createOtlpTelemetry(env.OTEL_EXPORTER_OTLP_ENDPOINT),
     initialize: async () => {
       await models.initialize();
@@ -2796,6 +2803,18 @@ async function initializeApplication(
   });
   adapters.models?.register(app, captureAnalytics);
   proactivity.registerRoutes(app);
+  const push = createPush({
+    pool,
+    ownerId,
+    sender: adapters.push,
+    quietHours: () => createPreferencesStore(pool, ownerId).get(),
+    redact: createTextRedactor(secrets),
+    failure: diagnostics.failure,
+  });
+  await push.initialize();
+  push.registerRoutes(app);
+  push.start();
+  app.addHook('preClose', push.stop);
 
   app.addHook('preClose', async () => {
     await adapters.models?.close();

@@ -126,6 +126,12 @@ Nod never generates a replacement when encrypted data already exists. Restore th
 Saved credentials can't be read without it. Keep a copy somewhere safe, outside the repository.
 :::
 
+## Push notifications (fork)
+
+| Variable                  | What it does                                                                                                                                                                                                                                             | Default |
+| ------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------- |
+| `NOD_FCM_SERVICE_ACCOUNT` | Only in the `gandreini/nod` fork. The Firebase service account JSON, or its base64, that sends Android push notifications to the Nod mobile app. Without it the server sends no push and doesn't offer it to the app. Keep it in `.env`; it is a secret. | Unset   |
+
 ## Channels
 
 Leave every variable for a channel blank or unset to manage it in **Channels**. The app checks your account and saves its settings encrypted.
