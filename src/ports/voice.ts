@@ -14,6 +14,7 @@ export type VoiceUsage = Partial<ProviderUsageEvent> & {
 export interface VoiceTalk {
   spoken: string;
   askNod: boolean;
+  endCall: boolean;
 }
 
 export interface VoiceTalker {

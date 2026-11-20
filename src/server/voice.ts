@@ -44,12 +44,14 @@ const spoken = {
     limit: 'Hai raggiunto il limite di spesa del mese, quindi devo fermarmi qui.',
     failed: 'Scusa, non sono riuscito a rispondere. Qualcosa è andato storto da parte mia.',
     asking: 'Ok, controllo. Un attimo.',
+    goodbye: 'Va bene, a presto!',
     handoffFailed: 'Non riesco a occuparmene adesso, qualcosa non ha funzionato.',
   },
   en: {
     limit: 'You have reached this month’s spending limit, so I have to stop here.',
     failed: 'Sorry, I could not answer that. Something went wrong on my side.',
     asking: 'Okay, let me check. One moment.',
+    goodbye: 'Okay, talk soon!',
     handoffFailed: 'I can’t take care of that right now, something went wrong.',
   },
 };
@@ -106,6 +108,7 @@ function instructions(
     '- Start with the answer itself; never repeat the question.',
     'Everything you write is spoken aloud to the owner. Never write notes, plans, reasoning or descriptions of yourself or the owner.',
     'To the owner you are one Nod. Never mention an agent, a tool, another assistant, or “Nod” as someone else; always speak in the first person.',
+    'Never say you are checking, looking, searching or doing something unless you call ask_nod in that same reply. When the owner asks you to hang up or end the call, call end_call with a short goodbye.',
     'Whenever the owner asks for something that needs their data, their apps, current information from the web, or an action, or when they answer a question you asked them earlier, call the ask_nod tool right away, without asking clarifying questions first. When you call it, the only words you write are a few words saying you are on it, for example “Ok, controllo. Un attimo.” The result will reach the call later; never pretend to have already done, checked or found something.',
     'Answer directly only small talk, general knowledge and things already in the recent chat or this call. Do not invent facts about the owner.',
     `It is now ${clockText(now, preferences)}.`,
@@ -137,6 +140,10 @@ function relayInstructions(
 }
 
 const silent = (text: string) => /^[\s.…]*$/u.test(text);
+const claimsWork = (text: string) =>
+  /^\s*(?:ok(?:ay)?[,.!]?\s*)?(?:(?:adesso|ora|subito)\s+)?(?:controllo|verifico|cerco|guardo|ci guardo|me ne occupo|let me check|checking|i'll check|let me look)\b/iu.test(
+    text,
+  );
 
 export function createVoice(options: VoiceOptions) {
   const { pool, ownerId, agents } = options;
@@ -293,6 +300,7 @@ export function createVoice(options: VoiceOptions) {
         let lastEventId: number | undefined;
         let lastTurns: VoiceTurn[] = [];
         let ownerWordsSent = 0;
+        let hangUp = false;
         const pending = new Set<string>();
         const relayed = new Set<string>();
         const words = options.voice.language === 'it' ? spoken.it : spoken.en;
@@ -337,12 +345,30 @@ export function createVoice(options: VoiceOptions) {
             )
           ).rows;
           const ready = (
-            await pool.query<{ id: string; text: string; turn_id: string }>(
-              `SELECT id,text,turn_id FROM messages WHERE owner_id=$1 AND role='assistant'
+            await pool.query<{
+              id: string;
+              text: string;
+              turn_id: string;
+              answer_choices: { options?: { label?: unknown }[] } | null;
+            }>(
+              `SELECT id,text,turn_id,answer_choices FROM messages WHERE owner_id=$1 AND role='assistant'
                  AND hidden_at IS NULL AND turn_id=ANY($2::uuid[]) ORDER BY created_at,id`,
               [ownerId, ids],
             )
-          ).rows.filter((answer) => !relayed.has(answer.id) && answer.text.trim());
+          ).rows
+            .map((answer) => {
+              const labels = (answer.answer_choices?.options ?? [])
+                .map((option) => (typeof option.label === 'string' ? option.label.trim() : ''))
+                .filter(Boolean);
+              return {
+                id: answer.id,
+                turn_id: answer.turn_id,
+                text: labels.length
+                  ? `${answer.text}\nThe owner can choose: ${labels.join('; ')}.`
+                  : answer.text,
+              };
+            })
+            .filter((answer) => !relayed.has(answer.id) && answer.text.trim());
           for (const turn of turns)
             if (['succeeded', 'failed', 'cancelled', 'waiting'].includes(turn.status)) {
               pending.delete(turn.id);
@@ -406,12 +432,14 @@ export function createVoice(options: VoiceOptions) {
               chunk,
             );
             if (signal.aborted) return;
-            if (!result.askNod) {
-              ownerWordsSent = owner.length;
+            if (result.endCall) {
+              if (!result.spoken.trim()) chunk(words.goodbye);
+              hangUp = true;
               return;
             }
+            if (!result.askNod && !claimsWork(result.spoken)) return;
             if (!result.spoken.trim()) chunk(words.asking);
-            const fresh = owner.slice(ownerWordsSent);
+            const fresh = owner.slice(Math.max(ownerWordsSent, owner.length - 3));
             ownerWordsSent = owner.length;
             if (!fresh.length) return;
             try {
@@ -425,6 +453,8 @@ export function createVoice(options: VoiceOptions) {
               });
               chunk(` ${words.handoffFailed}`);
             }
+          }).then(() => {
+            if (hangUp) setTimeout(() => socket.close(1000, 'The owner ended the call.'), 4000);
           });
         };
         const handle = (raw: Buffer) => {

@@ -8,6 +8,13 @@ const askNod = {
     'Do the owner’s request with your full abilities: their apps, memory, files, the web and actions. The owner’s own words from this call are used; you pass nothing.',
   parameters: { type: 'object', properties: {}, additionalProperties: false },
 };
+
+const endCall = {
+  name: 'end_call',
+  description:
+    'End the call when the owner asks you to hang up or clearly says goodbye. Say a short goodbye in the same reply.',
+  parameters: { type: 'object', properties: {}, additionalProperties: false },
+};
 import { createPiModelRuntime } from './models.ts';
 import { piUsageMetrics } from './usage.ts';
 
@@ -31,12 +38,13 @@ export function createPiVoiceTalker(options: { resolve(): Promise<ModelAccess> }
             timestamp: Date.now(),
           },
         ],
-        ...(canAskNod ? { tools: [askNod] } : {}),
+        ...(canAskNod ? { tools: [askNod, endCall] } : {}),
       };
       const started = performance.now();
       let reply: AssistantMessage | undefined;
       let spoken = '';
       let asked = false;
+      let ending = false;
       try {
         const stream = runtime.streamSimple(model, context, {
           signal: AbortSignal.any([AbortSignal.timeout(30_000), ...(signal ? [signal] : [])]),
@@ -49,6 +57,7 @@ export function createPiVoiceTalker(options: { resolve(): Promise<ModelAccess> }
             onText(event.delta);
           }
           if (event.type === 'toolcall_end' && event.toolCall.name === askNod.name) asked = true;
+          if (event.type === 'toolcall_end' && event.toolCall.name === endCall.name) ending = true;
           if (event.type === 'done') reply = event.message;
           if (event.type === 'error') reply = event.error;
         }
@@ -56,7 +65,7 @@ export function createPiVoiceTalker(options: { resolve(): Promise<ModelAccess> }
           throw new Error(
             `The voice model failed: ${reply.errorMessage || 'no reason given'} (${reply.provider}/${reply.model}).`,
           );
-        return { spoken, askNod: asked };
+        return { spoken, askNod: asked, endCall: ending };
       } finally {
         const metrics = piUsageMetrics(reply?.usage);
         report?.({

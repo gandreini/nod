@@ -110,7 +110,8 @@ async function disposable(t: TestContext) {
     CREATE TABLE messages (
       id uuid PRIMARY KEY, owner_id text NOT NULL, role text NOT NULL, text text NOT NULL,
       display_text text, thread_id uuid, turn_id uuid,
-      created_at timestamptz NOT NULL DEFAULT clock_timestamp(), hidden_at timestamptz
+      created_at timestamptz NOT NULL DEFAULT clock_timestamp(), hidden_at timestamptz,
+      answer_choices jsonb
     );
   `);
   t.after(async () => {
@@ -144,6 +145,7 @@ type Recorded = { instructions: string; turns: { role: string; content: string }
 function scriptedTalker(
   script: (call: Recorded, signal?: AbortSignal) => AsyncIterable<string>,
   asks: (call: Recorded & { canAskNod?: boolean }) => boolean = () => false,
+  ends: (call: Recorded) => boolean = () => false,
 ) {
   const calls: Recorded[] = [];
   const reports: unknown[] = [];
@@ -163,7 +165,11 @@ function scriptedTalker(
         category: 'agent',
         operation: 'voice',
       });
-      return { spoken: all, askNod: Boolean(input.canAskNod) && asks(input) };
+      return {
+        spoken: all,
+        askNod: Boolean(input.canAskNod) && asks(input),
+        endCall: Boolean(input.canAskNod) && ends(input),
+      };
     },
   };
   return { talker, calls, reports };
@@ -493,7 +499,7 @@ test(
     await until(() => received.filter((m) => m.is_final).length === 1);
     say(2, 'Ciao', 'Che meteo fa domani a Milano?');
     await until(() => submitted.length === 1);
-    assert.deepEqual(submitted, ['Che meteo fa domani a Milano?']);
+    assert.deepEqual(submitted, ['Ciao\nChe meteo fa domani a Milano?']);
     await until(() => received.filter((m) => m.is_final).length === 2);
     assert.equal(calls.length, 2);
     const turnId = turnIds[0]!;
@@ -626,4 +632,120 @@ test('silence after a hand-off stays silent and is never sent to Nod', database,
   assert.ok(!calls[1]!.turns.some((turn) => turn.content === '...'));
   assert.deepEqual(submitted, ['Guardami su Slack se ci sono messaggi', 'Grazie']);
   socket.terminate();
+});
+
+test(
+  'saying it will check without the tool still hands the request to Nod',
+  database,
+  async (t) => {
+    const pool = await disposable(t);
+    const submitted: string[] = [];
+    const { talker } = scriptedTalker(async function* (call) {
+      yield call.turns.at(-1)!.content.includes('Slack')
+        ? 'Ok, controllo subito i messaggi Slack.'
+        : 'Bene, grazie!';
+    });
+    const { app, secret } = await voiceApp(pool, {
+      agents: fakeAgents().agents,
+      talker,
+      submitted,
+    });
+    const { socket, received } = await engineSocket(app, secret);
+    const turns = [
+      { role: 'user', content: 'Ciao, come stai?' },
+      { role: 'agent', content: 'Bene, grazie!' },
+      { role: 'user', content: 'Mi controlli i messaggi Slack delle ultime due ore?' },
+    ];
+    socket.send(
+      JSON.stringify({ type: 'user_transcript', user_transcript: turns.slice(0, 1), event_id: 1 }),
+    );
+    await until(() => received.filter((m) => m.is_final).length === 1);
+    assert.deepEqual(submitted, []);
+    socket.send(JSON.stringify({ type: 'user_transcript', user_transcript: turns, event_id: 2 }));
+    await until(() => submitted.length === 1);
+    assert.deepEqual(submitted, [
+      'Ciao, come stai?\nMi controlli i messaggi Slack delle ultime due ore?',
+    ]);
+    socket.terminate();
+  },
+);
+
+test('a question from Nod reaches the call with its options', database, async (t) => {
+  const pool = await disposable(t);
+  const turnIds: string[] = [];
+  const { talker, calls } = scriptedTalker(
+    async function* (call) {
+      if (call.instructions.includes('The result:')) yield 'Cosa cerco?';
+    },
+    () => true,
+  );
+  const { app, secret } = await voiceApp(pool, { agents: fakeAgents().agents, talker, turnIds });
+  const { socket, received } = await engineSocket(app, secret);
+  socket.send(
+    JSON.stringify({
+      type: 'user_transcript',
+      user_transcript: [{ role: 'user', content: 'Riprova a cercare' }],
+      event_id: 1,
+    }),
+  );
+  await until(() => turnIds.length === 1 && received.some((m) => m.is_final));
+  await pool.query("INSERT INTO turns(id,owner_id,status) VALUES($1,'owner-a','waiting')", [
+    turnIds[0],
+  ]);
+  await pool.query(
+    `INSERT INTO messages(id,owner_id,role,text,turn_id,answer_choices) VALUES($1,'owner-a','assistant','Cosa riprovo a cercare?',$2,$3)`,
+    [
+      randomUUID(),
+      turnIds[0],
+      JSON.stringify({
+        options: [
+          { id: randomUUID(), label: 'Slack recenti' },
+          { id: randomUUID(), label: 'Mail Remote' },
+        ],
+        multiple: false,
+      }),
+    ],
+  );
+  socket.send(
+    JSON.stringify({
+      type: 'user_transcript',
+      user_transcript: [
+        { role: 'user', content: 'Riprova a cercare' },
+        { role: 'user', content: voiceRelayCue },
+      ],
+      event_id: 2,
+    }),
+  );
+  await until(() => received.filter((m) => m.is_final).length === 2);
+  assert.match(
+    calls.at(-1)!.instructions,
+    /Cosa riprovo a cercare\?\nThe owner can choose: Slack recenti; Mail Remote\./,
+  );
+  socket.terminate();
+});
+
+test('asking to hang up says goodbye and closes the call', database, async (t) => {
+  const pool = await disposable(t);
+  const submitted: string[] = [];
+  const { talker } = scriptedTalker(
+    async function* () {},
+    () => false,
+    (call) => call.turns.at(-1)!.content.includes('chiudi'),
+  );
+  const { app, secret } = await voiceApp(pool, { agents: fakeAgents().agents, talker, submitted });
+  const { socket, received, closed } = await engineSocket(app, secret);
+  socket.send(
+    JSON.stringify({
+      type: 'user_transcript',
+      user_transcript: [{ role: 'user', content: 'Ok, chiudi la chiamata' }],
+      event_id: 9,
+    }),
+  );
+  await until(() => received.some((m) => m.is_final));
+  assert.deepEqual(received, [
+    { type: 'agent_response', content: 'Va bene, a presto!', event_id: 9, is_final: false },
+    { type: 'agent_response', content: '', event_id: 9, is_final: true },
+  ]);
+  assert.equal(await closed, 1000);
+  assert.deepEqual(submitted, []);
 });
