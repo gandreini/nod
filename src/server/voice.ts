@@ -12,7 +12,7 @@ import type {
   VoiceTurn,
 } from '../ports/voice.ts';
 import type { ModelSelection } from '../shared/models.ts';
-import { events, type ServerEvent } from './events.ts';
+import { voiceRelayCue } from '../shared/voice.ts';
 import { activeThreadSql } from './history.ts';
 import { spendingLimitReached } from './ledger.ts';
 import { modelSelectionInput } from './models.ts';
@@ -275,13 +275,10 @@ export function createVoice(options: VoiceOptions) {
         void allowed.then((ok) => {
           if (!ok) socket.close(1008, 'Not authorised.');
         });
-        let active: { controller: AbortController; done: Promise<void> } | undefined;
+        let active: { controller: AbortController } | undefined;
         let lastEventId: number | undefined;
         let lastTurns: VoiceTurn[] = [];
         let ownerWordsSent = 0;
-        let checking = false;
-        let again = false;
-        let closed = false;
         const pending = new Set<string>();
         const relayed = new Set<string>();
         const words = options.voice.language === 'it' ? spoken.it : spoken.en;
@@ -313,48 +310,57 @@ export function createVoice(options: VoiceOptions) {
               if (active?.controller === controller) active = undefined;
             }
           })();
-          active = { controller, done };
+          active = { controller };
           return done;
         };
-        const relay = async () => {
-          if (closed || !pending.size || active) return;
+        const answers = async () => {
+          if (!pending.size) return [];
+          const ids = [...pending];
           const turns = (
             await pool.query<{ id: string; status: string; error: string | null }>(
               'SELECT id,status,error FROM turns WHERE owner_id=$1 AND id=ANY($2::uuid[])',
-              [ownerId, [...pending]],
+              [ownerId, ids],
             )
           ).rows;
-          const answers = (
+          const ready = (
             await pool.query<{ id: string; text: string; turn_id: string }>(
               `SELECT id,text,turn_id FROM messages WHERE owner_id=$1 AND role='assistant'
                  AND hidden_at IS NULL AND turn_id=ANY($2::uuid[]) ORDER BY created_at,id`,
-              [ownerId, [...pending]],
+              [ownerId, ids],
             )
           ).rows.filter((answer) => !relayed.has(answer.id) && answer.text.trim());
           for (const turn of turns)
-            if (
-              ['succeeded', 'failed', 'cancelled', 'waiting'].includes(turn.status) &&
-              !answers.some((answer) => answer.turn_id === turn.id)
-            ) {
+            if (['succeeded', 'failed', 'cancelled', 'waiting'].includes(turn.status)) {
               pending.delete(turn.id);
-              if (turn.status === 'failed')
-                answers.push({
+              if (turn.status === 'failed' && !ready.some((answer) => answer.turn_id === turn.id))
+                ready.push({
                   id: `failed:${turn.id}`,
                   turn_id: turn.id,
                   text: `Nod could not finish the request: ${options.redact(turn.error ?? 'no reason given')}`,
                 });
             }
-          const next = answers[0];
-          if (!next || closed || active) return;
-          const model = (await state()).model;
-          const preferences = await options.preferences();
-          const delivered = await speak(async (signal, chunk) => {
+          return ready;
+        };
+        const relay = (eventId?: number) => {
+          lastEventId = eventId;
+          void speak(async (signal, chunk) => {
+            const ready = await answers();
+            if (!ready.length || signal.aborted) return;
+            const [preferences, model] = await Promise.all([
+              options.preferences(),
+              state().then((current) => current.model),
+            ]);
             await talk(
               {
                 instructions: relayInstructions(
                   new Date(),
                   preferences,
-                  options.redact(next.text.slice(0, 6000)),
+                  options.redact(
+                    ready
+                      .map((answer) => answer.text)
+                      .join('\n\n')
+                      .slice(0, 6000),
+                  ),
                 ),
                 turns: lastTurns,
               },
@@ -362,29 +368,9 @@ export function createVoice(options: VoiceOptions) {
               signal,
               chunk,
             );
-            relayed.add(next.id);
-          }).then(() => relayed.has(next.id));
-          if (delivered) void check();
+            if (!signal.aborted) for (const answer of ready) relayed.add(answer.id);
+          });
         };
-        const check = async () => {
-          if (checking) {
-            again = true;
-            return;
-          }
-          checking = true;
-          try {
-            do {
-              again = false;
-              await relay().catch((error) => options.failure?.('voice_relay', error));
-            } while (again);
-          } finally {
-            checking = false;
-          }
-        };
-        const listener = (event: ServerEvent) => {
-          if (event.type === 'refresh' && pending.size) void check();
-        };
-        events.on('event', listener);
         const respond = (turns: VoiceTurn[], owner: string[], eventId?: number) => {
           lastEventId = eventId;
           lastTurns = turns;
@@ -415,7 +401,7 @@ export function createVoice(options: VoiceOptions) {
               });
               chunk(` ${words.handoffFailed}`);
             }
-          }).then(() => void check());
+          });
         };
         const handle = (raw: Buffer) => {
           let message: z.infer<typeof inbound>;
@@ -431,11 +417,19 @@ export function createVoice(options: VoiceOptions) {
               reason: options.redact(message.message).slice(0, 300),
             });
           else if (message.type === 'user_transcript') {
-            const all = message.user_transcript.filter((turn) => turn.content.trim());
+            const cue = message.user_transcript.at(-1)?.content.trim() === voiceRelayCue;
+            const all = message.user_transcript.filter(
+              (turn) => turn.content.trim() && turn.content.trim() !== voiceRelayCue,
+            );
             const turns = all.slice(-30).map((turn) => ({
               role: turn.role === 'user' ? ('user' as const) : ('assistant' as const),
               content: turn.content.slice(0, 2000),
             }));
+            if (cue) {
+              lastTurns = turns;
+              relay(message.event_id);
+              return;
+            }
             const owner = all
               .filter((turn) => turn.role === 'user')
               .map((turn) => turn.content.trim().slice(0, 4000));
@@ -445,11 +439,7 @@ export function createVoice(options: VoiceOptions) {
         socket.on('message', (raw: Buffer) => {
           void allowed.then((ok) => ok && handle(raw));
         });
-        socket.on('close', () => {
-          closed = true;
-          events.off('event', listener);
-          active?.controller.abort();
-        });
+        socket.on('close', () => active?.controller.abort());
       });
     });
   }

@@ -9,9 +9,9 @@ import type { MemoryCurator } from '../src/ports/memory-curator.ts';
 import type { VoiceAgents, VoiceEngineSettings, VoiceTalker } from '../src/ports/voice.ts';
 import { createElevenLabsVoiceAgents } from '../src/providers/elevenlabs/voice-agents.ts';
 import { registerForkCapabilities } from '../src/server/fork-capabilities.ts';
-import { refresh } from '../src/server/events.ts';
 import { spendingLimitReached } from '../src/server/ledger.ts';
 import { createVoice, voiceEnginePath } from '../src/server/voice.ts';
+import { voiceRelayCue } from '../src/shared/voice.ts';
 
 const database = { skip: !process.env.TEST_DATABASE_URL };
 
@@ -504,7 +504,7 @@ test(
       "INSERT INTO messages(id,owner_id,role,text,turn_id) VALUES($1,'owner-a','assistant','**Milano**, domani: 14°C, sereno.',$2)",
       [randomUUID(), turnId],
     );
-    refresh();
+    say(5, 'Ciao', 'Che meteo fa domani a Milano?', voiceRelayCue);
     await until(() => received.filter((m) => m.is_final).length === 3);
     const relay = calls.at(-1)!;
     assert.match(relay.instructions, /Nod’s answer:\n\*\*Milano\*\*, domani: 14°C, sereno\./);
@@ -512,16 +512,23 @@ test(
       {
         type: 'agent_response',
         content: 'Domani a Milano 14 gradi e sole.',
-        event_id: 2,
+        event_id: 5,
         is_final: false,
       },
-      { type: 'agent_response', content: '', event_id: 2, is_final: true },
+      { type: 'agent_response', content: '', event_id: 5, is_final: true },
     ]);
-    say(3, 'Ciao', 'Che meteo fa domani a Milano?', 'E a Roma, che meteo?');
+    assert.ok(!relay.turns.some((turn) => turn.content === voiceRelayCue));
+    say(6, 'Ciao', 'Che meteo fa domani a Milano?', voiceRelayCue, 'E a Roma, che meteo?');
     await until(() => submitted.length === 2);
     assert.equal(submitted[1], 'E a Roma, che meteo?');
-    refresh();
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    say(7, 'Ciao', voiceRelayCue);
+    await until(() => received.filter((m) => m.is_final).length === 5);
+    assert.deepEqual(received.at(-1), {
+      type: 'agent_response',
+      content: '',
+      event_id: 7,
+      is_final: true,
+    });
     assert.equal(calls.filter((call) => call.instructions.includes('Nod’s answer:')).length, 1);
     socket.terminate();
   },
@@ -554,7 +561,17 @@ test('a failed hand-off is said aloud and a failed Nod turn is reported', databa
     "INSERT INTO turns(id,owner_id,status,error) VALUES($1,'owner-a','failed','The restaurant site did not answer.')",
     [turnIds[0]],
   );
-  refresh();
+  socket.send(
+    JSON.stringify({
+      type: 'user_transcript',
+      user_transcript: [
+        { role: 'user', content: 'Prenota il ristorante' },
+        { role: 'agent', content: 'Ok, lo chiedo a Nod.' },
+        { role: 'user', content: voiceRelayCue },
+      ],
+      event_id: 5,
+    }),
+  );
   await until(() => received.filter((m) => m.is_final).length === 2);
   assert.equal(received.at(-2)!.content, 'Nod non ce l’ha fatta.');
   socket.terminate();
