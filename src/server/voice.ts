@@ -81,22 +81,30 @@ function chatText(chat: VoiceTurn[]) {
     : '(no recent messages)';
 }
 
-const speech = [
-  'Your words are turned into speech as you write them, so:',
-  '- Answer in one to three short spoken sentences. No lists, Markdown, emoji, links or code.',
-  '- Speak the language the owner speaks to you.',
-];
+const languages: Record<string, string> = { it: 'Italian', en: 'English' };
+
+function speech(language: string) {
+  const name = languages[language];
+  return [
+    'Your words are turned into speech as you write them, so:',
+    '- Answer in one to three short spoken sentences. No lists, Markdown, emoji, links or code.',
+    name
+      ? `- Always speak ${name}, the language of this call.`
+      : '- Speak the language the owner speaks to you.',
+  ];
+}
 
 function instructions(
   now: Date,
   preferences: { timeZone: string | null; locale?: string | null },
   chat: VoiceTurn[],
+  language: string,
 ) {
   return [
     'You are Nod, the owner’s personal assistant, speaking with them in a live voice call.',
-    ...speech,
+    ...speech(language),
     '- Start with the answer itself; never repeat the question.',
-    'You cannot read the owner’s apps, files, email or calendar, browse the web, or take any action yourself. Nod’s full agent can. Whenever the owner asks for something that needs their data, their apps, current information from the web, or an action, or when they answer a question Nod asked them, call the ask_nod tool. Before calling it, say one short sentence that you are asking Nod. Nod’s answer will reach the call later; never pretend to have done, checked or found something yourself.',
+    'You cannot read the owner’s apps, files, email or calendar, browse the web, or take any action yourself. Nod’s full agent can. Whenever the owner asks for something that needs their data, their apps, current information from the web, or an action, or when they answer a question Nod asked them, call the ask_nod tool right away, without asking clarifying questions first; Nod will ask if it needs to. When you call it, the only words you write are one short spoken sentence telling the owner you are asking Nod, for example “Ok, lo chiedo a Nod, un attimo.” Never describe the tool, the request or your reasoning. Nod’s answer will reach the call later; never pretend to have done, checked or found something yourself.',
     'Answer directly only small talk, general knowledge and things already in the recent chat or this call. Do not invent facts about the owner.',
     `It is now ${clockText(now, preferences)}.`,
     '',
@@ -109,10 +117,11 @@ function relayInstructions(
   now: Date,
   preferences: { timeZone: string | null; locale?: string | null },
   answer: string,
+  language: string,
 ) {
   return [
     'You are Nod, the owner’s personal assistant, in a live voice call. Earlier in the call you passed a request to Nod’s full agent. It has just answered in the chat.',
-    ...speech,
+    ...speech(language),
     '- Tell the owner what the answer says, briefly. Keep names, numbers, dates and times exact.',
     '- If the answer asks the owner a question or for a confirmation, ask it clearly and stop.',
     '- If the answer is long, give the gist and say the full answer is in the chat.',
@@ -361,6 +370,7 @@ export function createVoice(options: VoiceOptions) {
                       .join('\n\n')
                       .slice(0, 6000),
                   ),
+                  options.voice.language,
                 ),
                 turns: lastTurns,
               },
@@ -381,12 +391,20 @@ export function createVoice(options: VoiceOptions) {
               state().then((current) => current.model),
             ]);
             const result = await talk(
-              { instructions: instructions(new Date(), preferences, chat), turns, canAskNod: true },
+              {
+                instructions: instructions(new Date(), preferences, chat, options.voice.language),
+                turns,
+                canAskNod: true,
+              },
               model,
               signal,
               chunk,
             );
-            if (!result.askNod || signal.aborted) return;
+            if (signal.aborted) return;
+            if (!result.askNod) {
+              ownerWordsSent = owner.length;
+              return;
+            }
             if (!result.spoken.trim()) chunk(words.asking);
             const fresh = owner.slice(Math.min(ownerWordsSent, owner.length - 1));
             ownerWordsSent = owner.length;

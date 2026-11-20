@@ -493,7 +493,7 @@ test(
     await until(() => received.filter((m) => m.is_final).length === 1);
     say(2, 'Ciao', 'Che meteo fa domani a Milano?');
     await until(() => submitted.length === 1);
-    assert.deepEqual(submitted, ['Ciao\nChe meteo fa domani a Milano?']);
+    assert.deepEqual(submitted, ['Che meteo fa domani a Milano?']);
     await until(() => received.filter((m) => m.is_final).length === 2);
     assert.equal(calls.length, 2);
     const turnId = turnIds[0]!;
