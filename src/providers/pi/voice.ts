@@ -1,12 +1,19 @@
 import type { AssistantMessage, Context } from '@earendil-works/pi-ai';
 import type { ModelAccess } from '../../ports/models.ts';
 import type { VoiceTalker } from '../../ports/voice.ts';
+
+const askNod = {
+  name: 'ask_nod',
+  description:
+    'Hand the owner’s request to Nod’s full agent, which can use their apps, memory, files, the web and take actions. The server sends the owner’s own words from this call; you write nothing for it.',
+  parameters: { type: 'object', properties: {}, additionalProperties: false },
+};
 import { createPiModelRuntime } from './models.ts';
 import { piUsageMetrics } from './usage.ts';
 
 export function createPiVoiceTalker(options: { resolve(): Promise<ModelAccess> }): VoiceTalker {
   return {
-    async talk({ instructions, turns }, { signal, onText, report }) {
+    async talk({ instructions, turns, canAskNod }, { signal, onText, report }) {
       const access = await options.resolve();
       const modelId = access.textModel?.definition.choice.id ?? access.definition.choice.id;
       await access.prepareRequest?.(modelId, false);
@@ -24,10 +31,12 @@ export function createPiVoiceTalker(options: { resolve(): Promise<ModelAccess> }
             timestamp: Date.now(),
           },
         ],
+        ...(canAskNod ? { tools: [askNod] } : {}),
       };
       const started = performance.now();
       let reply: AssistantMessage | undefined;
       let spoken = '';
+      let asked = false;
       try {
         const stream = runtime.streamSimple(model, context, {
           signal: AbortSignal.any([AbortSignal.timeout(30_000), ...(signal ? [signal] : [])]),
@@ -39,6 +48,7 @@ export function createPiVoiceTalker(options: { resolve(): Promise<ModelAccess> }
             spoken += event.delta;
             onText(event.delta);
           }
+          if (event.type === 'toolcall_end' && event.toolCall.name === askNod.name) asked = true;
           if (event.type === 'done') reply = event.message;
           if (event.type === 'error') reply = event.error;
         }
@@ -46,7 +56,7 @@ export function createPiVoiceTalker(options: { resolve(): Promise<ModelAccess> }
           throw new Error(
             `The voice model failed: ${reply.errorMessage || 'no reason given'} (${reply.provider}/${reply.model}).`,
           );
-        return spoken;
+        return { spoken, askNod: asked };
       } finally {
         const metrics = piUsageMetrics(reply?.usage);
         report?.({

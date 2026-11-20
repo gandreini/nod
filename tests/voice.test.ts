@@ -9,6 +9,7 @@ import type { MemoryCurator } from '../src/ports/memory-curator.ts';
 import type { VoiceAgents, VoiceEngineSettings, VoiceTalker } from '../src/ports/voice.ts';
 import { createElevenLabsVoiceAgents } from '../src/providers/elevenlabs/voice-agents.ts';
 import { registerForkCapabilities } from '../src/server/fork-capabilities.ts';
+import { refresh } from '../src/server/events.ts';
 import { spendingLimitReached } from '../src/server/ledger.ts';
 import { createVoice, voiceEnginePath } from '../src/server/voice.ts';
 
@@ -105,7 +106,7 @@ async function disposable(t: TestContext) {
   });
   await pool.query(`
     CREATE TABLE threads (id uuid PRIMARY KEY, owner_id text NOT NULL, archived_at timestamptz);
-    CREATE TABLE turns (id uuid PRIMARY KEY, owner_id text NOT NULL, message_id uuid, withdrawn boolean NOT NULL DEFAULT false);
+    CREATE TABLE turns (id uuid PRIMARY KEY, owner_id text NOT NULL, message_id uuid, withdrawn boolean NOT NULL DEFAULT false, status text NOT NULL DEFAULT 'running', error text);
     CREATE TABLE messages (
       id uuid PRIMARY KEY, owner_id text NOT NULL, role text NOT NULL, text text NOT NULL,
       display_text text, thread_id uuid, turn_id uuid,
@@ -140,7 +141,10 @@ function fakeAgents() {
 
 type Recorded = { instructions: string; turns: { role: string; content: string }[] };
 
-function scriptedTalker(script: (call: Recorded, signal?: AbortSignal) => AsyncIterable<string>) {
+function scriptedTalker(
+  script: (call: Recorded, signal?: AbortSignal) => AsyncIterable<string>,
+  asks: (call: Recorded & { canAskNod?: boolean }) => boolean = () => false,
+) {
   const calls: Recorded[] = [];
   const reports: unknown[] = [];
   const talker: VoiceTalker = {
@@ -159,7 +163,7 @@ function scriptedTalker(script: (call: Recorded, signal?: AbortSignal) => AsyncI
         category: 'agent',
         operation: 'voice',
       });
-      return all;
+      return { spoken: all, askNod: Boolean(input.canAskNod) && asks(input) };
     },
   };
   return { talker, calls, reports };
@@ -173,6 +177,8 @@ async function voiceApp(
     limit?: boolean;
     recorded?: unknown[];
     models?: string[];
+    submitted?: string[];
+    turnIds?: string[];
   } = {},
 ) {
   const voice = createVoice({
@@ -202,6 +208,12 @@ async function voiceApp(
     preferences: async () => ({ timeZone: 'Europe/Rome' }),
     redact: (text) => text.replaceAll('sk-secret', '[redacted]'),
     voice: { voiceId: 'voice-it', language: 'it', ttsModel: 'eleven_v4_turbo' },
+    submit: async (text) => {
+      options.submitted?.push(text);
+      const turnId = randomUUID();
+      options.turnIds?.push(turnId);
+      return { turnId, messageId: randomUUID() };
+    },
   });
   await voice.initialize();
   const app = Fastify();
@@ -441,5 +453,109 @@ test('the monthly limit stops the reply with a spoken notice', database, async (
     },
     { type: 'agent_response', content: '', event_id: 7, is_final: true },
   ]);
+  socket.terminate();
+});
+
+test(
+  'a request for real work goes to Nod with the owner’s own words, and Nod’s answer is spoken',
+  database,
+  async (t) => {
+    const pool = await disposable(t);
+    const submitted: string[] = [];
+    const turnIds: string[] = [];
+    const { talker, calls } = scriptedTalker(
+      async function* (call) {
+        if (call.instructions.includes('Nod’s answer:')) yield 'Domani a Milano 14 gradi e sole.';
+        else if (call.turns.at(-1)!.content.includes('meteo')) yield 'Ok, chiedo a Nod. ';
+        else yield 'Certo.';
+      },
+      (call) => call.turns.at(-1)!.content.includes('meteo'),
+    );
+    const { app, secret } = await voiceApp(pool, {
+      agents: fakeAgents().agents,
+      talker,
+      submitted,
+      turnIds,
+    });
+    const { socket, received } = await engineSocket(app, secret);
+    const say = (event_id: number, ...owner: string[]) =>
+      socket.send(
+        JSON.stringify({
+          type: 'user_transcript',
+          user_transcript: owner.flatMap((content, index) => [
+            { role: 'user', content },
+            ...(index < owner.length - 1 ? [{ role: 'agent', content: 'Certo.' }] : []),
+          ]),
+          event_id,
+        }),
+      );
+    say(1, 'Ciao');
+    await until(() => received.filter((m) => m.is_final).length === 1);
+    say(2, 'Ciao', 'Che meteo fa domani a Milano?');
+    await until(() => submitted.length === 1);
+    assert.deepEqual(submitted, ['Ciao\nChe meteo fa domani a Milano?']);
+    await until(() => received.filter((m) => m.is_final).length === 2);
+    assert.equal(calls.length, 2);
+    const turnId = turnIds[0]!;
+    await pool.query("INSERT INTO turns(id,owner_id,status) VALUES($1,'owner-a','succeeded')", [
+      turnId,
+    ]);
+    await pool.query(
+      "INSERT INTO messages(id,owner_id,role,text,turn_id) VALUES($1,'owner-a','assistant','**Milano**, domani: 14°C, sereno.',$2)",
+      [randomUUID(), turnId],
+    );
+    refresh();
+    await until(() => received.filter((m) => m.is_final).length === 3);
+    const relay = calls.at(-1)!;
+    assert.match(relay.instructions, /Nod’s answer:\n\*\*Milano\*\*, domani: 14°C, sereno\./);
+    assert.deepEqual(received.slice(-2), [
+      {
+        type: 'agent_response',
+        content: 'Domani a Milano 14 gradi e sole.',
+        event_id: 2,
+        is_final: false,
+      },
+      { type: 'agent_response', content: '', event_id: 2, is_final: true },
+    ]);
+    say(3, 'Ciao', 'Che meteo fa domani a Milano?', 'E a Roma, che meteo?');
+    await until(() => submitted.length === 2);
+    assert.equal(submitted[1], 'E a Roma, che meteo?');
+    refresh();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(calls.filter((call) => call.instructions.includes('Nod’s answer:')).length, 1);
+    socket.terminate();
+  },
+);
+
+test('a failed hand-off is said aloud and a failed Nod turn is reported', database, async (t) => {
+  const pool = await disposable(t);
+  const { talker } = scriptedTalker(
+    async function* (call) {
+      if (call.instructions.includes('Nod’s answer:')) yield 'Nod non ce l’ha fatta.';
+    },
+    () => true,
+  );
+  const turnIds: string[] = [];
+  const { app, secret } = await voiceApp(pool, { agents: fakeAgents().agents, talker, turnIds });
+  const { socket, received } = await engineSocket(app, secret);
+  socket.send(
+    JSON.stringify({
+      type: 'user_transcript',
+      user_transcript: [{ role: 'user', content: 'Prenota il ristorante' }],
+      event_id: 4,
+    }),
+  );
+  await until(() => received.some((m) => m.is_final));
+  assert.equal(
+    received[0]!.content,
+    'Ok, lo chiedo a Nod. Resta pure in linea, ti dico appena ho la risposta.',
+  );
+  await pool.query(
+    "INSERT INTO turns(id,owner_id,status,error) VALUES($1,'owner-a','failed','The restaurant site did not answer.')",
+    [turnIds[0]],
+  );
+  refresh();
+  await until(() => received.filter((m) => m.is_final).length === 2);
+  assert.equal(received.at(-2)!.content, 'Nod non ce l’ha fatta.');
   socket.terminate();
 });

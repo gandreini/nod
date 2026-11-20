@@ -11,15 +11,20 @@ export type VoiceUsage = Partial<ProviderUsageEvent> & {
   costUsd: number | null;
 };
 
+export interface VoiceTalk {
+  spoken: string;
+  askNod: boolean;
+}
+
 export interface VoiceTalker {
   talk(
-    input: { instructions: string; turns: VoiceTurn[] },
+    input: { instructions: string; turns: VoiceTurn[]; canAskNod?: boolean },
     options: {
       signal?: AbortSignal;
       onText(text: string): void;
       report?(usage: VoiceUsage): void;
     },
-  ): Promise<string>;
+  ): Promise<VoiceTalk>;
 }
 
 export interface VoiceEngineSettings {

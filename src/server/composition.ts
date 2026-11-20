@@ -2850,6 +2850,7 @@ async function initializeApplication(
       language: process.env.NOD_VOICE_LANGUAGE || 'en',
       ttsModel: process.env.NOD_VOICE_TTS_MODEL || 'eleven_v4_turbo',
     },
+    submit: (text) => userMessages.submit(text, [], { channel: 'web' }),
     failure: diagnostics.failure,
   });
   await voice.initialize();
