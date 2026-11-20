@@ -96,10 +96,11 @@ export function createPush(options: PushOptions) {
     );
   }
 
+  function feature() {
+    return sender ? { version: 1, platforms: [...sender.platforms] } : undefined;
+  }
+
   function registerRoutes(app: FastifyInstance) {
-    app.get('/api/fork/capabilities', async () => ({
-      features: sender ? { push: { version: 1, platforms: [...sender.platforms] } } : {},
-    }));
     app.put('/api/fork/push/devices', async (request, reply) => {
       if (!sender) return reply.code(404).send(unavailable);
       const parsed = registration.safeParse(request.body);
@@ -224,5 +225,5 @@ export function createPush(options: PushOptions) {
     await running;
   }
 
-  return { initialize, registerRoutes, deliver, start, stop };
+  return { initialize, registerRoutes, feature, deliver, start, stop };
 }

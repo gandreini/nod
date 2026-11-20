@@ -212,6 +212,11 @@ import { cachedIcons, registerLinkOpened } from './link-previews.ts';
 import type { PushSender } from '../ports/push.ts';
 import { createFcmSender, parseServiceAccount } from '../providers/fcm/index.ts';
 import { createPush } from './push.ts';
+import type { VoiceAgents } from '../ports/voice.ts';
+import { createElevenLabsVoiceAgents } from '../providers/elevenlabs/voice-agents.ts';
+import { createPiVoiceTalker } from '../providers/pi/voice.ts';
+import { registerForkCapabilities } from './fork-capabilities.ts';
+import { createVoice } from './voice.ts';
 export interface ApplicationAdapters {
   analytics?: ProductAnalytics;
   onboardingEmail?: OnboardingEmailDelivery;
@@ -242,6 +247,7 @@ export interface ApplicationAdapters {
   trustCurator?: MemoryCurator;
   messaging?: MessagingTransport;
   push?: PushSender;
+  voiceAgents?: VoiceAgents;
   linkPreviews?: LinkPreviewProvider;
   feedback?: FeedbackDelivery;
   traces?: ModelTraceGate;
@@ -489,6 +495,10 @@ export function createDefaultAdapters(
     push: env.NOD_FCM_SERVICE_ACCOUNT
       ? createFcmSender(parseServiceAccount(env.NOD_FCM_SERVICE_ACCOUNT))
       : undefined,
+    voiceAgents:
+      env.NOD_VOICE_ELEVENLABS_KEY && !desktopMode
+        ? createElevenLabsVoiceAgents(env.NOD_VOICE_ELEVENLABS_KEY.trim())
+        : undefined,
     telemetry: createOtlpTelemetry(env.OTEL_EXPORTER_OTLP_ENDPOINT),
     initialize: async () => {
       await models.initialize();
@@ -2815,6 +2825,36 @@ async function initializeApplication(
   push.registerRoutes(app);
   push.start();
   app.addHook('preClose', push.stop);
+  const voice = createVoice({
+    pool,
+    ownerId,
+    publicOrigin,
+    agents: adapters.voiceAgents,
+    talker: (model) =>
+      createPiVoiceTalker({
+        resolve: async () => {
+          if (!adapters.models) throw new Error('No model connection is set up.');
+          return model ? adapters.models.resolve(false, model) : adapters.models.resolve(true);
+        },
+      }),
+    meter: ledger.curator,
+    checkModel: async (model) => {
+      if (!adapters.models) throw new Error('No model connection is set up.');
+      await adapters.models.resolve(false, model);
+    },
+    modelsReady: () => adapters.models?.configured ?? false,
+    preferences: () => createPreferencesStore(pool, ownerId).get(),
+    redact: createTextRedactor(secrets),
+    voice: {
+      voiceId: process.env.NOD_VOICE_ID || 'Xb7hH8MSUJpSbSDYk0k2',
+      language: process.env.NOD_VOICE_LANGUAGE || 'en',
+      ttsModel: process.env.NOD_VOICE_TTS_MODEL || 'eleven_v4_turbo',
+    },
+    failure: diagnostics.failure,
+  });
+  await voice.initialize();
+  voice.registerRoutes(app);
+  registerForkCapabilities(app, () => ({ push: push.feature(), voice: voice.feature() }));
 
   app.addHook('preClose', async () => {
     await adapters.models?.close();

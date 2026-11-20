@@ -8,6 +8,7 @@ import { decodeJwt } from 'jose';
 import pg from 'pg';
 import type { PushDevice, PushNotification, PushSender } from '../src/ports/push.ts';
 import { createFcmSender, parseServiceAccount } from '../src/providers/fcm/index.ts';
+import { registerForkCapabilities } from '../src/server/fork-capabilities.ts';
 import { createPush, notificationText } from '../src/server/push.ts';
 
 async function body(request: IncomingMessage) {
@@ -213,6 +214,7 @@ async function routes(pool: pg.Pool, sender?: PushSender, ownerId = 'owner-a') {
   await push.initialize();
   const app = Fastify();
   push.registerRoutes(app);
+  registerForkCapabilities(app, () => ({ push: push.feature() }));
   return { app, push };
 }
 
