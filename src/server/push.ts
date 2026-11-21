@@ -8,6 +8,7 @@ import type { PushPlatform, PushSender } from '../ports/push.ts';
 import type { Preferences } from '../shared/contracts.ts';
 import { events, type ServerEvent } from './events.ts';
 import { isQuietTime } from './preferences.ts';
+import { workOriginSql } from './turn-chain.ts';
 
 type QuietHours = Pick<Preferences, 'quietHoursEnabled' | 'quietStart' | 'quietEnd' | 'timeZone'>;
 
@@ -74,6 +75,9 @@ const newMessages = `
     AND m.created_at >= GREATEST((SELECT since FROM push_state WHERE owner_id=$1), now()-interval '10 minutes')
     AND NOT EXISTS (SELECT 1 FROM push_sent s WHERE s.message_id=m.id)`;
 
+const fromSchedule = `EXISTS(SELECT 1 FROM turns o ${workOriginSql('o')}
+  WHERE o.id=m.turn_id AND o.owner_id=m.owner_id AND work_origin.source='schedule')`;
+
 export function createPush(options: PushOptions) {
   const { pool, ownerId, sender } = options;
 
@@ -138,10 +142,10 @@ export function createPush(options: PushOptions) {
     if (isQuietTime(await options.quietHours())) {
       await pool.query(
         `INSERT INTO push_sent(message_id,owner_id) SELECT m.id,m.owner_id ${newMessages}
+           AND NOT ${fromSchedule}
          ON CONFLICT(message_id) DO NOTHING`,
         [ownerId],
       );
-      return;
     }
     const claimed = await pool.query<{ id: string; text: string; attachments: unknown }>(
       `WITH picked AS (

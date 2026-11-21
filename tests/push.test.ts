@@ -170,7 +170,13 @@ async function disposable(t: TestContext) {
     options: `-c search_path=${schema}`,
   });
   await pool.query(`
-    CREATE TABLE turns (id uuid PRIMARY KEY, owner_id text NOT NULL, channel text NOT NULL DEFAULT 'web');
+    CREATE TABLE turns (
+      id uuid PRIMARY KEY, owner_id text NOT NULL, channel text NOT NULL DEFAULT 'web',
+      thread_id uuid, session_id uuid, parent_turn_id uuid, source text NOT NULL DEFAULT 'user',
+      source_id text, created_at timestamptz NOT NULL DEFAULT clock_timestamp()
+    );
+    CREATE TABLE tasks (id uuid PRIMARY KEY, owner_id text NOT NULL, activity_key text);
+    CREATE TABLE schedules (id uuid PRIMARY KEY, owner_id text NOT NULL);
     CREATE TABLE messages (
       id uuid PRIMARY KEY, owner_id text NOT NULL, role text NOT NULL, text text NOT NULL,
       thread_id uuid, turn_id uuid, attachments jsonb NOT NULL DEFAULT '[]',
@@ -235,16 +241,30 @@ async function assistant(
     hidden?: boolean;
     delivered?: string;
     minutesAgo?: number;
+    source?: string;
+    after?: string;
   } = {},
 ) {
   const id = randomUUID();
   const turn = randomUUID();
   const owner = values.owner ?? 'owner-a';
-  await pool.query('INSERT INTO turns(id,owner_id,channel) VALUES($1,$2,$3)', [
-    turn,
-    owner,
-    values.channel ?? 'web',
-  ]);
+  const thread = '00000000-0000-4000-8000-000000000001';
+  const parent = values.after
+    ? (await pool.query('SELECT session_id FROM turns WHERE id=$1', [values.after])).rows[0]
+    : undefined;
+  await pool.query(
+    `INSERT INTO turns(id,owner_id,channel,thread_id,session_id,parent_turn_id,source)
+     VALUES($1,$2,$3,$4,$5,$6,$7)`,
+    [
+      turn,
+      owner,
+      values.channel ?? 'web',
+      thread,
+      parent?.session_id ?? turn,
+      values.after ?? null,
+      values.source ?? 'user',
+    ],
+  );
   await pool.query(
     `INSERT INTO messages(id,owner_id,role,text,thread_id,turn_id,created_at,hidden_at,delivered_channel)
      VALUES($1,$2,'assistant',$3,$4,$5,clock_timestamp()-make_interval(mins => $6),$7,$8)`,
@@ -252,7 +272,7 @@ async function assistant(
       id,
       owner,
       values.text ?? 'Hello **there**',
-      randomUUID(),
+      thread,
       values.delivered ? null : turn,
       values.minutesAgo ?? 0,
       values.hidden ? new Date() : null,
@@ -408,4 +428,42 @@ test('quiet hours skip messages for good and gone tokens are removed', database,
   assert.deepEqual(failures, [
     { reason: 'FCM refused the notification: fixture (HTTP 500)', httpStatus: 500 },
   ]);
+});
+
+test("during quiet hours only results of the owner's schedules are sent", database, async (t) => {
+  const pool = await disposable(t);
+  const { sender, sent } = recordingSender();
+  const push = createPush({
+    pool,
+    ownerId: 'owner-a',
+    sender,
+    redact: (text) => text,
+    quietHours: async () => {
+      const hour = new Date().getUTCHours();
+      const clock = (value: number) => `${String((value + 24) % 24).padStart(2, '0')}:00`;
+      return {
+        quietHoursEnabled: true,
+        quietStart: clock(hour - 1),
+        quietEnd: clock(hour + 2),
+        timeZone: 'UTC',
+      };
+    },
+  });
+  await push.initialize();
+  const app = Fastify();
+  push.registerRoutes(app);
+  await register(app, 'phone');
+  await assistant(pool, { text: 'Reply to the owner' });
+  await assistant(pool, { text: 'Nod on its own', source: 'event' });
+  const fired = await assistant(pool, { text: 'Morning check-in', source: 'schedule' });
+  const scheduleTurn = (await pool.query('SELECT turn_id FROM messages WHERE id=$1', [fired]))
+    .rows[0].turn_id;
+  await assistant(pool, { text: 'Check-in follow-up', source: 'resume', after: scheduleTurn });
+  await push.deliver();
+  assert.deepEqual(
+    sent.map((item) => item.notification.body),
+    ['Morning check-in', 'Check-in follow-up'],
+  );
+  await push.deliver();
+  assert.equal(sent.length, 2);
 });
