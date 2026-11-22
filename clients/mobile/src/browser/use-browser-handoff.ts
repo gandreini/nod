@@ -1,6 +1,7 @@
 import { randomUUID } from 'expo-crypto';
 import { fetch } from 'expo/fetch';
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { AppState } from 'react-native';
 import { ApiError, errorText, read, request, tokenRefused, unreachable } from '../connection/api';
 import type { Connection } from '../connection/connection';
 import { frameReader, toBase64 } from './frames';
@@ -28,6 +29,7 @@ export function useBrowserHandoff(
   const frames = useRef(0);
   const timer = useRef<ReturnType<typeof setTimeout>>(undefined);
   const [attempt, setAttempt] = useState(0);
+  const [away, setAway] = useState(false);
   const [failures, setFailures] = useState(0);
   const [live, setLive] = useState(false);
   const [frame, setFrame] = useState<Frame>();
@@ -160,7 +162,19 @@ export function useBrowserHandoff(
   }, [pump]);
 
   useEffect(() => {
-    if (end || unavailable) return;
+    const subscription = AppState.addEventListener('change', (status) => {
+      if (status === 'background') setAway(true);
+      if (status !== 'active') return;
+      setAway((was) => {
+        if (was) setAttempt((value) => value + 1);
+        return false;
+      });
+    });
+    return () => subscription.remove();
+  }, []);
+
+  useEffect(() => {
+    if (end || unavailable || away) return;
     const controller = new AbortController();
     latest.current = null;
     showing.current = false;
@@ -200,16 +214,16 @@ export function useBrowserHandoff(
       setFailures((value) => value + 1);
     });
     return () => controller.abort();
-  }, [attempt, closedBy, connection, end, pump, turnId, unavailable]);
+  }, [attempt, away, closedBy, connection, end, pump, turnId, unavailable]);
 
   useEffect(() => {
-    if (end || live || unavailable) return;
+    if (end || live || unavailable || away) return;
     const wait = setTimeout(() => {
       setStreamError('No page arrived in 15 seconds.');
       setFailures((value) => value + 1);
     }, firstFrameTimeout);
     return () => clearTimeout(wait);
-  }, [attempt, end, failures, live, unavailable]);
+  }, [attempt, away, end, failures, live, unavailable]);
 
   useEffect(() => {
     if (end || !failures || unavailable) return;

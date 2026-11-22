@@ -15,11 +15,12 @@ import { AppLogo } from './app-logo';
 import { ApprovalCard, ChoiceCard, ConnectAppCard, type Answer } from '../chat/cards';
 import { MessageAttachments } from '../files/attachment-views';
 import type { Draft } from '../files/attachments';
-import { AssistantMessage, ScrollToLatest, Unsent, UserBubble } from '../chat/chat-screen';
+import { ScrollToLatest } from '../chat/chat-composer';
+import { AssistantMessage, Unsent, UserBubble } from '../chat/chat-messages';
 import type { Outgoing } from '../chat/chat-state';
 import { Composer } from '../chat/composer';
 import type { ApprovalState, Message } from '../connection/contracts';
-import { useNod } from '../connection/nod-context';
+import { useNodBase } from '../connection/nod-context';
 import { NodGlyph, NodMark } from '../ui/nod-mark';
 import { font, radius, useTheme } from '../ui/theme';
 import {
@@ -216,7 +217,7 @@ function SchemeSwitch() {
 
 export function GalleryScreen() {
   const theme = useTheme();
-  const { connection } = useNod();
+  const { connection } = useNodBase();
   const [draft, setDraft] = useState('Can you check my calendar for tomorrow?');
   const noop = () => {};
   return (

@@ -154,6 +154,7 @@ const choices = (options: string[], pending: boolean) => ({
   answerChoicesPending: pending,
 });
 let activity: object[] = [];
+let verification: { id: string; turnId: string; kind: 'otp' | 'payment' } | null = null;
 let pending: { timers: NodeJS.Timeout[]; turnId: string; streamId: string } | null = null;
 const view = () => ({
   threadId,
@@ -162,6 +163,7 @@ const view = () => ({
     .filter((message) => message.answerChoicesPending)
     .map((message) => message.id),
   configuration: { conversationResetEnabled: false },
+  verificationRequests: verification ? [verification] : [],
   messages: store.messages,
   turns: [
     {
@@ -346,7 +348,7 @@ app.post('/api/messages', async (request, reply) => {
       error: 'This question is no longer waiting for an answer.',
     });
   const parity = store.parity;
-  if (parity) {
+  if (parity && (parity.question === 'pending' || body.questionAnswer)) {
     const allowed =
       body.threadId === threadId &&
       body.replyToMessageId === questionId &&
@@ -372,7 +374,12 @@ app.post('/api/messages', async (request, reply) => {
     id: body.clientMessageId,
     clientMessageId: body.clientMessageId,
     role: 'user',
-    text: body.text,
+    text:
+      verification && /^\s*\d{3,8}\s*$/.test(body.text)
+        ? verification.kind === 'otp'
+          ? 'Verification code sent securely.'
+          : 'Security code sent securely.'
+        : body.text,
     ...(attachments.length ? { attachments } : {}),
     ...(typeof body.replyToMessageId === 'string'
       ? { replyToMessageId: body.replyToMessageId }
@@ -380,6 +387,7 @@ app.post('/api/messages', async (request, reply) => {
     turnId: randomUUID(),
     createdAt: stamp(),
   };
+  if (verification && message.text !== body.text) verification = null;
   store.messages.push(message);
   store.turn = parity ? 'idle' : 'running';
   if (demo) {
@@ -444,6 +452,27 @@ app.post('/fixture/activity', async (request, reply) => {
   if (!Array.isArray(body?.items))
     return reply.code(400).send({ error: 'Invalid synthetic activity.' });
   emit({ type: 'activity', items: body.items });
+  return { ok: true };
+});
+app.post('/fixture/verification', async (request, reply) => {
+  if (!controlled(request.headers)) return reply.code(401).send({ error: 'Unauthorized.' });
+  const body = request.body as { kind?: unknown };
+  if (body?.kind !== 'otp' && body?.kind !== 'payment')
+    return reply.code(400).send({ error: 'Invalid synthetic verification.' });
+  const turnId = randomUUID();
+  store.messages.push({
+    id: randomUUID(),
+    role: 'assistant',
+    text:
+      body.kind === 'otp'
+        ? 'The synthetic shop sent a code to your phone.'
+        : 'The synthetic shop needs your card’s security code.',
+    turnId,
+    createdAt: stamp(),
+  });
+  verification = { id: randomUUID(), turnId, kind: body.kind };
+  await persist();
+  emitRefresh();
   return { ok: true };
 });
 app.post('/fixture/interrupt', async (request, reply) => {
@@ -671,6 +700,15 @@ app.get('/api/preferences', async () =>
 app.get('/api/models', async () =>
   demo ? { ...models, selection: store.demo!.selection ?? models.selection } : models,
 );
+if (process.env.NOD_VALIDATION_VOICE === '1') {
+  let voiceModel: unknown = null;
+  app.get('/api/fork/capabilities', async () => ({ features: { voice: { version: 1 } } }));
+  app.get('/api/fork/voice/settings', async () => ({ model: voiceModel }));
+  app.put('/api/fork/voice/settings', async (request) => {
+    voiceModel = (request.body as { model?: unknown } | null)?.model ?? null;
+    return { model: voiceModel };
+  });
+}
 const taskView = () => ({
   id: taskId,
   title: 'Synthetic saved task',

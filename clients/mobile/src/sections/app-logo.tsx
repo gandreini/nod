@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { Image, View } from 'react-native';
 import { parse, SvgAst, type JsxAST } from 'react-native-svg';
 import { integrationServiceIds } from '../../../../src/shared/integrations';
+import { fetchWithin } from '../connection/api';
 import { Link2 } from '../ui/icons';
 import type { Theme } from '../ui/theme';
 
@@ -16,7 +17,7 @@ function loadLogo(uri: string): Promise<Logo> {
   if (!pending) {
     pending = rasterExtension.test(uri)
       ? Promise.resolve({ kind: 'raster', uri })
-      : fetch(uri)
+      : fetchWithin(uri, {}, 15_000)
           .then(async (response): Promise<Logo> => {
             if (!response.ok) return null;
             const type = response.headers.get('content-type') ?? '';
@@ -24,7 +25,10 @@ function loadLogo(uri: string): Promise<Logo> {
             const ast = parse(await response.text());
             return ast ? { kind: 'svg', ast } : null;
           })
-          .catch(() => null);
+          .catch(() => {
+            logos.delete(uri);
+            return null;
+          });
     logos.set(uri, pending);
   }
   return pending;

@@ -2,16 +2,18 @@ import { ChevronLeft, ChevronRight, RefreshCw } from './icons';
 import { router } from 'expo-router';
 import { useEffect, useRef, useState, type ComponentType, type ReactNode } from 'react';
 import {
+  AccessibilityInfo,
   ActivityIndicator,
+  Platform,
   Pressable,
   RefreshControl,
-  ScrollView,
   StyleSheet,
   Text,
   View,
   type StyleProp,
   type ViewStyle,
 } from 'react-native';
+import { KeyboardAwareScrollView } from 'react-native-keyboard-controller';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { NodGlyph } from './nod-mark';
 import { font, radius, useTheme, type Theme } from './theme';
@@ -63,7 +65,9 @@ export function Page({
         </Text>
         {action}
       </View>
-      <ScrollView
+      <KeyboardAwareScrollView
+        bottomOffset={16}
+        keyboardShouldPersistTaps="handled"
         contentContainerStyle={styles.content}
         scrollEventThrottle={onEndReached ? 100 : undefined}
         onScroll={
@@ -93,7 +97,7 @@ export function Page({
         }
       >
         {children}
-      </ScrollView>
+      </KeyboardAwareScrollView>
     </SafeAreaView>
   );
 }
@@ -158,6 +162,9 @@ export function Button({
 
 export function Notice({ text, onRetry }: { text: string; onRetry?: () => void }) {
   const theme = useTheme();
+  useEffect(() => {
+    if (Platform.OS === 'ios') AccessibilityInfo.announceForAccessibility(text);
+  }, [text]);
   return (
     <View style={[styles.notice, { backgroundColor: theme.errorSoft }]}>
       <Text
@@ -169,7 +176,7 @@ export function Notice({ text, onRetry }: { text: string; onRetry?: () => void }
       {onRetry ? (
         <Pressable
           onPress={onRetry}
-          hitSlop={8}
+          hitSlop={13}
           accessibilityRole="button"
           accessibilityLabel="Retry"
         >
@@ -184,7 +191,12 @@ export function SectionTitle({ children, count }: { children: string; count?: nu
   const theme = useTheme();
   return (
     <View style={styles.section}>
-      <Text style={[styles.sectionText, { color: theme.mutedForeground }]}>{children}</Text>
+      <Text
+        accessibilityRole="header"
+        style={[styles.sectionText, { color: theme.mutedForeground }]}
+      >
+        {children}
+      </Text>
       {count !== undefined ? (
         <Text style={[styles.sectionText, { color: theme.mutedForeground }]}>{count}</Text>
       ) : null}
@@ -309,20 +321,12 @@ export function Row({
 }) {
   const theme = useTheme();
   const color = danger ? theme.error : theme.foreground;
-  return (
-    <Pressable
-      onPress={onPress}
-      disabled={!onPress}
-      accessibilityRole={onPress ? 'button' : undefined}
-      style={({ pressed }) => [
-        styles.row,
-        {
-          backgroundColor: pressed ? theme.controlActive : 'transparent',
-          borderTopColor: theme.border,
-          borderTopWidth: first ? 0 : StyleSheet.hairlineWidth,
-        },
-      ]}
-    >
+  const frame = {
+    borderTopColor: theme.border,
+    borderTopWidth: first ? 0 : StyleSheet.hairlineWidth,
+  };
+  const content = (
+    <>
       <View style={[styles.glyph, { backgroundColor: danger ? theme.errorSoft : theme.muted }]}>
         <RowIcon size={18} color={danger ? theme.error : theme.secondary} />
       </View>
@@ -335,6 +339,25 @@ export function Row({
         ) : null}
       </View>
       {onPress && !danger ? <ChevronRight size={18} color={theme.mutedForeground} /> : null}
+    </>
+  );
+  if (!onPress)
+    return (
+      <View accessible style={[styles.row, frame]}>
+        {content}
+      </View>
+    );
+  return (
+    <Pressable
+      onPress={onPress}
+      accessibilityRole="button"
+      style={({ pressed }) => [
+        styles.row,
+        frame,
+        { backgroundColor: pressed ? theme.controlActive : 'transparent' },
+      ]}
+    >
+      {content}
     </Pressable>
   );
 }
@@ -374,7 +397,7 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
     gap: 8,
-    minHeight: 40,
+    minHeight: 44,
     paddingHorizontal: 16,
     borderRadius: radius.full,
   },

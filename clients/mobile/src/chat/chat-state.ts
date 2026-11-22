@@ -1,4 +1,8 @@
-import type { Activity, Message } from '../connection/contracts';
+import {
+  classifyVerificationReply,
+  securityCodeIn,
+} from '../../../../src/shared/verification-code';
+import type { Activity, Message, VerificationRequest } from '../connection/contracts';
 
 export function workState(activity: Activity[], outgoing: Outgoing[], writing: boolean) {
   const working = activity.some((item) => !item.background);
@@ -25,6 +29,7 @@ export interface Outgoing {
   sendId?: string;
   attempts?: number;
   text: string;
+  privateText?: string;
   audio?: Recording;
   files?: LocalFile[];
   attachmentIds?: string[];
@@ -78,7 +83,7 @@ export function inTail(item: Outgoing, messages: Message[]) {
   return !messages.some((message) => Date.parse(message.createdAt) > at);
 }
 
-export type Step = 'done' | 'wait' | 'retry' | 'renew' | 'fail' | 'drop';
+export type Step = 'done' | 'recover' | 'wait' | 'retry' | 'renew' | 'fail' | 'drop';
 
 export interface Failure {
   status: number;
@@ -91,12 +96,12 @@ export const busyRetries = 3;
 export function nextStep(
   failure: Failure,
   delivered: boolean | undefined,
-  { voice, attempts }: { voice: boolean; attempts: number },
+  { voice, attempts, recovered = false }: { voice: boolean; attempts: number; recovered?: boolean },
 ): Step {
   if (delivered) return 'done';
   const { status } = failure;
   const reason = failure.reason ?? '';
-  if (status === 0) return 'wait';
+  if (status === 0) return recovered ? 'wait' : 'recover';
   if (voice && status === 400 && /no speech was detected/i.test(reason)) return 'drop';
   const again = attempts < busyRetries ? 'retry' : 'fail';
   if (status === 429 || status >= 500) return again;
@@ -104,4 +109,35 @@ export function nextStep(
   if (voice && status === 409 && /may already be in the conversation/i.test(reason))
     return delivered === false ? 'renew' : again;
   return 'fail';
+}
+
+export function privateCode(text: string, requests: VerificationRequest[] = []) {
+  if (!text.trim() || !requests.length) return undefined;
+  const otp =
+    classifyVerificationReply(text).kind !== 'ordinary' &&
+    requests.some((request) => request.kind === 'otp');
+  const card =
+    Boolean(securityCodeIn(text)) && requests.some((request) => request.kind === 'payment');
+  if (!otp && !card) return undefined;
+  return requests.every((request) => request.kind === 'payment')
+    ? 'Security code sent securely.'
+    : 'Verification code sent securely.';
+}
+
+export function codeRequestTargets(requests: VerificationRequest[] = [], messages: Message[]) {
+  return new Map(
+    requests.flatMap((request) => {
+      const target = messages.findLast(
+        (message) => message.role === 'assistant' && message.turnId === request.turnId,
+      );
+      return target ? [[target.id, request.kind] as const] : [];
+    }),
+  );
+}
+
+export function persistable(item: Outgoing) {
+  if (item.privateText) return false;
+  if (item.audio || item.files?.length) return true;
+  const reply = classifyVerificationReply(item.text).kind;
+  return reply !== 'code' && reply !== 'wrapped' && !securityCodeIn(item.text);
 }

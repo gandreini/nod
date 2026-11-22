@@ -3,6 +3,8 @@ import { AppState } from 'react-native';
 import EventSource from 'react-native-sse';
 import type { Connection } from '../connection/connection';
 import type { Activity } from '../connection/contracts';
+import { resetConnections } from '../../modules/nod-network';
+import { liveHeld } from './live-holds';
 
 export interface ServerEvent {
   type?: string;
@@ -15,21 +17,29 @@ export interface ServerEvent {
 }
 
 export interface ServerEventHandlers {
-  opened(): void;
   received(event: ServerEvent): void;
   refused(status: number): void;
   failed(message: string): void;
   resumed(): void;
+  stalled(): void;
 }
 
+export const resumeHedge = 3000;
 const firstDelay = 3000;
 const maxDelay = 30000;
-const silentLimit = 45000;
+const silentLimit = 25000;
+const recoverGap = 5000;
+const quietLimit = 20000;
 
 export function useServerEvents(connection: Connection, handlers: ServerEventHandlers) {
   const [live, setLive] = useState(false);
   const latest = useRef(handlers);
   const control = useRef<(() => void) | null>(null);
+  const health = useRef<{
+    stale(): boolean;
+    suspect(): boolean;
+    recover(): Promise<void>;
+  } | null>(null);
 
   useEffect(() => {
     latest.current = handlers;
@@ -44,6 +54,8 @@ export function useServerEvents(connection: Connection, handlers: ServerEventHan
     let delay = firstDelay;
     let pending: ReturnType<typeof setTimeout> | null = null;
     let stopped = false;
+    let paused = false;
+    let resumeCheck: ReturnType<typeof setTimeout> | null = null;
     const clearPending = () => {
       if (pending) clearTimeout(pending);
       pending = null;
@@ -53,15 +65,15 @@ export function useServerEvents(connection: Connection, handlers: ServerEventHan
       events.open();
     };
     const retry = () => {
-      if (pending || stopped) return;
+      if (pending || stopped || paused) return;
       pending = setTimeout(() => {
         pending = null;
-        if (!stopped) reopen();
+        if (!stopped && !paused) reopen();
       }, delay);
       delay = Math.min(delay * 2, maxDelay);
     };
     const reconnect = () => {
-      if (stopped) return;
+      if (stopped || paused) return;
       clearPending();
       delay = firstDelay;
       reopen();
@@ -78,21 +90,34 @@ export function useServerEvents(connection: Connection, handlers: ServerEventHan
     const handle = inner._handleEvent.bind(events);
     inner._handleEvent = (text) => {
       heard = Date.now();
+      delay = firstDelay;
       handle(text);
     };
-    const watch = setInterval(() => {
-      if (!open || stopped || Date.now() - heard < silentLimit) return;
+    let recovered = 0;
+    const recover = async () => {
+      if (Date.now() - recovered < recoverGap) return;
+      recovered = Date.now();
+      heard = Date.now();
       open = false;
       setLive(false);
+      clearPending();
+      await resetConnections(connection.origin);
       reconnect();
-    }, silentLimit / 3);
+    };
+    health.current = {
+      stale: () => !stopped && !paused && open && Date.now() - heard >= silentLimit,
+      suspect: () => !stopped && (!open || Date.now() - heard >= quietLimit),
+      recover,
+    };
+    const watch = setInterval(() => {
+      if (!open || stopped || paused || Date.now() - heard < silentLimit) return;
+      void recover();
+    }, 5000);
     events.addEventListener('open', () => {
       open = true;
       heard = Date.now();
       clearPending();
-      delay = firstDelay;
       setLive(true);
-      latest.current.opened();
     });
     events.addEventListener('error', (event) => {
       open = false;
@@ -121,21 +146,50 @@ export function useServerEvents(connection: Connection, handlers: ServerEventHan
       latest.current.received(data);
     });
     const lifecycle = AppState.addEventListener('change', (status) => {
-      if (status !== 'active' || stopped) return;
-      reconnect();
+      if (stopped) return;
+      if (status === 'background' && !liveHeld()) {
+        paused = true;
+        open = false;
+        if (resumeCheck) clearTimeout(resumeCheck);
+        resumeCheck = null;
+        clearPending();
+        setLive(false);
+        events.close();
+        return;
+      }
+      if (status !== 'active' || !paused) return;
+      paused = false;
       latest.current.resumed();
+      void resetConnections(connection.origin).then(() => {
+        if (stopped || paused) return;
+        reconnect();
+        if (resumeCheck) clearTimeout(resumeCheck);
+        resumeCheck = setTimeout(() => {
+          resumeCheck = null;
+          if (stopped || paused || open) return;
+          recovered = 0;
+          void recover().then(() => latest.current.stalled());
+        }, resumeHedge);
+      });
     });
     return () => {
       stopped = true;
+      if (resumeCheck) clearTimeout(resumeCheck);
       clearPending();
       clearInterval(watch);
       lifecycle.remove();
       events.removeAllEventListeners();
       events.close();
       if (control.current === reconnect) control.current = null;
+      health.current = null;
     };
   }, [connection]);
 
   const reconnect = useCallback(() => control.current?.(), []);
-  return { live, reconnect };
+  const stale = useCallback(() => health.current?.stale() ?? false, []);
+  const suspect = useCallback(() => health.current?.suspect() ?? true, []);
+  const recover = useCallback(async () => {
+    await (health.current?.recover() ?? resetConnections(connection.origin));
+  }, [connection.origin]);
+  return { live, reconnect, stale, suspect, recover };
 }

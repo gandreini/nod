@@ -1,0 +1,27 @@
+appId: com.gandreini.nod.e2e
+name: Send a verification code privately
+---
+- launchApp
+- extendedWaitUntil:
+    visible: Synthetic history ready
+    timeout: 15000
+- runScript:
+    file: ../scripts/control.js
+    env:
+      ROUTE: /fixture/verification
+      BODY: '{"kind":"otp"}'
+- extendedWaitUntil:
+    visible: '.*Send the code by itself in the message box.*'
+    timeout: 10000
+- tapOn:
+    id: composer-input
+- inputText: '482913'
+- tapOn:
+    id: composer-send
+- extendedWaitUntil:
+    visible: Verification code sent securely.
+    timeout: 10000
+- assertNotVisible: '482913'
+- extendedWaitUntil:
+    notVisible: '.*Send the code by itself in the message box.*'
+    timeout: 10000

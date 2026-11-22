@@ -10,3 +10,4 @@ executionOrder:
     - Open every section from the menu
     - Read a file Nod sent in the bottom panel
     - Use Nod's browser in the bottom panel
+    - Send a verification code privately

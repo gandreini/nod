@@ -1,11 +1,12 @@
 import { useEffect, useRef, useState } from 'react';
 import { Animated, Easing, Pressable, StyleSheet, Text } from 'react-native';
+import { X } from '../ui/icons';
 import { font, type Theme } from '../ui/theme';
 
 const tuck = 28;
 
 export const noticeMotion = { duration: 220, easing: Easing.out(Easing.cubic) };
-const shownFor = 5000;
+const shownFor = (text: string) => Math.max(5000, text.length * 70);
 
 export function ComposerNotice({
   text,
@@ -37,7 +38,7 @@ export function ComposerNotice({
       if (finished && !text) setShown(undefined);
     });
     if (!text) return;
-    const timer = setTimeout(() => dismiss.current(), shownFor);
+    const timer = setTimeout(() => dismiss.current(), shownFor(text));
     return () => clearTimeout(timer);
   }, [progress, text]);
   if (!shown) return null;
@@ -63,7 +64,8 @@ export function ComposerNotice({
         accessibilityLiveRegion="polite"
         style={styles.body}
       >
-        <Text style={[styles.text, { color: theme.foreground }]}>{shown}</Text>
+        <Text style={[styles.text, styles.fill, { color: theme.foreground }]}>{shown}</Text>
+        <X size={16} color={theme.mutedForeground} />
       </Pressable>
     </Animated.View>
   );
@@ -81,6 +83,14 @@ const styles = StyleSheet.create({
     borderWidth: StyleSheet.hairlineWidth,
     borderBottomWidth: 0,
   },
-  body: { paddingHorizontal: 20, paddingTop: 12, paddingBottom: 12 + tuck },
+  body: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    gap: 12,
+    paddingHorizontal: 20,
+    paddingTop: 12,
+    paddingBottom: 12 + tuck,
+  },
+  fill: { flex: 1 },
   text: { fontFamily: font.regular, fontSize: 13, lineHeight: 18 },
 });

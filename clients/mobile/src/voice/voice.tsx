@@ -4,6 +4,7 @@ import {
   useAudioPlayer,
   useAudioPlayerStatus,
   useAudioStream,
+  type AudioPlayer,
   type AudioSource,
 } from 'expo-audio';
 import { Pause, Play } from '../ui/icons';
@@ -15,9 +16,10 @@ import type { Recording } from '../chat/chat-state';
 import { wavBars, wavSeconds } from './waveform';
 import { dropRecording } from './pending-voice';
 import { font, radius, type Theme } from '../ui/theme';
-import { errorText } from '../connection/api';
+import { errorText, fetchWithin } from '../connection/api';
 
 const playback = { allowsRecording: false, playsInSilentMode: true };
+let playingNow: AudioPlayer | null = null;
 let recordingNow = false;
 
 export function clock(seconds: number) {
@@ -63,6 +65,26 @@ export function useVoiceRecorder() {
   const [error, setError] = useState<string>();
   const busy = useRef(false);
   const started = useRef(0);
+  const live = useRef(false);
+  live.current = active;
+
+  useEffect(
+    () => () => {
+      if (!live.current) return;
+      recordingNow = false;
+      void stream
+        .stopFileRecordingAsync()
+        .then((file) => dropRecording(file.uri, true))
+        .catch(() => {})
+        .finally(() => {
+          try {
+            if (stream.isStreaming) stream.stop();
+          } catch {}
+          void setAudioModeAsync(playback).catch(() => {});
+        });
+    },
+    [stream],
+  );
 
   useEffect(() => {
     if (!active) return;
@@ -132,6 +154,7 @@ export function useVoiceRecorder() {
       };
     } catch (problem) {
       if (stream.isStreaming) stream.stop();
+      await setAudioModeAsync(playback).catch(() => {});
       setError(`Recording did not stop cleanly: ${errorText(problem)}`);
       return null;
     } finally {
@@ -199,13 +222,16 @@ function loadWave(source: AudioSource) {
     pending = (
       uri.startsWith('file:')
         ? new File(uri).bytes()
-        : fetch(uri, { headers }).then(async (response) => {
+        : fetchWithin(uri, { headers }).then(async (response) => {
             if (!response.ok) throw new Error(`HTTP ${response.status}`);
             return new Uint8Array(await response.arrayBuffer());
           })
     )
       .then((bytes) => ({ bars: wavBars(bytes, barCount), seconds: wavSeconds(bytes) }))
-      .catch(() => ({ bars: null, seconds: null }));
+      .catch(() => {
+        waves.delete(uri);
+        return { bars: null, seconds: null };
+      });
     waves.set(uri, pending);
   }
   return pending;
@@ -247,6 +273,12 @@ export function AudioClip({
 }) {
   const player = useAudioPlayer(null);
   const status = useAudioPlayerStatus(player);
+  useEffect(
+    () => () => {
+      if (playingNow === player) playingNow = null;
+    },
+    [player],
+  );
   const [loaded, setLoaded] = useState(false);
   const [error, setError] = useState<string>();
   const wave = useWave(source, mimeType, size);
@@ -259,13 +291,15 @@ export function AudioClip({
     setError(undefined);
     try {
       if (!status.playing && !recordingNow) await setAudioModeAsync(playback);
+      if (status.playing) return player.pause();
+      if (playingNow && playingNow !== player) playingNow.pause();
+      playingNow = player;
       if (!loaded) {
         player.replace(source);
         setLoaded(true);
         player.play();
         return;
       }
-      if (status.playing) return player.pause();
       if (ended) void player.seekTo(0);
       player.play();
     } catch (problem) {
@@ -278,6 +312,7 @@ export function AudioClip({
       <View style={styles.clip}>
         <Pressable
           onPress={toggle}
+          hitSlop={8}
           accessibilityRole="button"
           accessibilityLabel={status.playing ? 'Pause voice message' : 'Play voice message'}
           style={({ pressed }) => [

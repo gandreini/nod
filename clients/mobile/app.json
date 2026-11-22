@@ -44,7 +44,7 @@
       [
         "expo-audio",
         {
-          "microphonePermission": "Nod uses the microphone when you record a voice message."
+          "microphonePermission": "Nod uses the microphone when you record a voice message or talk with Nod in a call."
         }
       ],
       [
@@ -54,7 +54,18 @@
           "cameraPermission": "Nod uses the camera when you take a photo to attach to a message."
         }
       ],
-      "expo-sharing"
+      "expo-sharing",
+      [
+        "expo-notifications",
+        {
+          "icon": "./assets/android-icon-monochrome.png",
+          "color": "#ff91ac",
+          "defaultChannel": "messages"
+        }
+      ],
+      "@livekit/react-native-expo-plugin",
+      "@config-plugins/react-native-webrtc",
+      "./plugins/with-connection-ping"
     ]
   }
 }

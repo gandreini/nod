@@ -32,6 +32,10 @@ export function refusedAccess(problem: unknown) {
     : undefined;
 }
 
+export function refusedToken(problem: unknown): problem is ApiError {
+  return problem instanceof ApiError && problem.status === 401;
+}
+
 export function tokenRefused(origin: string, status = 401) {
   return `${new URL(origin).host} no longer accepts the saved token (HTTP ${status}). Connect again with the current token.`;
 }
@@ -80,6 +84,16 @@ export function unreachable(connection: Connection, error: unknown) {
     undefined,
     String(error),
   );
+}
+
+export async function fetchWithin(url: string, init: RequestInit = {}, timeout = 30_000) {
+  const deadline = new AbortController();
+  const timer = setTimeout(() => deadline.abort(), timeout);
+  try {
+    return await fetch(url, { ...init, signal: deadline.signal });
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 export async function request<T>(
@@ -132,8 +146,8 @@ function api<T>(connection: Connection, path: string, body?: unknown) {
   return request<T>(connection, path, body === undefined ? 'GET' : 'POST', body);
 }
 
-export function getState(connection: Connection) {
-  return api<AppState>(connection, '/api/state');
+export function getState(connection: Connection, signal?: AbortSignal) {
+  return request<AppState>(connection, '/api/state', 'GET', undefined, signal, 15_000);
 }
 
 export async function messageArrived(connection: Connection, id: string) {
@@ -165,16 +179,23 @@ export interface OutgoingText {
   attachmentIds?: string[];
 }
 
-export function sendText(connection: Connection, input: OutgoingText) {
-  return api<SubmitMessageResponse>(connection, '/api/messages', {
-    clientMessageId: input.id,
-    text: input.text,
-    threadId: input.threadId,
-    ...(input.replyToMessageId ? { replyToMessageId: input.replyToMessageId } : {}),
-    ...(input.questionAnswer ? { questionAnswer: input.questionAnswer } : {}),
-    ...(input.approvalAnswer ? { approvalAnswer: input.approvalAnswer } : {}),
-    ...(input.attachmentIds?.length ? { attachmentIds: input.attachmentIds } : {}),
-  });
+export function sendText(connection: Connection, input: OutgoingText, timeout = 10_000) {
+  return request<SubmitMessageResponse>(
+    connection,
+    '/api/messages',
+    'POST',
+    {
+      clientMessageId: input.id,
+      text: input.text,
+      threadId: input.threadId,
+      ...(input.replyToMessageId ? { replyToMessageId: input.replyToMessageId } : {}),
+      ...(input.questionAnswer ? { questionAnswer: input.questionAnswer } : {}),
+      ...(input.approvalAnswer ? { approvalAnswer: input.approvalAnswer } : {}),
+      ...(input.attachmentIds?.length ? { attachmentIds: input.attachmentIds } : {}),
+    },
+    undefined,
+    timeout,
+  );
 }
 
 export function appSetupStatus(connection: Connection, hashes: string[], connectionIds: string[]) {

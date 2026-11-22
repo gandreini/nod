@@ -1,7 +1,15 @@
 import { CryptoDigestAlgorithm, digestStringAsync } from 'expo-crypto';
 import { Check, LoaderCircle, X } from '../ui/icons';
 import { useEffect, useState, type ReactNode } from 'react';
-import { ActivityIndicator, Linking, Pressable, StyleSheet, Text, View } from 'react-native';
+import {
+  ActivityIndicator,
+  AppState,
+  Linking,
+  Pressable,
+  StyleSheet,
+  Text,
+  View,
+} from 'react-native';
 import { appSetupStatus, errorText } from '../connection/api';
 import { AppLogo } from '../sections/app-logo';
 import type { Connection } from '../connection/connection';
@@ -197,6 +205,14 @@ const approvalLabels: Record<string, string> = {
   uncertain: 'May have run',
 };
 
+function declineLabel(title: string) {
+  return /^cancel\b/i.test(title) ? 'No' : 'Cancel';
+}
+
+function destructive(title: string) {
+  return /^(delete|remove|trash)\b/i.test(title);
+}
+
 export function ApprovalCard({
   message,
   question,
@@ -254,9 +270,9 @@ export function ApprovalCard({
       ) : null}
       {state === 'pending' ? (
         <View style={{ borderTopWidth: StyleSheet.hairlineWidth, borderTopColor: theme.border }}>
-          {[approval.title, 'Cancel'].map((label, index) => (
+          {[approval.title, declineLabel(approval.title)].map((label, index) => (
             <Row
-              key={label}
+              key={index}
               theme={theme}
               first={index === 0}
               disabled={busy}
@@ -264,9 +280,20 @@ export function ApprovalCard({
               onPress={() => answer(index === 0, label)}
             >
               <Badge theme={theme} label={String.fromCharCode(65 + index)} />
-              <Text style={[styles.rowText, { color: theme.foreground }]}>{label}</Text>
+              <Text
+                style={[
+                  styles.rowText,
+                  {
+                    color:
+                      index === 0 && destructive(approval.title) ? theme.error : theme.foreground,
+                  },
+                ]}
+              >
+                {label}
+              </Text>
             </Row>
           ))}
+          {busy ? <ActivityIndicator style={styles.spinner} color={theme.accent} /> : null}
         </View>
       ) : (
         <View
@@ -297,6 +324,32 @@ export function ApprovalCard({
   );
 }
 
+export function CodeRequestCard({ kind, theme }: { kind: 'otp' | 'payment'; theme: Theme }) {
+  const otp = kind === 'otp';
+  return (
+    <Card theme={theme}>
+      <View style={styles.heading}>
+        <Text style={[styles.caption, { color: theme.mutedForeground }]}>
+          {otp ? 'Waiting for a verification code' : 'Waiting for a security code'}
+        </Text>
+        <Text style={[styles.title, { color: theme.foreground }]}>
+          {otp ? 'Verification code' : 'Card security code'}
+        </Text>
+      </View>
+      <View style={styles.slots} accessible={false} importantForAccessibility="no-hide-descendants">
+        {Array.from({ length: otp ? 6 : 3 }, (_, index) => (
+          <View key={index} style={[styles.slot, { borderColor: theme.border }]} />
+        ))}
+      </View>
+      <Text style={[styles.codeHint, { color: theme.secondary }]} accessibilityLiveRegion="polite">
+        {otp
+          ? 'Send the code by itself in the message box. Nod enters it privately and hides it in this chat.'
+          : 'Send the 3- or 4-digit code from your card by itself in the message box.'}
+      </Text>
+    </Card>
+  );
+}
+
 export const connectLink =
   /\[([^\]]+)\]\(<?(\/apps\?connect=([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}))>?\)/gi;
 
@@ -316,6 +369,15 @@ export function ConnectAppCard({
   const [app, setApp] = useState<AppSetupStatus['apps'][number]>();
   const [completed, setCompleted] = useState(false);
   const [error, setError] = useState<string>();
+  const [checks, setChecks] = useState(0);
+  const [checked, setChecked] = useState(false);
+
+  useEffect(() => {
+    const subscription = AppState.addEventListener('change', (status) => {
+      if (status === 'active') setChecks((count) => count + 1);
+    });
+    return () => subscription.remove();
+  }, []);
 
   useEffect(() => {
     let active = true;
@@ -330,16 +392,19 @@ export function ConnectAppCard({
       })
       .catch((problem) => {
         if (active) setError(`Could not check this app: ${errorText(problem)}`);
+      })
+      .finally(() => {
+        if (active) setChecked(true);
       });
     return () => {
       active = false;
     };
-  }, [connection, connectionId]);
+  }, [checks, connection, connectionId]);
 
   const name = app?.name ?? 'App';
   const expired = !completed && app?.available === false;
   const label = completed ? 'Connected' : expired ? 'Expired' : 'Connect';
-  const off = completed || expired;
+  const off = completed || expired || !checked;
 
   return (
     <View style={[styles.connectWrap, { backgroundColor: theme.muted }]}>
@@ -423,6 +488,15 @@ const styles = StyleSheet.create({
     paddingVertical: 12,
   },
   spinner: { paddingVertical: 8 },
+  slots: { flexDirection: 'row', gap: 8, paddingHorizontal: 16, paddingBottom: 12 },
+  slot: { width: 32, height: 40, borderRadius: 8, borderWidth: 1 },
+  codeHint: {
+    fontFamily: font.regular,
+    fontSize: 14,
+    lineHeight: 20,
+    paddingHorizontal: 16,
+    paddingBottom: 16,
+  },
   problem: {
     fontFamily: font.regular,
     fontSize: 13,

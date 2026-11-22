@@ -37,7 +37,7 @@ export function NodMark({ size = 28 }: { size?: number }) {
   );
 }
 
-export function NodGlyph({ size = 28 }: { size?: number }) {
+export function NodGlyph({ size = 28, mark }: { size?: number; mark?: string }) {
   const theme = useTheme();
   const turn = useRef(new Animated.Value(0)).current;
   const [still, setStill] = useState(false);
@@ -71,7 +71,7 @@ export function NodGlyph({ size = 28 }: { size?: number }) {
       importantForAccessibility="no-hide-descendants"
     >
       <Svg width={size} height={size} viewBox="0 0 32 32">
-        <Circle cx="16" cy="16" r="10" stroke={theme.mark} strokeWidth="4" fill="none" />
+        <Circle cx="16" cy="16" r="10" stroke={mark ?? theme.mark} strokeWidth="4" fill="none" />
       </Svg>
       <Animated.View
         style={{ position: 'absolute', width: size, height: size, transform: [{ rotate }] }}

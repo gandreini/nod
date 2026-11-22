@@ -6,7 +6,7 @@ import { searchApps } from '../../../../src/web/lib/app-search';
 import { errorText } from '../connection/api';
 import { AppLogo } from './app-logo';
 import type { AppConnection } from '../connection/contracts';
-import { useNod } from '../connection/nod-context';
+import { useNodBase } from '../connection/nod-context';
 import { radius, useTheme } from '../ui/theme';
 import { Button, Empty, Group, Loaded, Notice, Page, Pill, SectionTitle, text } from '../ui/ui';
 import { useRequest, useResource } from './use-resource';
@@ -47,7 +47,7 @@ function AppRow({
   onPress(): void;
 }) {
   const theme = useTheme();
-  const { connection } = useNod();
+  const { connection } = useNodBase();
   const who = account(app);
   return (
     <Pressable
@@ -103,7 +103,7 @@ function AppRow({
 
 export function AppsScreen() {
   const theme = useTheme();
-  const { ask, connection } = useNod();
+  const { ask, connection } = useNodBase();
   const send = useRequest();
   const apps = useResource<AppConnection[]>('/api/apps');
   const catalog = useResource<AppConnection[]>('/api/apps/catalog', { optional: true });
@@ -249,7 +249,7 @@ export function AppsScreen() {
                 setQuery('');
                 setShown(page);
               }}
-              hitSlop={8}
+              hitSlop={13}
               accessibilityRole="button"
               accessibilityLabel="Clear search"
             >

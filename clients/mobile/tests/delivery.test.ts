@@ -25,7 +25,15 @@ async function harness(
   const connection: Connection = { origin: server.origin, token: server.token, owner: 'synthetic' };
   if (faults.length) await server.control('/fixture/audio-faults', { faults });
   const dropped: string[] = [];
-  const net = { up: true };
+  const net = {
+    up: true,
+    stale: false,
+    suspect: true,
+    slowSends: 0,
+    loseAnswers: 0,
+    deadSends: 0,
+    steps: [] as string[],
+  };
   const reachable = () => {
     if (!net.up) throw new ApiError(0, 'Could not reach the synthetic server: offline');
   };
@@ -33,12 +41,23 @@ async function harness(
     thread: () => threadId,
     sendText: async (item, thread) => {
       reachable();
-      return sendText(connection, {
+      net.steps.push('send');
+      if (net.deadSends > 0) {
+        net.deadSends -= 1;
+        return new Promise(() => {});
+      }
+      if (net.slowSends > 0) await new Promise((resolve) => setTimeout(resolve, net.slowSends));
+      const answer = await sendText(connection, {
         id: item.id,
         text: item.text,
         threadId: thread,
         attachmentIds: item.attachmentIds,
       });
+      if (net.loseAnswers > 0) {
+        net.loseAnswers -= 1;
+        throw new ApiError(0, 'The synthetic answer was lost on the way back.');
+      }
+      return answer;
     },
     sendAudio: async (_item, thread, sendId) => {
       reachable();
@@ -51,6 +70,13 @@ async function harness(
       );
     },
     arrived: (sendId) => messageArrived(connection, sendId),
+    stale: () => net.stale,
+    suspect: () => net.suspect,
+    recover: async () => {
+      net.stale = false;
+      net.steps.push('recover');
+    },
+    hedgeAfter: 300,
     newId: randomUUID,
     later,
     onChange: () => {},
@@ -201,6 +227,67 @@ describe('message delivery', () => {
     }
   });
 
+  test('a text whose answer is lost goes again at once on a fresh connection, without waiting for the live stream, and arrives once', async () => {
+    const { server, outbox, settled, messages, net } = await harness();
+    try {
+      outbox.setOnline(false);
+      net.loseAnswers = 1;
+      const item = text('lost answer');
+      outbox.add(item);
+      await settled();
+      assert.deepEqual(net.steps, ['send', 'recover', 'send']);
+      assert.equal(outbox.items()[0]?.status ?? 'sent', 'sent');
+      assert.deepEqual((await messages()).filter((message) => message.id === item.id).length, 1);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  test('a text stuck on a dead connection goes again on a fresh one within moments and arrives once', async () => {
+    const { server, outbox, settled, messages, net } = await harness();
+    try {
+      net.deadSends = 1;
+      const item = text('dead connection');
+      const started = Date.now();
+      outbox.add(item);
+      await settled();
+      assert.ok(Date.now() - started < 2000);
+      assert.deepEqual(net.steps, ['send', 'recover', 'send']);
+      assert.equal((await messages()).filter((message) => message.id === item.id).length, 1);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  test('a slow server on a healthy connection gets the message once, with no resend', async () => {
+    const { server, outbox, settled, messages, net } = await harness();
+    try {
+      net.suspect = false;
+      net.slowSends = 700;
+      const item = text('slow but alive');
+      outbox.add(item);
+      await settled();
+      assert.deepEqual(net.steps, ['send']);
+      assert.equal((await messages()).filter((message) => message.id === item.id).length, 1);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  test('a quiet live stream renews the connection before a message goes out', async () => {
+    const { server, outbox, settled, messages, net } = await harness();
+    try {
+      net.stale = true;
+      const item = text('after a quiet stream');
+      outbox.add(item);
+      await settled();
+      assert.deepEqual(net.steps, ['recover', 'send']);
+      assert.ok((await messages()).some((message) => message.id === item.id));
+    } finally {
+      await server.stop();
+    }
+  });
+
   test('offline, messages wait in order and go out when the connection returns', async () => {
     const { server, outbox, settled, messages, net } = await harness();
     try {
@@ -295,6 +382,9 @@ describe('message delivery', () => {
         sendText: () => Promise.reject(new Error('unexpected text send')),
         sendAudio: () => Promise.reject(new Error('unexpected voice send')),
         arrived: () => Promise.resolve(false),
+        stale: () => false,
+        suspect: () => false,
+        recover: () => Promise.resolve(),
         newId: randomUUID,
         later: (run) => void setTimeout(run, 0),
         onChange: () => {},

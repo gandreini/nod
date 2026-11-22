@@ -3,6 +3,8 @@ import { randomBytes } from 'node:crypto';
 import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { after, before, describe, test } from 'node:test';
+import { ApiError } from '../src/connection/api.ts';
+import { loadCapabilities, parseCapabilities } from '../src/connection/capabilities.ts';
 import { ConnectionProblem, checkServer, serverOrigin } from '../src/connection/connection.ts';
 import { monthlyLimit } from '../src/sections/money.ts';
 import { startFakeServer } from './fake-server.ts';
@@ -114,5 +116,78 @@ describe('monthly limit', () => {
     assert.deepEqual(monthlyLimit('1.234'), {
       error: 'Use at most two decimals, for example 25.50.',
     });
+  });
+});
+
+describe('capabilities', () => {
+  test('parse keeps only a well-formed push feature', () => {
+    assert.deepEqual(
+      parseCapabilities({ features: { push: { version: 1, platforms: ['android'] } } }),
+      { push: { version: 1, platforms: ['android'] } },
+    );
+    assert.deepEqual(
+      parseCapabilities({
+        features: { push: { version: 1, platforms: ['android'] }, voice: { version: 1 } },
+      }),
+      { push: { version: 1, platforms: ['android'] }, voice: { version: 1 } },
+    );
+    assert.deepEqual(parseCapabilities({ features: { voice: { version: 'x' } } }), {});
+    for (const value of [
+      undefined,
+      null,
+      'x',
+      { features: [] },
+      { features: { push: { version: '1' } } },
+      { features: { push: { version: 1, platforms: 'android' } } },
+    ])
+      assert.deepEqual(parseCapabilities(value), {}, JSON.stringify(value));
+  });
+
+  async function serve(status: number, body: string) {
+    const server: Server = createServer((_request, response) => {
+      response.writeHead(status, { 'Content-Type': 'application/json' });
+      response.end(body);
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const origin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    return {
+      connection: { origin, token: 't', owner: 'o' },
+      close: () => new Promise<void>((resolve) => server.close(() => resolve())),
+    };
+  }
+
+  test('an original server (404) or garbage means no features', async () => {
+    for (const [status, body] of [
+      [404, '{"error":"Route not found."}'],
+      [200, 'not json'],
+    ] as const) {
+      const server = await serve(status, body);
+      assert.deepEqual(await loadCapabilities(server.connection), {});
+      await server.close();
+    }
+  });
+
+  test('a network failure or a server error leaves the known features unknown, not removed', async () => {
+    const failing = await serve(500, '{}');
+    assert.equal(await loadCapabilities(failing.connection), undefined);
+    await failing.close();
+    assert.equal(
+      await loadCapabilities({ origin: 'http://127.0.0.1:9', token: 't', owner: 'o' }),
+      undefined,
+    );
+  });
+
+  test('a fork server lists push and a refused token still reaches the caller', async () => {
+    const fork = await serve(200, '{"features":{"push":{"version":1,"platforms":["android"]}}}');
+    assert.deepEqual(await loadCapabilities(fork.connection), {
+      push: { version: 1, platforms: ['android'] },
+    });
+    await fork.close();
+    const refused = await serve(401, '{"error":"Unauthorized"}');
+    await assert.rejects(
+      loadCapabilities(refused.connection),
+      (error) => error instanceof ApiError && error.status === 401,
+    );
+    await refused.close();
   });
 });

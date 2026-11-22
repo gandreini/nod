@@ -5,7 +5,16 @@ import {
   type IconPath,
 } from '../../../../src/web/components/icon-drawings';
 
-export { Camera, CreditCard, Image, KeyRound, Pause } from 'lucide-react-native';
+export {
+  Camera,
+  CreditCard,
+  Image,
+  KeyRound,
+  MicOff,
+  Pause,
+  Phone,
+  PhoneOff,
+} from 'lucide-react-native';
 
 type Props = { size?: number; color?: string; solid?: boolean; strokeWidth?: number };
 

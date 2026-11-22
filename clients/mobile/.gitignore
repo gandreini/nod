@@ -42,3 +42,10 @@ yarn-error.*
 
 # End-to-end test builds
 e2e/build/
+
+# Firebase
+google-services.json
+*firebase-adminsdk*.json
+
+# local native module build output
+modules/*/android/build/

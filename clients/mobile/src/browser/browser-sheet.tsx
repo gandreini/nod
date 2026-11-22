@@ -2,6 +2,7 @@ import * as ScreenOrientation from 'expo-screen-orientation';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Animated,
+  Platform,
   Image,
   Keyboard,
   Modal,
@@ -17,7 +18,7 @@ import { KeyboardAvoidingView } from 'react-native-keyboard-controller';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import type { Connection } from '../connection/connection';
 import type { Turn } from '../connection/contracts';
-import { useNod } from '../connection/nod-context';
+import { useNodBase } from '../connection/nod-context';
 import { ArrowLeft, Globe2, RefreshCw, X } from '../ui/icons';
 import { IconButton } from '../ui/sheet';
 import { darkTheme, font, radius, type Theme } from '../ui/theme';
@@ -121,7 +122,7 @@ export function BrowserSheet({
   onReturned(): void;
 }) {
   const theme = darkTheme;
-  const { refused } = useNod();
+  const { refused } = useNodBase();
   const insets = useSafeAreaInsets();
   const handoff = useBrowserHandoff(connection, turnId, refused);
   const off = !handoff.live || Boolean(handoff.busy) || Boolean(handoff.end);
@@ -226,14 +227,18 @@ function BrowserScreen({
   handoff,
   theme,
   dark,
+  onTap,
 }: {
   handoff: BrowserHandoff;
   theme: Theme;
   dark?: boolean;
+  onTap?(): void;
 }) {
   const box = useRef({ width: 0, height: 0 });
   const current = useRef(handoff);
   current.current = handoff;
+  const tapped = useRef(onTap);
+  tapped.current = onTap;
   const zoom = useRef<Zoom>({ scale: 1, x: 0, y: 0 });
   const scale = useRef(new Animated.Value(1)).current;
   const shiftX = useRef(new Animated.Value(0)).current;
@@ -316,7 +321,10 @@ function BrowserScreen({
             box.current,
             current.current.size,
           );
-          if (at) current.current.send(tap(at));
+          if (at) {
+            current.current.send(tap(at));
+            tapped.current?.();
+          }
         },
         onPanResponderTerminate: () => {
           gesture.current = null;
@@ -385,7 +393,7 @@ function BrowserBody({
   const busy = Boolean(handoff.busy);
   return (
     <>
-      <BrowserScreen handoff={handoff} theme={theme} dark />
+      <BrowserScreen handoff={handoff} theme={theme} dark onTap={() => setTyped('')} />
       <View style={[styles.bar, { paddingBottom: bottom }]}>
         {handoff.error ? (
           <Text
@@ -413,6 +421,12 @@ function BrowserBody({
           submitBehavior="submit"
           returnKeyType="go"
           autoCapitalize="none"
+          autoCorrect={false}
+          spellCheck={false}
+          autoComplete="off"
+          importantForAutofill="no"
+          textContentType="none"
+          keyboardType={Platform.OS === 'android' ? 'visible-password' : 'default'}
           editable={handoff.live && !busy}
           placeholder="Type on the page"
           placeholderTextColor={theme.placeholder}

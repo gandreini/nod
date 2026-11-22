@@ -2,7 +2,7 @@ import { ChevronLeft, ChevronRight, CodeXml, ExternalLink, Eye, FileText } from 
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { Alert, Image, Keyboard, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import { artifactSource, read, unreachable, errorText } from '../connection/api';
+import { artifactSource, errorText, fetchWithin, read, unreachable } from '../connection/api';
 import { ownedArtifact } from '../connection/links';
 import { openArtifact } from './attachment-views';
 import { fileSize } from './attachments';
@@ -16,7 +16,7 @@ import { font, radius, useTheme, type Theme } from '../ui/theme';
 import { Button, Loading } from '../ui/ui';
 import { IconButton, Sheet, SheetTitle, sheetStyles, type CloseSheet } from '../ui/sheet';
 
-const shownCharacters = 200_000;
+const shownCharacters = 50_000;
 const bodyPadding = 16;
 
 export function FileViewerProvider({ children }: { children: ReactNode }) {
@@ -56,7 +56,7 @@ async function loadText(connection: Connection, file: Artifact) {
   const source = artifactSource(connection, file.url);
   let response: Response;
   try {
-    response = await fetch(source.uri, { headers: source.headers });
+    response = await fetchWithin(source.uri, { headers: source.headers });
   } catch (problem) {
     throw unreachable(connection, problem);
   }

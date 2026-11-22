@@ -10,6 +10,7 @@ import {
 } from '../../../../src/shared/models';
 import { formatClockTime, useDateFormat } from '../../../../src/web/lib/date-format';
 import { errorText } from '../connection/api';
+import { useNodBase } from '../connection/nod-context';
 import type { Preferences } from '../connection/contracts';
 import { radius, useTheme } from '../ui/theme';
 import { Button, Card, Group, Loaded, Notice, Page, SectionTitle, text } from '../ui/ui';
@@ -25,138 +26,223 @@ const effortNames: Record<ModelEffort, string> = {
   max: 'Max',
 };
 
-function Models() {
+type ModelChoice = { connectionId: string; modelId: string; effort: ModelEffort };
+
+function ModelChooser({
+  connections,
+  selection: saved,
+  save,
+  automatic,
+}: {
+  connections: ModelConnection[];
+  selection: ModelChoice | null | undefined;
+  save(choice: ModelChoice | null): Promise<void>;
+  automatic?: { title: string; detail: string };
+}) {
   const theme = useTheme();
-  const send = useRequest();
-  const models = useResource<ModelsResponse>('/api/models');
   const [busy, setBusy] = useState<string>();
   const [error, setError] = useState<string>();
   const [picking, setPicking] = useState(false);
-  const selection = models.data?.selection;
-  const usable = (models.data?.connections ?? []).filter((row) => row.status === 'connected');
+  const [optimistic, setOptimistic] = useState<{ choice: ModelChoice | null }>();
+  const selection = optimistic ? optimistic.choice : saved;
+  const usable = connections.filter((row) => row.status === 'connected');
   const currentRow = usable.find((row) => row.id === selection?.connectionId);
   const current = currentRow?.models.find((model) => model.id === selection?.modelId);
 
-  async function choose(row: ModelConnection, modelId: string, effort?: ModelEffort) {
+  async function choose(key: string, choice: ModelChoice | null) {
+    setBusy(key);
+    setError(undefined);
+    setOptimistic({ choice });
+    setPicking(false);
+    try {
+      await save(choice);
+    } catch (problem) {
+      setError(`Changing the model failed: ${errorText(problem)}`);
+    } finally {
+      setOptimistic(undefined);
+      setBusy(undefined);
+    }
+  }
+
+  function pick(row: ModelConnection, modelId: string, effort?: ModelEffort) {
     const model = row.models.find((item) => item.id === modelId)!;
     const next =
       effort ??
       (selection && model.efforts.includes(selection.effort)
         ? selection.effort
         : lightestEffort(model.efforts));
-    setBusy(`${row.id}:${modelId}:${effort ?? ''}`);
-    setError(undefined);
-    try {
-      const view = await send<ModelsResponse>('/api/models/selection', 'PUT', {
-        connectionId: row.id,
-        modelId,
-        effort: next,
-      });
-      models.setData(view);
-      setPicking(false);
-    } catch (problem) {
-      setError(`Changing the model failed: ${errorText(problem)}`);
-    } finally {
-      setBusy(undefined);
-    }
+    void choose(`${row.id}:${modelId}:${effort ?? ''}`, {
+      connectionId: row.id,
+      modelId,
+      effort: next,
+    });
   }
 
+  if (!usable.length)
+    return (
+      <Card>
+        <Text style={[text.body, { color: theme.secondary }]}>
+          No model connection works right now. Add or reconnect one in Nod on your computer.
+        </Text>
+      </Card>
+    );
+
+  const chosen = currentRow && current;
+  return (
+    <>
+      {error ? <Notice text={error} /> : null}
+      {!picking && (chosen || (automatic && !selection)) ? (
+        <Card style={styles.currentModel}>
+          <View style={styles.fill}>
+            <Text style={[text.title, { color: theme.foreground }]}>
+              {chosen ? current.name : automatic!.title}
+            </Text>
+            <Text style={[text.small, { color: theme.mutedForeground }]}>
+              {chosen ? currentRow.label || modelSource(currentRow) : automatic!.detail}
+            </Text>
+          </View>
+          <Button label="Change" onPress={() => setPicking(true)} />
+        </Card>
+      ) : null}
+      {(picking || (!chosen && !(automatic && !selection))) && (
+        <>
+          {automatic ? (
+            <Group>
+              <Pressable
+                onPress={() => void choose('automatic', null)}
+                disabled={busy !== undefined || !selection}
+                accessibilityRole="radio"
+                accessibilityState={{ checked: !selection }}
+                style={({ pressed }) => [
+                  styles.option,
+                  { backgroundColor: pressed ? theme.controlActive : 'transparent' },
+                ]}
+              >
+                <View style={styles.fill}>
+                  <Text style={[text.label, { color: theme.foreground }]}>{automatic.title}</Text>
+                  <Text style={[text.small, { color: theme.mutedForeground }]}>
+                    {automatic.detail}
+                  </Text>
+                </View>
+                {!selection ? <Check size={18} color={theme.accent} /> : null}
+              </Pressable>
+            </Group>
+          ) : null}
+          {usable.map((row) => (
+            <View key={row.id} style={styles.gap}>
+              <Text style={[text.small, styles.source, { color: theme.mutedForeground }]}>
+                {row.label || modelSource(row)}
+              </Text>
+              <Group>
+                {row.models.map((model, index) => {
+                  const selected =
+                    selection?.connectionId === row.id && selection.modelId === model.id;
+                  return (
+                    <Pressable
+                      key={model.id}
+                      onPress={() => pick(row, model.id)}
+                      disabled={busy !== undefined || selected}
+                      accessibilityRole="radio"
+                      accessibilityState={{ checked: selected }}
+                      style={({ pressed }) => [
+                        styles.option,
+                        {
+                          backgroundColor: pressed ? theme.controlActive : 'transparent',
+                          borderTopColor: theme.border,
+                          borderTopWidth: index === 0 ? 0 : StyleSheet.hairlineWidth,
+                        },
+                      ]}
+                    >
+                      <Text style={[text.label, styles.fill, { color: theme.foreground }]}>
+                        {model.name}
+                      </Text>
+                      {selected ? <Check size={18} color={theme.accent} /> : null}
+                    </Pressable>
+                  );
+                })}
+              </Group>
+            </View>
+          ))}
+          {picking ? <Button label="Cancel" onPress={() => setPicking(false)} /> : null}
+        </>
+      )}
+      {chosen && current.efforts.length > 1 && selection ? (
+        <>
+          <Text style={[text.small, styles.source, { color: theme.mutedForeground }]}>
+            Thinking effort
+          </Text>
+          <View style={styles.chips}>
+            {current.efforts.map((effort) => {
+              const on = selection.effort === effort;
+              return (
+                <Pressable
+                  key={effort}
+                  onPress={() => pick(currentRow, current.id, effort)}
+                  disabled={busy !== undefined || on}
+                  accessibilityRole="radio"
+                  accessibilityState={{ checked: on }}
+                  style={[styles.chip, { backgroundColor: on ? theme.primary : theme.control }]}
+                >
+                  <Text
+                    style={[text.label, { color: on ? theme.primaryForeground : theme.foreground }]}
+                  >
+                    {effortNames[effort]}
+                  </Text>
+                </Pressable>
+              );
+            })}
+          </View>
+        </>
+      ) : null}
+    </>
+  );
+}
+
+type ModelsResource = ReturnType<typeof useResource<ModelsResponse>>;
+
+function Models({ models }: { models: ModelsResource }) {
+  const send = useRequest();
   return (
     <Loaded resource={models} label="Models">
-      {() =>
-        !usable.length ? (
-          <Card>
-            <Text style={[text.body, { color: theme.secondary }]}>
-              No model connection works right now. Add or reconnect one in Nod on your computer.
-            </Text>
-          </Card>
-        ) : (
-          <>
-            {error ? <Notice text={error} /> : null}
-            {!picking && currentRow && current ? (
-              <Card style={styles.currentModel}>
-                <View style={styles.fill}>
-                  <Text style={[text.title, { color: theme.foreground }]}>{current.name}</Text>
-                  <Text style={[text.small, { color: theme.mutedForeground }]}>
-                    {currentRow.label || modelSource(currentRow)}
-                  </Text>
-                </View>
-                <Button label="Change" onPress={() => setPicking(true)} />
-              </Card>
-            ) : null}
-            {(picking || !current) &&
-              usable.map((row) => (
-                <View key={row.id} style={styles.gap}>
-                  <Text style={[text.small, styles.source, { color: theme.mutedForeground }]}>
-                    {row.label || modelSource(row)}
-                  </Text>
-                  <Group>
-                    {row.models.map((model, index) => {
-                      const selected =
-                        selection?.connectionId === row.id && selection.modelId === model.id;
-                      return (
-                        <Pressable
-                          key={model.id}
-                          onPress={() => void choose(row, model.id)}
-                          disabled={busy !== undefined || selected}
-                          accessibilityRole="radio"
-                          accessibilityState={{ checked: selected }}
-                          style={({ pressed }) => [
-                            styles.option,
-                            {
-                              backgroundColor: pressed ? theme.controlActive : 'transparent',
-                              borderTopColor: theme.border,
-                              borderTopWidth: index === 0 ? 0 : StyleSheet.hairlineWidth,
-                            },
-                          ]}
-                        >
-                          <Text style={[text.label, styles.fill, { color: theme.foreground }]}>
-                            {model.name}
-                          </Text>
-                          {selected ? <Check size={18} color={theme.accent} /> : null}
-                        </Pressable>
-                      );
-                    })}
-                  </Group>
-                </View>
-              ))}
-            {currentRow && current && current.efforts.length > 1 && selection ? (
-              <>
-                <Text style={[text.small, styles.source, { color: theme.mutedForeground }]}>
-                  Thinking effort
-                </Text>
-                <View style={styles.chips}>
-                  {current.efforts.map((effort) => {
-                    const on = selection.effort === effort;
-                    return (
-                      <Pressable
-                        key={effort}
-                        onPress={() => void choose(currentRow, current.id, effort)}
-                        disabled={busy !== undefined || on}
-                        accessibilityRole="radio"
-                        accessibilityState={{ checked: on }}
-                        style={[
-                          styles.chip,
-                          { backgroundColor: on ? theme.primary : theme.control },
-                        ]}
-                      >
-                        <Text
-                          style={[
-                            text.label,
-                            { color: on ? theme.primaryForeground : theme.foreground },
-                          ]}
-                        >
-                          {effortNames[effort]}
-                        </Text>
-                      </Pressable>
-                    );
-                  })}
-                </View>
-              </>
-            ) : null}
-          </>
-        )
-      }
+      {(view) => (
+        <ModelChooser
+          connections={view.connections}
+          selection={view.selection}
+          save={async (choice) => {
+            models.setData(await send<ModelsResponse>('/api/models/selection', 'PUT', choice));
+          }}
+        />
+      )}
+    </Loaded>
+  );
+}
+
+function VoiceCallModel({ models }: { models: ModelsResource }) {
+  const send = useRequest();
+  const voice = useResource<{ model: ModelChoice | null }>('/api/fork/voice/settings');
+  return (
+    <Loaded resource={models} label="Models">
+      {(view) => (
+        <Loaded resource={voice} label="Voice call">
+          {(saved) => (
+            <ModelChooser
+              connections={view.connections}
+              selection={saved.model}
+              automatic={{
+                title: 'Automatic',
+                detail: 'Nod’s fastest model on your main connection.',
+              }}
+              save={async (model) => {
+                voice.setData(
+                  await send<{ model: ModelChoice | null }>('/api/fork/voice/settings', 'PUT', {
+                    model,
+                  }),
+                );
+              }}
+            />
+          )}
+        </Loaded>
+      )}
     </Loaded>
   );
 }
@@ -280,13 +366,66 @@ function Behaviour() {
   );
 }
 
+function NotificationSettings() {
+  const theme = useTheme();
+  const { push } = useNodBase();
+  if (!push.available) return null;
+  return (
+    <>
+      <SectionTitle>Notifications</SectionTitle>
+      {push.error ? <Notice text={push.error} /> : null}
+      <Card>
+        <View style={styles.toggle}>
+          <View style={styles.fill}>
+            <Text style={[text.label, { color: theme.foreground }]}>Messages from Nod</Text>
+            <Text style={[text.small, { color: theme.mutedForeground }]}>
+              Tells you when Nod writes to you, even when the app is closed. Not during quiet hours.
+            </Text>
+          </View>
+          <Switch
+            value={push.enabled}
+            onValueChange={(next) => void push.setEnabled(next)}
+            disabled={push.busy}
+            accessibilityLabel="Messages from Nod"
+            trackColor={{ false: theme.inset, true: theme.primary }}
+            thumbColor={theme.surface}
+          />
+        </View>
+      </Card>
+    </>
+  );
+}
+
+function ModelRole({ title, detail }: { title: string; detail: string }) {
+  const theme = useTheme();
+  return (
+    <View style={styles.role}>
+      <Text style={[text.label, { color: theme.foreground }]}>{title}</Text>
+      <Text style={[text.small, { color: theme.mutedForeground }]}>{detail}</Text>
+    </View>
+  );
+}
+
 export function SettingsScreen() {
+  const { capabilities } = useNodBase();
+  const models = useResource<ModelsResponse>('/api/models');
   return (
     <Page title="Settings" back>
-      <SectionTitle>Model</SectionTitle>
-      <Models />
+      <SectionTitle>Models</SectionTitle>
+      <ModelRole title="Main" detail="Nod's chat, tasks and everything it does for you." />
+      <Models models={models} />
+      {capabilities.voice ? (
+        <>
+          <ModelRole
+            title="Voice calls"
+            detail="Answers you live during a call. Faster models reply sooner."
+          />
+          <VoiceCallModel models={models} />
+        </>
+      ) : null}
       <SectionTitle>Behaviour</SectionTitle>
       <Behaviour />
+      <NotificationSettings />
     </Page>
   );
 }
@@ -295,6 +434,7 @@ const styles = StyleSheet.create({
   fill: { flex: 1 },
   gap: { gap: 8 },
   source: { paddingHorizontal: 4, paddingTop: 4 },
+  role: { paddingHorizontal: 4, paddingTop: 8, gap: 2 },
   option: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -305,7 +445,12 @@ const styles = StyleSheet.create({
   },
   currentModel: { flexDirection: 'row', alignItems: 'center', gap: 12 },
   chips: { flexDirection: 'row', flexWrap: 'wrap', gap: 8 },
-  chip: { paddingHorizontal: 16, paddingVertical: 8, borderRadius: radius.full },
+  chip: {
+    minHeight: 44,
+    justifyContent: 'center',
+    paddingHorizontal: 16,
+    borderRadius: radius.full,
+  },
   toggles: { gap: 16 },
   toggle: { flexDirection: 'row', alignItems: 'center', gap: 16 },
   divider: { height: StyleSheet.hairlineWidth },

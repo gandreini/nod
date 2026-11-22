@@ -51,7 +51,7 @@ trap cleanup EXIT
 
 stale() {
   [ ! -e "$1" ] || [ "${E2E_BUILD:-}" = 1 ] ||
-    [ -n "$(find src assets app.json app.config.js package.json pnpm-lock.yaml metro.config.js ../../src/shared ../../src/web/lib ../../src/web/components/icon-drawings.ts -newer "$1" -print -quit)" ]
+    [ -n "$(find src assets modules plugins app.json app.config.js package.json pnpm-lock.yaml metro.config.js ../../src/shared ../../src/web/lib ../../src/web/components/icon-drawings.ts -newer "$1" -print -quit)" ]
 }
 
 start_android() {
@@ -63,7 +63,7 @@ start_android() {
   if ! "$emulator" -list-avds | grep -qx "$avd"; then
     echo no | "$avdmanager" create avd --name "$avd" --package "$image" --device pixel_7
   fi
-  serial="$("$adb" devices | awk '/^emulator-[0-9]+\tdevice/{print $1; exit}')"
+  serial="${E2E_SERIAL:-$("$adb" devices | awk '/^emulator-[0-9]+\tdevice/{print $1; exit}')}"
   if [ -z "$serial" ]; then
     "$emulator" -avd "$avd" -no-window -no-audio -no-boot-anim -no-snapshot-save >"$work/emulator.log" 2>&1 &
     started=$!

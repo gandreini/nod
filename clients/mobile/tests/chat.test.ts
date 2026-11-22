@@ -4,8 +4,11 @@ import { after, before, describe, test } from 'node:test';
 import { ApiError, getState, read, sendText } from '../src/connection/api.ts';
 import { choiceAnswerText } from '../src/connection/contracts.ts';
 import {
+  codeRequestTargets,
   keepOlder,
   mergeMessages,
+  persistable,
+  privateCode,
   sendTime,
   timeline,
   unsent,
@@ -15,6 +18,8 @@ import {
   type Outgoing,
 } from '../src/chat/chat-state.ts';
 import type { Activity, Message } from '../src/connection/contracts.ts';
+import { claimCallStart, inCall, openCall } from '../src/call/active.ts';
+import { liveHeld } from '../src/chat/live-holds.ts';
 import { startFakeServer } from './fake-server.ts';
 
 function message(id: string, createdAt: string, text = id): Message {
@@ -39,6 +44,70 @@ function work(fields: Partial<Activity>): Activity {
 }
 
 describe('chat state', () => {
+  test('a double tap opens one call, and a call keeps the live connection open', () => {
+    assert.equal(claimCallStart(1_000), true);
+    assert.equal(claimCallStart(1_100), false);
+    const close = openCall();
+    assert.equal(inCall(), true);
+    assert.equal(liveHeld(), true);
+    assert.equal(claimCallStart(10_000), false);
+    close();
+    assert.equal(inCall(), false);
+    assert.equal(liveHeld(), false);
+    assert.equal(claimCallStart(20_000), true);
+  });
+
+  test('a code sent while Nod waits for one is masked, and nothing else is', () => {
+    const otp = [{ id: 'r1', turnId: 't1', kind: 'otp' as const }];
+    const card = [{ id: 'r2', turnId: 't1', kind: 'payment' as const }];
+    assert.equal(privateCode('482913', otp), 'Verification code sent securely.');
+    assert.equal(privateCode('the code is 482913', otp), 'Verification code sent securely.');
+    assert.equal(privateCode('123', card), 'Security code sent securely.');
+    assert.equal(privateCode('cvv 4321', card), 'Security code sent securely.');
+    assert.equal(privateCode('482913', []), undefined);
+    assert.equal(privateCode('yes, go ahead', otp), undefined);
+    assert.equal(privateCode('see you at 5', card), undefined);
+  });
+
+  test('a code is never kept with the unsent messages, even before Nod asks for it', () => {
+    const outgoing = (text: string, extra: Partial<Outgoing> = {}): Outgoing => ({
+      id: 'o',
+      text,
+      status: 'queued',
+      createdAt: '2026-11-22T10:00:00.000Z',
+      ...extra,
+    });
+    assert.equal(persistable(outgoing('482913')), false);
+    assert.equal(persistable(outgoing('the code is 482913')), false);
+    assert.equal(persistable(outgoing('cvv 123')), false);
+    assert.equal(
+      persistable(outgoing('ok', { privateText: 'Verification code sent securely.' })),
+      false,
+    );
+    assert.equal(persistable(outgoing('Book the table for Friday')), true);
+  });
+
+  test('the code card goes under Nod’s latest message in the waiting turn', () => {
+    const message = (id: string, role: 'user' | 'assistant', turnId: string): Message => ({
+      id,
+      role,
+      text: id,
+      turnId,
+      createdAt: '2026-11-22T10:00:00.000Z',
+      attachments: [],
+    });
+    const targets = codeRequestTargets(
+      [{ id: 'r1', turnId: 't2', kind: 'otp' }],
+      [
+        message('a', 'assistant', 't1'),
+        message('b', 'user', 't2'),
+        message('c', 'assistant', 't2'),
+        message('d', 'assistant', 't2'),
+      ],
+    );
+    assert.deepEqual([...targets], [['d', 'otp']]);
+  });
+
   test('Nod shows it is working whenever Stop is offered, a task it continues included', () => {
     const task = [work({ taskId: 'task', title: 'Synthetic benchmark' })];
     assert.deepEqual(workState(task, [], false), { working: true, thinking: true });
@@ -174,9 +243,17 @@ describe('chat state', () => {
     assert.equal(unsent([voice], [message('second', '2026-11-14T12:30:05.000Z')]).length, 0);
   });
 
-  test('an unreachable server makes a message wait, whatever it is and however often', () => {
-    assert.equal(nextStep({ status: 0 }, undefined, { voice: false, attempts: 0 }), 'wait');
-    assert.equal(nextStep({ status: 0 }, false, { voice: true, attempts: 9 }), 'wait');
+  test('an unreachable server renews the connection once, then makes a message wait', () => {
+    assert.equal(nextStep({ status: 0 }, undefined, { voice: false, attempts: 0 }), 'recover');
+    assert.equal(nextStep({ status: 0 }, false, { voice: true, attempts: 9 }), 'recover');
+    assert.equal(
+      nextStep({ status: 0 }, undefined, { voice: false, attempts: 0, recovered: true }),
+      'wait',
+    );
+    assert.equal(
+      nextStep({ status: 0 }, false, { voice: true, attempts: 9, recovered: true }),
+      'wait',
+    );
   });
 
   test('a busy server is tried three more times, then the message is not sent', () => {

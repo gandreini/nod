@@ -1,252 +1,38 @@
-import { ChevronDown, Clock, RefreshCw, Trash2 } from '../ui/icons';
+import { RefreshCw } from '../ui/icons';
 import {
   KeyboardAvoidingView,
   useReanimatedKeyboardAnimation,
 } from 'react-native-keyboard-controller';
 import Reanimated, { useAnimatedStyle } from 'react-native-reanimated';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import { ChatMenu } from './chat-menu';
-import { ComposerNotice, noticeMotion } from './composer-notice';
-import { memo, useCallback, useEffect, useRef, useState } from 'react';
+import { ChatMenu, menuSpace } from './chat-menu';
+import { noticeMotion } from './composer-notice';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
   Animated,
-  Easing,
   FlatList,
   Pressable,
   StyleSheet,
   Text,
   View,
-  useWindowDimensions,
-  type StyleProp,
-  type ViewStyle,
 } from 'react-native';
-import { artifactSource } from '../connection/api';
-import { ApprovalCard, ChoiceCard, ConnectAppCard, connectLink, type Answer } from './cards';
-import { timeline, type LocalFile, type Outgoing, type Recording } from './chat-state';
-import type { Connection } from '../connection/connection';
-import { splitQuestion, type Activity, type Artifact, type Message } from '../connection/contracts';
-import { Markdown } from './markdown';
+import { timeline, type Outgoing } from './chat-state';
+import { type Activity, type Message } from '../connection/contracts';
 import { NodGlyph, NodMark } from '../ui/nod-mark';
-import { GradientFill } from '../ui/gradient-fill';
-import { Loading } from '../ui/ui';
-import { ownedArtifact } from '../connection/links';
+import { Loading, Notice } from '../ui/ui';
 import { useLiveLine } from './live-line';
 import { font, radius, useTheme, type Theme } from '../ui/theme';
 import { useNod } from '../connection/nod-context';
-import { AttachMenu, MessageAttachments } from '../files/attachment-views';
-import { sendable } from '../files/attachments';
-import { Composer } from './composer';
-import { useAttachments } from '../files/use-attachments';
-import { AudioClip, useVoiceRecorder } from '../voice/voice';
-import { prepareTranscription } from '../files/uploads';
-import {
-  BrowserCard,
-  BrowserSheet,
-  useHandoffs,
-  type HandoffState,
-} from '../browser/browser-sheet';
+import { BrowserSheet, useHandoffs } from '../browser/browser-sheet';
+import { ChatComposer, Fade } from './chat-composer';
+import { ChatRow } from './chat-messages';
 
 type Row = { key: string; message?: Message; outgoing?: Outgoing; stream?: string };
-
-const maxRecordingSeconds = 300;
 const offlineDelay = 3000;
 const awayOffset = 400;
 const initialComposerHeight = 76;
-const menuGap = 12;
-const unsentSlop = { top: 12, bottom: 12, left: 8, right: 8 };
-
-function Fade({
-  theme,
-  edge,
-  style,
-}: {
-  theme: Theme;
-  edge: 'top' | 'bottom';
-  style: StyleProp<ViewStyle>;
-}) {
-  return (
-    <View pointerEvents="none" style={style}>
-      <GradientFill color={theme.background} opaque={edge} mid={{ offset: 0.5, opacity: 0.88 }} />
-    </View>
-  );
-}
-
-export function Unsent({
-  outgoing,
-  theme,
-  onRetry,
-  onDiscard,
-}: {
-  outgoing: Outgoing;
-  theme: Theme;
-  onRetry(id: string): void;
-  onDiscard(id: string): void;
-}) {
-  const failed = outgoing.status === 'failed';
-  const reason = outgoing.error;
-  return (
-    <View style={styles.unsent} accessibilityLiveRegion="polite">
-      <Pressable
-        onPress={() =>
-          reason &&
-          Alert.alert(failed ? 'Message not sent' : 'Waiting for connection', reason, undefined, {
-            cancelable: true,
-          })
-        }
-        disabled={!reason}
-        hitSlop={unsentSlop}
-        accessibilityLabel={`${failed ? 'Not sent' : 'Waiting for connection'}. ${reason ?? ''}`}
-        style={styles.unsentStatus}
-      >
-        {failed ? null : <Clock size={14} color={theme.mutedForeground} />}
-        <Text style={[styles.caption, { color: theme.mutedForeground }]}>
-          {failed ? 'Not sent' : 'Waiting for connection'}
-        </Text>
-      </Pressable>
-      {failed ? (
-        <Pressable
-          onPress={() => onRetry(outgoing.id)}
-          hitSlop={unsentSlop}
-          accessibilityRole="button"
-          accessibilityLabel="Try sending this message again"
-          style={styles.unsentAction}
-        >
-          <RefreshCw size={14} color={theme.link} />
-          <Text style={[styles.caption, styles.unsentLabel, { color: theme.link }]}>Try again</Text>
-        </Pressable>
-      ) : null}
-      <Pressable
-        onPress={() => onDiscard(outgoing.id)}
-        hitSlop={unsentSlop}
-        accessibilityRole="button"
-        accessibilityLabel="Delete this unsent message"
-        style={styles.unsentAction}
-      >
-        <Trash2 size={14} color={theme.link} />
-        <Text style={[styles.caption, styles.unsentLabel, { color: theme.link }]}>Delete</Text>
-      </Pressable>
-    </View>
-  );
-}
-
-function OutgoingMessage({
-  outgoing,
-  connection,
-  theme,
-  onRetry,
-  onDiscard,
-}: {
-  outgoing: Outgoing;
-  connection: Connection;
-  theme: Theme;
-  onRetry(id: string): void;
-  onDiscard(id: string): void;
-}) {
-  const { width } = useWindowDimensions();
-  const away = useRef(new Animated.Value(0)).current;
-  const [leaving, setLeaving] = useState(false);
-  const discard = (id: string) => {
-    if (leaving) return;
-    setLeaving(true);
-    Animated.timing(away, {
-      toValue: 1,
-      duration: 240,
-      easing: Easing.in(Easing.cubic),
-      useNativeDriver: true,
-    }).start(() => onDiscard(id));
-  };
-  return (
-    <Animated.View
-      pointerEvents={leaving ? 'none' : 'auto'}
-      style={
-        leaving
-          ? {
-              opacity: away.interpolate({ inputRange: [0, 1], outputRange: [1, 0] }),
-              transform: [
-                { translateX: away.interpolate({ inputRange: [0, 1], outputRange: [0, width] }) },
-              ],
-            }
-          : null
-      }
-    >
-      <UserMessage
-        text={outgoing.text}
-        local={outgoing.files}
-        recording={outgoing.audio}
-        dim={outgoing.status === 'sent' ? 1 : 0.5}
-        connection={connection}
-        theme={theme}
-      >
-        {outgoing.status === 'failed' || outgoing.status === 'waiting' ? (
-          <Unsent outgoing={outgoing} theme={theme} onRetry={onRetry} onDiscard={discard} />
-        ) : null}
-      </UserMessage>
-    </Animated.View>
-  );
-}
-
-export function ScrollToLatest({
-  visible,
-  theme,
-  onPress,
-}: {
-  visible: boolean;
-  theme: Theme;
-  onPress(): void;
-}) {
-  const shown = useRef(new Animated.Value(0)).current;
-  const [rested, setRested] = useState(false);
-  useEffect(() => {
-    setRested(false);
-    Animated.spring(shown, {
-      toValue: visible ? 1 : 0,
-      useNativeDriver: true,
-      speed: 16,
-      bounciness: visible ? 8 : 0,
-    }).start(({ finished }) => {
-      if (!finished || !visible) return;
-      shown.setValue(1);
-      setRested(true);
-    });
-  }, [shown, visible]);
-  return (
-    <Animated.View
-      pointerEvents={visible ? 'auto' : 'none'}
-      style={[
-        styles.toBottom,
-        {
-          opacity: rested ? 1 : shown,
-          transform: rested
-            ? []
-            : [
-                { translateY: shown.interpolate({ inputRange: [0, 1], outputRange: [52, 0] }) },
-                { scale: shown.interpolate({ inputRange: [0, 1], outputRange: [0.7, 1] }) },
-              ],
-        },
-      ]}
-    >
-      <Pressable
-        onPress={onPress}
-        accessibilityRole="button"
-        accessibilityLabel="Scroll to the latest message"
-        accessibilityElementsHidden={!visible}
-        importantForAccessibility={visible ? 'yes' : 'no-hide-descendants'}
-        style={({ pressed }) => [
-          styles.toBottomButton,
-          {
-            backgroundColor: pressed ? theme.controlActive : theme.surface,
-            borderColor: theme.hairline,
-            boxShadow: theme.shadow.floating,
-          },
-        ]}
-      >
-        <ChevronDown size={22} color={theme.foreground} />
-      </Pressable>
-    </Animated.View>
-  );
-}
 
 function WorkingRow({ activity, theme }: { activity: Activity[]; theme: Theme }) {
   const line = useLiveLine(activity);
@@ -270,380 +56,9 @@ function WorkingRow({ activity, theme }: { activity: Activity[]; theme: Theme })
   );
 }
 
-function Transcript({ text, theme }: { text: string; theme: Theme }) {
-  const [open, setOpen] = useState(false);
-  if (!text) return null;
-  return (
-    <Pressable
-      onPress={() => setOpen(!open)}
-      accessibilityRole="button"
-      accessibilityState={{ expanded: open }}
-    >
-      <Text
-        selectable={open}
-        numberOfLines={open ? undefined : 1}
-        style={[styles.caption, { color: theme.mutedForeground }]}
-      >
-        {open ? text : `Transcript · ${text}`}
-      </Text>
-    </Pressable>
-  );
-}
-
-export function UserBubble({
-  text,
-  theme,
-  dim = 1,
-  audio,
-  files,
-  children,
-}: {
-  text: string;
-  theme: Theme;
-  dim?: number;
-  audio?: React.ReactNode;
-  files?: React.ReactNode;
-  children?: React.ReactNode;
-}) {
-  return (
-    <View style={[styles.userRow, styles.userStack]}>
-      {files ? <View style={{ opacity: dim }}>{files}</View> : null}
-      {text || audio ? (
-        <View
-          style={[
-            styles.userBubble,
-            audio ? styles.audioBubble : null,
-            { backgroundColor: theme.chatSent, opacity: dim },
-          ]}
-        >
-          {audio}
-          {audio ? (
-            <Transcript text={text} theme={theme} />
-          ) : (
-            <Text selectable style={[styles.messageText, { color: theme.foreground }]}>
-              {text}
-            </Text>
-          )}
-        </View>
-      ) : null}
-      {children}
-    </View>
-  );
-}
-
-function splitAudio(attachments: Artifact[] = []) {
-  return {
-    audio: attachments.find(
-      (item) => item.mimeType.startsWith('audio/') && ownedArtifact(item.url),
-    ),
-    files: attachments.filter((item) => !item.mimeType.startsWith('audio/')),
-  };
-}
-
-function UserMessage({
-  text,
-  transcript,
-  attachments,
-  local,
-  recording,
-  dim,
-  connection,
-  theme,
-  children,
-}: {
-  text: string;
-  transcript?: string;
-  attachments?: Artifact[];
-  local?: LocalFile[];
-  recording?: Recording;
-  dim?: number;
-  connection: Connection;
-  theme: Theme;
-  children?: React.ReactNode;
-}) {
-  const { audio, files } = splitAudio(attachments);
-  return (
-    <UserBubble
-      text={audio ? (transcript ?? text) : text}
-      theme={theme}
-      dim={dim}
-      files={
-        files.length || local?.length ? (
-          <MessageAttachments
-            attachments={files}
-            local={local}
-            connection={connection}
-            theme={theme}
-            alignEnd
-          />
-        ) : undefined
-      }
-      audio={
-        audio ? (
-          <AudioClip
-            source={artifactSource(connection, audio.url)}
-            mimeType={audio.mimeType}
-            size={audio.size}
-            theme={theme}
-            onBubble
-          />
-        ) : recording ? (
-          <AudioClip
-            source={recording.uri}
-            durationMillis={recording.durationMillis}
-            mimeType={recording.mimeType}
-            theme={theme}
-            onBubble
-          />
-        ) : undefined
-      }
-    >
-      {children}
-    </UserBubble>
-  );
-}
-
-export function AssistantMessage({
-  message,
-  connection,
-  theme,
-  pending,
-  onAnswer,
-  handoff,
-  onOpenBrowser,
-}: {
-  message: Message;
-  connection: Connection;
-  theme: Theme;
-  pending: boolean;
-  onAnswer: Answer;
-  handoff?: HandoffState;
-  onOpenBrowser?(messageId: string): void;
-}) {
-  const { audio, files } = splitAudio(message.attachments);
-  const asking = Boolean(message.approval || (message.answerChoices && pending));
-  const { lead, question } = asking
-    ? splitQuestion(message.text)
-    : { lead: message.text, question: '' };
-  const links = [...lead.matchAll(connectLink)];
-  const text = links.length ? lead.replace(connectLink, '').trim() : lead;
-  return (
-    <View style={styles.stack}>
-      {audio || text ? (
-        <View
-          style={[
-            styles.assistantBubble,
-            audio ? styles.audioBubble : null,
-            { backgroundColor: theme.chatReceived },
-          ]}
-        >
-          {audio ? (
-            <AudioClip
-              source={artifactSource(connection, audio.url)}
-              mimeType={audio.mimeType}
-              size={audio.size}
-              theme={theme}
-              onBubble
-            />
-          ) : null}
-          {text ? <Markdown text={text} theme={theme} /> : null}
-        </View>
-      ) : null}
-      {message.approval ? (
-        <ApprovalCard message={message} question={question} theme={theme} onAnswer={onAnswer} />
-      ) : asking ? (
-        <ChoiceCard message={message} question={question} theme={theme} onAnswer={onAnswer} />
-      ) : null}
-      {links.map((link) => (
-        <ConnectAppCard
-          key={link[3]}
-          title={link[1]}
-          path={link[2]}
-          connectionId={link[3]}
-          connection={connection}
-          theme={theme}
-        />
-      ))}
-      {files.length ? (
-        <MessageAttachments attachments={files} connection={connection} theme={theme} />
-      ) : null}
-      {handoff ? (
-        <BrowserCard state={handoff} theme={theme} onOpen={() => onOpenBrowser?.(message.id)} />
-      ) : null}
-    </View>
-  );
-}
-
-const ChatRow = memo(function ChatRow({
-  message,
-  outgoing,
-  stream,
-  pending,
-  connection,
-  theme,
-  handoff,
-  onAnswer,
-  onRetry,
-  onDiscard,
-  onOpenBrowser,
-}: {
-  message?: Message;
-  outgoing?: Outgoing;
-  stream?: string;
-  pending: boolean;
-  connection: Connection;
-  theme: Theme;
-  handoff?: HandoffState;
-  onAnswer: Answer;
-  onRetry(id: string): void;
-  onDiscard(id: string): void;
-  onOpenBrowser(messageId: string): void;
-}) {
-  if (stream !== undefined)
-    return (
-      <View style={[styles.assistantBubble, { backgroundColor: theme.chatReceived }]}>
-        <Markdown text={stream} theme={theme} />
-      </View>
-    );
-  if (outgoing)
-    return (
-      <OutgoingMessage
-        outgoing={outgoing}
-        connection={connection}
-        theme={theme}
-        onRetry={onRetry}
-        onDiscard={onDiscard}
-      />
-    );
-  if (!message) return null;
-  if (message.role === 'user')
-    return (
-      <UserMessage
-        text={message.displayText ?? message.text}
-        transcript={message.text}
-        attachments={message.attachments}
-        connection={connection}
-        theme={theme}
-      />
-    );
-  return (
-    <AssistantMessage
-      message={message}
-      connection={connection}
-      theme={theme}
-      pending={pending}
-      onAnswer={onAnswer}
-      handoff={handoff}
-      onOpenBrowser={onOpenBrowser}
-    />
-  );
-});
-
-function ChatComposer({
-  theme,
-  height,
-  away,
-  onHeight,
-  onNotice,
-  onLatest,
-}: {
-  theme: Theme;
-  height: number;
-  away: boolean;
-  onHeight(height: number): void;
-  onNotice(height: number): void;
-  onLatest(): void;
-}) {
-  const { connection, chat } = useNod();
-  const [draft, setDraft] = useState('');
-  const voice = useVoiceRecorder();
-  const files = useAttachments(connection);
-  const [attaching, setAttaching] = useState(false);
-  const [notice, setNotice] = useState<string>();
-  const insets = useSafeAreaInsets();
-  const voiceBusy = chat.outgoing.some(
-    (item) => item.audio && item.status !== 'failed' && item.status !== 'sent',
-  );
-
-  const noticeText = voice.error ?? files.error ?? chat.notice ?? notice;
-
-  useEffect(() => {
-    if (voice.active && voice.seconds >= maxRecordingSeconds) void finishVoice();
-  }, [voice.active, voice.seconds]);
-
-  async function finishVoice() {
-    const recording = await voice.finish();
-    if (!recording) return;
-    chat.sendVoice(recording);
-    onLatest();
-  }
-
-  function submit() {
-    const text = draft.trim();
-    if (!sendable(text, files.drafts)) return;
-    chat.send(text, files.drafts);
-    setDraft('');
-    files.clear();
-    onLatest();
-  }
-
-  return (
-    <View
-      style={[styles.composerWrap, { paddingBottom: 12 + insets.bottom }]}
-      onLayout={(event) => onHeight(event.nativeEvent.layout.height)}
-    >
-      <Fade theme={theme} edge="bottom" style={styles.bottomFade} />
-      <ScrollToLatest visible={away && !noticeText} theme={theme} onPress={onLatest} />
-      <View>
-        <ComposerNotice
-          text={noticeText}
-          theme={theme}
-          onDismiss={() => {
-            voice.clearError();
-            files.clearError();
-            chat.clearNotice();
-            setNotice(undefined);
-          }}
-          onHeight={onNotice}
-        />
-        <Composer
-          theme={theme}
-          draft={draft}
-          onDraft={setDraft}
-          ready={chat.ready}
-          working={chat.working}
-          recording={voice.active ? { seconds: voice.seconds, levels: voice.levels } : undefined}
-          onSubmit={submit}
-          onStop={chat.stop}
-          micBlocked={voiceBusy}
-          onRecord={() => {
-            if (voiceBusy)
-              return setNotice('Wait for your voice message to finish sending, or delete it.');
-            void voice.start();
-            void prepareTranscription(connection).catch(() => {});
-          }}
-          onCancelRecording={voice.cancel}
-          onSendRecording={() => void finishVoice()}
-          drafts={files.drafts}
-          onAttach={() => setAttaching(true)}
-          onRemoveDraft={files.remove}
-          onRetryDraft={files.retry}
-        />
-      </View>
-      <AttachMenu
-        visible={attaching}
-        theme={theme}
-        above={height + menuGap}
-        onClose={() => setAttaching(false)}
-        onPick={(source) => void files.pick(source)}
-      />
-    </View>
-  );
-}
-
 export function ChatScreen() {
   const theme = useTheme();
-  const { connection, chat } = useNod();
+  const { connection, chat, capabilities } = useNod();
   const insets = useSafeAreaInsets();
   const list = useRef<FlatList<Row>>(null);
   const noticeShift = useRef(new Animated.Value(0)).current;
@@ -696,13 +111,24 @@ export function ChatScreen() {
         connection={connection}
         theme={theme}
         handoff={row.message?.role === 'assistant' ? handoffStatus(row.message.id) : undefined}
+        codeRequest={row.message ? chat.codeRequests.get(row.message.id) : undefined}
         onAnswer={answer}
         onRetry={retry}
         onDiscard={discard}
         onOpenBrowser={showBrowser}
       />
     ),
-    [answer, connection, discard, handoffStatus, pendingQuestions, retry, showBrowser, theme],
+    [
+      answer,
+      chat.codeRequests,
+      connection,
+      discard,
+      handoffStatus,
+      pendingQuestions,
+      retry,
+      showBrowser,
+      theme,
+    ],
   );
 
   return (
@@ -724,7 +150,11 @@ export function ChatScreen() {
         keyboardVerticalOffset={-insets.bottom}
         enabled={!handoffs.open}
       >
-        {!chat.ready ? (
+        {!chat.ready && chat.error ? (
+          <View style={[styles.firstLoad, { paddingTop: insets.top + 64 }]}>
+            <Notice text={chat.error} onRetry={chat.reconnect} />
+          </View>
+        ) : !chat.ready ? (
           <Loading />
         ) : rows.length === 0 ? null : (
           <Animated.View style={[styles.fill, { transform: [{ translateY: noticeShift }] }]}>
@@ -766,10 +196,22 @@ export function ChatScreen() {
         />
       </KeyboardAvoidingView>
       <Fade theme={theme} edge="top" style={[styles.topFade, { height: insets.top + 64 }]} />
-      {chat.error || offline ? (
-        <View style={[styles.status, { top: insets.top + 8 }]} pointerEvents="box-none">
+      {(chat.error && chat.ready) || (offline && !chat.error) ? (
+        <View
+          style={[
+            styles.status,
+            { top: insets.top + 8, right: menuSpace(Boolean(capabilities.voice)) },
+          ]}
+          pointerEvents="box-none"
+        >
           <Pressable
-            onPress={chat.reconnect}
+            onPress={() => {
+              if (!chat.error) return chat.reconnect();
+              Alert.alert('Nod can’t load the chat', chat.error, [
+                { text: 'Close', style: 'cancel' },
+                { text: 'Try again', onPress: chat.reconnect },
+              ]);
+            }}
             accessibilityRole="button"
             accessibilityLabel={chat.error ? `${chat.error}. Retry` : `Reconnecting to ${host}`}
             style={[
@@ -815,35 +257,8 @@ export function ChatScreen() {
 
 const styles = StyleSheet.create({
   fill: { flex: 1 },
-  stack: { gap: 12 },
   caption: { fontFamily: font.regular, fontSize: 13, lineHeight: 18 },
   list: { paddingHorizontal: 16, paddingVertical: 16, gap: 24 },
-  userRow: { alignItems: 'flex-end' },
-  userStack: { gap: 8 },
-  userBubble: {
-    maxWidth: '85%',
-    paddingHorizontal: 16,
-    paddingVertical: 12,
-    borderTopLeftRadius: radius.bubble,
-    borderTopRightRadius: radius.bubble,
-    borderBottomLeftRadius: radius.bubble,
-    borderBottomRightRadius: 4,
-  },
-  assistantBubble: {
-    alignSelf: 'flex-start',
-    maxWidth: '92%',
-    paddingHorizontal: 16,
-    paddingVertical: 12,
-    borderTopLeftRadius: radius.bubble,
-    borderTopRightRadius: radius.bubble,
-    borderBottomRightRadius: radius.bubble,
-    borderBottomLeftRadius: 4,
-  },
-  messageText: { fontFamily: font.regular, fontSize: 17, lineHeight: 25 },
-  unsent: { flexDirection: 'row', alignItems: 'center', justifyContent: 'flex-end', gap: 16 },
-  unsentStatus: { flexDirection: 'row', alignItems: 'center', gap: 6 },
-  unsentAction: { flexDirection: 'row', alignItems: 'center', gap: 4 },
-  unsentLabel: { fontFamily: font.medium },
   thinking: { flexDirection: 'row', alignItems: 'center', gap: 8, paddingVertical: 8 },
   workingDetails: { flex: 1, gap: 2 },
   olderSpinner: { paddingVertical: 16 },
@@ -855,13 +270,11 @@ const styles = StyleSheet.create({
     padding: 24,
   },
   emptyTitle: { fontFamily: font.semibold, fontSize: 24, letterSpacing: -0.5 },
-  audioBubble: { gap: 8, minWidth: 260 },
+  firstLoad: { flex: 1, paddingHorizontal: 16 },
   topFade: { position: 'absolute', top: 0, left: 0, right: 0, zIndex: 1 },
-  bottomFade: { position: 'absolute', top: -32, left: 0, right: 0, bottom: 0 },
   status: {
     position: 'absolute',
     left: 16,
-    right: 76,
     height: 44,
     zIndex: 2,
     alignItems: 'flex-start',
@@ -877,21 +290,4 @@ const styles = StyleSheet.create({
     borderWidth: StyleSheet.hairlineWidth,
   },
   statusText: { flexShrink: 1 },
-  toBottom: { position: 'absolute', alignSelf: 'center', top: -44 },
-  toBottomButton: {
-    width: 40,
-    height: 40,
-    borderRadius: radius.full,
-    borderWidth: StyleSheet.hairlineWidth,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  composerWrap: {
-    position: 'absolute',
-    left: 0,
-    right: 0,
-    bottom: 0,
-    paddingHorizontal: 12,
-    paddingTop: 8,
-  },
 });

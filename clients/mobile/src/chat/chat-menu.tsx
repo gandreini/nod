@@ -8,12 +8,15 @@ import {
   Ellipsis,
   Gauge,
   LayoutGrid,
+  Phone,
   Server,
   Settings,
   Vault,
 } from '../ui/icons';
 import { font, radius, type Theme } from '../ui/theme';
 import type { Icon } from '../ui/ui';
+import { useNodBase } from '../connection/nod-context';
+import { claimCallStart } from '../call/active';
 
 const items: Array<{ icon: Icon; label: string; href: Href }> = [
   { icon: CalendarClock, label: 'Scheduled', href: '/scheduled' },
@@ -25,9 +28,18 @@ const items: Array<{ icon: Icon; label: string; href: Href }> = [
   ...(__DEV__ ? [{ icon: LayoutGrid, label: 'UI gallery', href: '/gallery' as Href }] : []),
 ];
 
+const edge = 16;
+const size = 44;
+const gap = 8;
+
+export function menuSpace(voice: boolean) {
+  return edge + (voice ? 2 : 1) * (size + gap);
+}
+
 export function ChatMenu({ theme }: { theme: Theme }) {
   const insets = useSafeAreaInsets();
   const [open, setOpen] = useState(false);
+  const { capabilities } = useNodBase();
   const top = insets.top + 8;
 
   function go(href: Href) {
@@ -37,6 +49,29 @@ export function ChatMenu({ theme }: { theme: Theme }) {
 
   return (
     <>
+      {capabilities.voice ? (
+        <Pressable
+          onPress={() => {
+            if (claimCallStart()) router.push('/call');
+          }}
+          accessibilityRole="button"
+          testID="call-button"
+          accessibilityLabel="Talk with Nod"
+          hitSlop={8}
+          style={({ pressed }) => [
+            styles.button,
+            {
+              top,
+              right: menuSpace(false),
+              boxShadow: theme.shadow.floating,
+              backgroundColor: pressed ? theme.controlActive : theme.surface,
+              borderColor: theme.border,
+            },
+          ]}
+        >
+          <Phone size={20} color={theme.foreground} />
+        </Pressable>
+      ) : null}
       <Pressable
         onPress={() => setOpen(true)}
         accessibilityRole="button"
@@ -103,9 +138,9 @@ export function ChatMenu({ theme }: { theme: Theme }) {
 const styles = StyleSheet.create({
   button: {
     position: 'absolute',
-    right: 16,
-    width: 44,
-    height: 44,
+    right: edge,
+    width: size,
+    height: size,
     borderRadius: radius.full,
     borderWidth: StyleSheet.hairlineWidth,
     alignItems: 'center',

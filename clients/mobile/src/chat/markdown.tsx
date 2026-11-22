@@ -16,7 +16,7 @@ import type { Connection } from '../connection/connection';
 import type { Artifact } from '../connection/contracts';
 import { useFileViewer } from '../files/file-viewer-context';
 import { imageArtifact, safeLink } from '../connection/links';
-import { useNod } from '../connection/nod-context';
+import { useNodBase } from '../connection/nod-context';
 import { ScrollFade } from '../ui/scroll-fade';
 import { font, radius, type Theme } from '../ui/theme';
 
@@ -223,7 +223,7 @@ function markdownStyles(theme: Theme) {
 }
 
 export const Markdown = memo(function Markdown({ text, theme }: { text: string; theme: Theme }) {
-  const { connection } = useNod();
+  const { connection } = useNodBase();
   const viewer = useFileViewer();
   const options = useMemo(
     () => ({

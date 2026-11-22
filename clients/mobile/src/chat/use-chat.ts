@@ -11,19 +11,24 @@ import {
   sendText,
   stopThread,
   tokenRefused,
+  refusedToken,
 } from '../connection/api';
 import { prepareTranscription, sendAudio } from '../files/uploads';
 import type { Answer } from './cards';
 import { attachmentIds, type Draft } from '../files/attachments';
 import {
+  codeRequestTargets,
   keepOlder,
   mergeMessages,
+  persistable,
+  privateCode,
   sendTime,
   workState,
   type Outgoing,
   type Recording,
 } from './chat-state';
-import { createOutbox, type Outbox } from './outbox';
+import { dropPicked } from '../files/downloads';
+import { createOutbox, sendQuickly, type Outbox } from './outbox';
 import { dropRecording, keepRecording, loadPending, savePending } from '../voice/pending-voice';
 import type { Connection } from '../connection/connection';
 import type { AppState, Message } from '../connection/contracts';
@@ -42,7 +47,7 @@ export function useChat(connection: Connection, onRefused: (notice: string) => v
   const [version, setVersion] = useState(0);
   const threadId = useRef<string | null>(null);
   const stateRef = useRef<AppState | null>(null);
-  const inFlight = useRef(false);
+  const inFlight = useRef<AbortController | null>(null);
   const again = useRef(false);
   const alive = useRef(true);
   const timers = useRef(new Set<ReturnType<typeof setTimeout>>());
@@ -74,46 +79,53 @@ export function useChat(connection: Connection, onRefused: (notice: string) => v
     [connection.origin, onRefused],
   );
 
-  const refresh = useCallback(async () => {
-    if (inFlight.current) {
-      again.current = true;
-      return;
-    }
-    inFlight.current = true;
-    try {
-      const next = await getState(connection);
-      if (!alive.current) return;
-      if (threadId.current && threadId.current !== next.threadId) setOlder([]);
-      if (threadId.current !== next.threadId) setHasEarlier(Boolean(next.hasEarlierMessages));
-      else if (next.hasEarlierMessages) setHasEarlier(true);
-      const previous = stateRef.current;
-      if (previous?.threadId === next.threadId)
-        setOlder((current) => keepOlder(current, previous.messages, next.messages));
-      threadId.current = next.threadId;
-      stateRef.current = next;
-      dispatch({
-        type: 'persisted',
-        threadId: next.threadId,
-        streamIds: next.messages.flatMap((item) => (item.streamId ? [item.streamId] : [])),
-        discardedTurnIds: next.turns
-          .filter((turn) => turn.status === 'failed' || turn.status === 'cancelled')
-          .map((turn) => turn.id),
-      });
-      setState(next);
-      outbox.current?.settle(next.messages);
-      setError(undefined);
-    } catch (problem) {
-      if (!alive.current) return;
-      if (problem instanceof ApiError && problem.status === 401) return refused(problem.status);
-      setError(refusedAccess(problem) ?? errorText(problem));
-    } finally {
-      inFlight.current = false;
-      if (again.current && alive.current) {
-        again.current = false;
-        void refresh();
+  const refresh = useCallback(
+    async (restart = false, retries = 0) => {
+      if (inFlight.current && !restart) {
+        again.current = true;
+        return;
       }
-    }
-  }, [connection, refused]);
+      inFlight.current?.abort();
+      const request = new AbortController();
+      inFlight.current = request;
+      try {
+        const next = await getState(connection, request.signal);
+        if (!alive.current || inFlight.current !== request) return;
+        if (threadId.current && threadId.current !== next.threadId) setOlder([]);
+        if (threadId.current !== next.threadId) setHasEarlier(Boolean(next.hasEarlierMessages));
+        else if (next.hasEarlierMessages) setHasEarlier(true);
+        const previous = stateRef.current;
+        if (previous?.threadId === next.threadId)
+          setOlder((current) => keepOlder(current, previous.messages, next.messages));
+        threadId.current = next.threadId;
+        stateRef.current = next;
+        dispatch({
+          type: 'persisted',
+          threadId: next.threadId,
+          streamIds: next.messages.flatMap((item) => (item.streamId ? [item.streamId] : [])),
+          discardedTurnIds: next.turns
+            .filter((turn) => turn.status === 'failed' || turn.status === 'cancelled')
+            .map((turn) => turn.id),
+        });
+        setState(next);
+        outbox.current?.settle(next.messages);
+        setError(undefined);
+      } catch (problem) {
+        if (!alive.current || inFlight.current !== request) return;
+        if (refusedToken(problem)) return refused(problem.status);
+        if (!(problem instanceof ApiError && problem.status) && retries > 0)
+          return later(() => void refresh(true, retries - 1), 1500);
+        setError(refusedAccess(problem) ?? errorText(problem));
+      } finally {
+        if (inFlight.current === request) inFlight.current = null;
+        if (!inFlight.current && again.current && alive.current) {
+          again.current = false;
+          void refresh();
+        }
+      }
+    },
+    [connection, later, refused],
+  );
 
   const received = useCallback(
     (data: ServerEvent) => {
@@ -144,15 +156,18 @@ export function useChat(connection: Connection, onRefused: (notice: string) => v
     [refresh],
   );
 
-  const { live, reconnect: reconnectEvents } = useServerEvents(connection, {
-    opened: () => void refresh(),
+  const {
+    live,
+    reconnect: reconnectEvents,
+    stale,
+    suspect,
+    recover,
+  } = useServerEvents(connection, {
     received,
     refused,
     failed: setError,
-    resumed: () => {
-      void refresh();
-      setVersion((value) => value + 1);
-    },
+    resumed: () => setVersion((value) => value + 1),
+    stalled: () => void refresh(true, 1),
   });
 
   useEffect(() => {
@@ -163,6 +178,12 @@ export function useChat(connection: Connection, onRefused: (notice: string) => v
   deliveredRef.current = () => void refresh();
   const refusedRef = useRef(refused);
   refusedRef.current = refused;
+  const staleRef = useRef(stale);
+  staleRef.current = stale;
+  const suspectRef = useRef(suspect);
+  suspectRef.current = suspect;
+  const recoverRef = useRef(recover);
+  recoverRef.current = recover;
   const outbox = useRef<Outbox | null>(null);
   if (!outbox.current)
     outbox.current = createOutbox({
@@ -179,6 +200,9 @@ export function useChat(connection: Connection, onRefused: (notice: string) => v
         await sendAudio(connection, { id: sendId, threadId: thread, ...item.audio! });
       },
       arrived: (sendId) => messageArrived(connection, sendId),
+      stale: () => staleRef.current(),
+      suspect: () => suspectRef.current(),
+      recover: () => recoverRef.current(),
       newId: randomUUID,
       later,
       onChange: (items) => {
@@ -196,9 +220,13 @@ export function useChat(connection: Connection, onRefused: (notice: string) => v
   }, [live]);
 
   const send = useCallback((text: string, attachments: Draft[] = []) => {
+    const masked = attachments.length
+      ? undefined
+      : privateCode(text, stateRef.current?.verificationRequests);
     outbox.current!.add({
       id: randomUUID(),
       text,
+      ...(masked ? { privateText: masked } : {}),
       ...(attachments.length
         ? {
             files: attachments.map(({ uri, name, mimeType, size }) => ({
@@ -238,10 +266,11 @@ export function useChat(connection: Connection, onRefused: (notice: string) => v
   const discard = useCallback((id: string) => outbox.current!.discard(id), []);
 
   const kept = useRef(new Set<string>());
+  const picked = useRef(new Set<string>());
   const [hydrated, setHydrated] = useState(false);
   useEffect(() => {
     if (!hydrated) return;
-    const pending = outgoing.filter((item) => item.status !== 'sent');
+    const pending = outgoing.filter((item) => item.status !== 'sent' && persistable(item));
     savePending(connection.origin, pending).catch((problem) => {
       if (alive.current) setVoiceError(`Could not keep the unsent messages: ${errorText(problem)}`);
     });
@@ -250,6 +279,11 @@ export function useChat(connection: Connection, onRefused: (notice: string) => v
       if (!now.has(uri)) dropRecording(uri);
     });
     kept.current = now;
+    const waiting = new Set(outgoing.flatMap((item) => (item.files ?? []).map((file) => file.uri)));
+    picked.current.forEach((uri) => {
+      if (!waiting.has(uri)) dropPicked(uri);
+    });
+    picked.current = waiting;
   }, [connection.origin, hydrated, outgoing]);
 
   const restored = useRef(false);
@@ -283,8 +317,17 @@ export function useChat(connection: Connection, onRefused: (notice: string) => v
     async (reply) => {
       const thread = threadId.current;
       if (!thread) throw new Error('The conversation is still loading. Try again in a moment.');
+      const input = { id: randomUUID(), threadId: thread, ...reply };
       try {
-        await sendText(connection, { id: randomUUID(), threadId: thread, ...reply });
+        if (staleRef.current()) await recoverRef.current();
+        await sendQuickly(() => sendText(connection, input), {
+          recover: () => recoverRef.current(),
+          suspect: () => suspectRef.current(),
+        }).catch(async (problem) => {
+          if (!(problem instanceof ApiError) || problem.status !== 0) throw problem;
+          await recoverRef.current();
+          return sendText(connection, input);
+        });
         void refresh();
         return 'sent';
       } catch (problem) {
@@ -315,11 +358,15 @@ export function useChat(connection: Connection, onRefused: (notice: string) => v
       await stopThread(connection);
       void refresh();
     } catch (problem) {
-      setError(`Stop failed: ${errorText(problem)}`);
+      setNotice(`Stop failed: ${errorText(problem)}`);
     }
   }, [connection, refresh]);
 
   const messages = useMemo(() => mergeMessages(older, state?.messages ?? []), [older, state]);
+  const codeRequests = useMemo(
+    () => codeRequestTargets(state?.verificationRequests, messages),
+    [messages, state?.verificationRequests],
+  );
   const pendingQuestions = useMemo(
     () =>
       new Set(
@@ -340,7 +387,7 @@ export function useChat(connection: Connection, onRefused: (notice: string) => v
       setOlder((current) => mergeMessages(page.messages, current));
       setHasEarlier(page.hasMore);
     } catch (problem) {
-      if (alive.current) setError(`Older messages did not load: ${errorText(problem)}`);
+      if (alive.current) setNotice(`Older messages did not load: ${errorText(problem)}`);
     } finally {
       if (alive.current) setLoadingOlder(false);
     }
@@ -368,6 +415,7 @@ export function useChat(connection: Connection, onRefused: (notice: string) => v
     hasEarlier,
     loadingOlder,
     pendingQuestions,
+    codeRequests,
     send,
     sendVoice,
     answer,

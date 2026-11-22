@@ -16,6 +16,7 @@ export type {
   Task,
   TaskStatus,
   Turn,
+  VerificationRequest,
   VaultListEntry,
   VaultSession,
 } from '../../../../src/shared/contracts';

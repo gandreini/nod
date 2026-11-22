@@ -1,16 +1,23 @@
 import { useFocusEffect } from 'expo-router';
-import { useCallback, useEffect, useRef, useState } from 'react';
-import { ApiError, errorText, refusedAccess, request, tokenRefused } from '../connection/api';
-import { useNod } from '../connection/nod-context';
+import { useCallback, useRef, useState } from 'react';
+import {
+  ApiError,
+  errorText,
+  refusedAccess,
+  request,
+  tokenRefused,
+  refusedToken,
+} from '../connection/api';
+import { useChatVersion, useNodBase } from '../connection/nod-context';
 
 export function useRequest() {
-  const { connection, refused } = useNod();
+  const { connection, refused } = useNodBase();
   return useCallback(
     async <T = unknown>(path: string, method: Parameters<typeof request>[2], body?: unknown) => {
       try {
         return await request<T>(connection, path, method, body);
       } catch (problem) {
-        if (problem instanceof ApiError && problem.status === 401) {
+        if (refusedToken(problem)) {
           const notice = tokenRefused(connection.origin);
           refused(notice);
           throw new Error(notice);
@@ -23,7 +30,8 @@ export function useRequest() {
 }
 
 export function useResource<T>(path: string, options: { optional?: boolean } = {}) {
-  const { connection, chat, refused } = useNod();
+  const { connection, refused } = useNodBase();
+  const version = useChatVersion();
   const [data, setData] = useState<T>();
   const [error, setError] = useState<string>();
   const [loading, setLoading] = useState(false);
@@ -41,8 +49,7 @@ export function useResource<T>(path: string, options: { optional?: boolean } = {
     } catch (problem) {
       if (call !== latest.current) return;
       if (optional && problem instanceof ApiError && problem.status === 403) return;
-      if (problem instanceof ApiError && problem.status === 401)
-        return refused(tokenRefused(connection.origin));
+      if (refusedToken(problem)) return refused(tokenRefused(connection.origin));
       setError(refusedAccess(problem) ?? errorText(problem));
     } finally {
       if (call === latest.current) setLoading(false);
@@ -52,11 +59,8 @@ export function useResource<T>(path: string, options: { optional?: boolean } = {
   useFocusEffect(
     useCallback(() => {
       void load();
-    }, [load]),
+    }, [version, load]),
   );
-  useEffect(() => {
-    if (chat.version) void load();
-  }, [chat.version, load]);
 
   const replace = useCallback(
     (next: T | undefined | ((current: T | undefined) => T | undefined)) => {

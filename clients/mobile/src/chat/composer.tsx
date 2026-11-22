@@ -16,6 +16,7 @@ export function Composer({
   micBlocked,
   onSubmit,
   onStop,
+  stopping = false,
   onRecord,
   onCancelRecording,
   onSendRecording,
@@ -33,6 +34,7 @@ export function Composer({
   micBlocked?: boolean;
   onSubmit(): void;
   onStop(): void;
+  stopping?: boolean;
   onRecord(): void;
   onCancelRecording(): void;
   onSendRecording(): void;
@@ -84,6 +86,7 @@ export function Composer({
             </View>
             <Pressable
               onPress={onSendRecording}
+              hitSlop={4}
               accessibilityRole="button"
               accessibilityLabel="Send voice message"
               style={({ pressed }) => [
@@ -102,6 +105,7 @@ export function Composer({
             <Pressable
               onPress={onAttach}
               disabled={!ready}
+              hitSlop={4}
               accessibilityRole="button"
               accessibilityLabel="Add a photo or file"
               style={({ pressed }) => [
@@ -134,7 +138,10 @@ export function Composer({
                 label="Send"
                 testID="composer-send"
               >
-                <ArrowUp size={20} color={theme.primaryForeground} />
+                <ArrowUp
+                  size={20}
+                  color={canSend ? theme.primaryForeground : theme.mutedForeground}
+                />
               </ActionButton>
             ) : action === 'stop' ? (
               <ActionButton
@@ -142,7 +149,8 @@ export function Composer({
                 color={theme.control}
                 pressed={theme.controlActive}
                 onPress={onStop}
-                label="Stop"
+                disabled={stopping}
+                label={stopping ? 'Stopping all work' : 'Stop all work'}
               >
                 <Square size={14} color={theme.foreground} solid />
               </ActionButton>
@@ -224,10 +232,19 @@ function ActionButton({
       accessibilityLabel={label}
       accessibilityState={disabled ? { disabled } : undefined}
       testID={testID}
+      hitSlop={4}
       style={styles.button}
     >
       {({ pressed: down }) => (
-        <View style={[styles.face, { backgroundColor: down ? pressed : color }]}>
+        <View
+          style={[
+            styles.face,
+            {
+              backgroundColor: down ? pressed : color,
+              opacity: disabled && kind === 'stop' ? 0.5 : 1,
+            },
+          ]}
+        >
           {fading && !down ? (
             <Animated.View
               pointerEvents="none"

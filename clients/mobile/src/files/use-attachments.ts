@@ -11,8 +11,9 @@ import { checkSize, type AttachSource, type Draft } from './attachments';
 import { allowIn } from '../connection/permissions';
 import type { Connection } from '../connection/connection';
 import { uploadFile } from './uploads';
-import { ApiError, errorText, refusedAccess, tokenRefused } from '../connection/api';
-import { useNod } from '../connection/nod-context';
+import { errorText, refusedAccess, tokenRefused, refusedToken } from '../connection/api';
+import { dropPicked } from './downloads';
+import { useNodBase } from '../connection/nod-context';
 
 type Picked = { uri: string; name: string; mimeType: string; size?: number };
 
@@ -30,7 +31,7 @@ function fromImage(asset: ImagePickerAsset): Picked {
 export function useAttachments(connection: Connection) {
   const [drafts, setDrafts] = useState<Draft[]>([]);
   const [error, setError] = useState<string>();
-  const { refused } = useNod();
+  const { refused } = useNodBase();
   const uploads = useRef(new Map<string, AbortController>());
 
   useEffect(() => {
@@ -52,9 +53,9 @@ export function useAttachments(connection: Connection) {
         );
       } catch (problem) {
         if (controller.signal.aborted) return;
-        if (problem instanceof ApiError && problem.status === 401)
-          return refused(tokenRefused(connection.origin, problem.status));
+        if (refusedToken(problem)) return refused(tokenRefused(connection.origin, problem.status));
         const reason = refusedAccess(problem) ?? errorText(problem);
+        setError(`${draft.name} didn’t upload: ${reason}`);
         setDrafts((current) =>
           current.map((item) =>
             item.id === draft.id ? { ...item, state: 'failed', error: reason } : item,
@@ -120,6 +121,8 @@ export function useAttachments(connection: Connection) {
   function remove(id: string) {
     uploads.current.get(id)?.abort();
     uploads.current.delete(id);
+    const draft = drafts.find((item) => item.id === id);
+    if (draft) dropPicked(draft.uri);
     setDrafts((current) => current.filter((item) => item.id !== id));
   }
 

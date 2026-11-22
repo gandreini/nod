@@ -1,6 +1,7 @@
-import { useState } from 'react';
+import { useRef, useState, type ComponentRef } from 'react';
 import {
   ActivityIndicator,
+  Platform,
   Pressable,
   ScrollView,
   StyleSheet,
@@ -15,6 +16,7 @@ import { saveConnection } from './stored-connection';
 import { font, radius, useTheme } from '../ui/theme';
 import { errorText } from './api';
 import { Notice } from '../ui/ui';
+import { Eye } from '../ui/icons';
 
 export function ConnectScreen({
   notice,
@@ -29,6 +31,8 @@ export function ConnectScreen({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | undefined>(notice);
   const [focused, setFocused] = useState<'url' | 'token' | null>(null);
+  const [showToken, setShowToken] = useState(false);
+  const tokenField = useRef<ComponentRef<typeof TextInput>>(null);
 
   async function connect() {
     if (disabled) return;
@@ -77,6 +81,7 @@ export function ConnectScreen({
             onFocus={() => setFocused('url')}
             onBlur={() => setFocused(null)}
             testID="connect-address"
+            accessibilityLabel="Server address"
             accessibilityLabelledBy="address-label"
             autoCapitalize="none"
             autoCorrect={false}
@@ -88,31 +93,48 @@ export function ConnectScreen({
             selectionColor={theme.primary}
             selectionHandleColor={theme.accent}
             editable={!busy}
+            returnKeyType="next"
+            submitBehavior="submit"
+            onSubmitEditing={() => tokenField.current?.focus()}
           />
         </View>
         <View style={styles.group}>
           <Text style={[styles.label, { color: theme.foreground }]} nativeID="token-label">
             Token
           </Text>
-          <TextInput
-            style={field('token')}
-            value={token}
-            onChangeText={setToken}
-            onFocus={() => setFocused('token')}
-            onBlur={() => setFocused(null)}
-            testID="connect-token"
-            accessibilityLabelledBy="token-label"
-            autoCapitalize="none"
-            autoCorrect={false}
-            autoComplete="off"
-            importantForAutofill="no"
-            secureTextEntry
-            cursorColor={theme.accent}
-            selectionColor={theme.primary}
-            selectionHandleColor={theme.accent}
-            editable={!busy}
-            onSubmitEditing={connect}
-          />
+          <View>
+            <TextInput
+              ref={tokenField}
+              style={[field('token'), styles.tokenField]}
+              value={token}
+              onChangeText={setToken}
+              onFocus={() => setFocused('token')}
+              onBlur={() => setFocused(null)}
+              testID="connect-token"
+              accessibilityLabel="Token"
+              accessibilityLabelledBy="token-label"
+              autoCapitalize="none"
+              autoCorrect={false}
+              autoComplete="off"
+              importantForAutofill="no"
+              secureTextEntry={!showToken}
+              keyboardType={showToken && Platform.OS === 'android' ? 'visible-password' : 'default'}
+              returnKeyType="go"
+              cursorColor={theme.accent}
+              selectionColor={theme.primary}
+              selectionHandleColor={theme.accent}
+              editable={!busy}
+              onSubmitEditing={connect}
+            />
+            <Pressable
+              onPress={() => setShowToken((shown) => !shown)}
+              accessibilityRole="button"
+              accessibilityLabel={showToken ? 'Hide the token' : 'Show the token'}
+              style={({ pressed }) => [styles.reveal, { opacity: pressed ? 0.6 : 1 }]}
+            >
+              <Eye size={20} color={showToken ? theme.accent : theme.mutedForeground} />
+            </Pressable>
+          </View>
         </View>
         {error ? <Notice text={error} /> : null}
         <Pressable
@@ -158,6 +180,16 @@ const styles = StyleSheet.create({
   body: { fontFamily: font.regular, fontSize: 16, lineHeight: 24 },
   group: { gap: 8 },
   label: { fontFamily: font.medium, fontSize: 14 },
+  tokenField: { paddingRight: 52 },
+  reveal: {
+    position: 'absolute',
+    right: 0,
+    top: 0,
+    bottom: 0,
+    width: 48,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
   field: {
     borderWidth: 1,
     borderRadius: radius.input,

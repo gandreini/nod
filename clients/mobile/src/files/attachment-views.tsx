@@ -36,17 +36,23 @@ async function show(file: File, mimeType: string) {
   await shareAsync(file.uri, { mimeType });
 }
 
-async function download(connection: Connection, artifact: Artifact) {
+const downloading = new Map<string, Promise<File>>();
+
+function download(connection: Connection, artifact: Artifact) {
+  const running = downloading.get(artifact.id);
+  if (running) return running;
   const source = artifactSource(connection, artifact.url);
-  try {
-    return await File.downloadFileAsync(source.uri, downloadsFolder(), {
-      headers: source.headers,
-      idempotent: true,
-    });
-  } catch (problem) {
-    await request(connection, `${artifact.url}/metadata`);
-    throw problem;
-  }
+  const next = File.downloadFileAsync(source.uri, downloadsFolder(), {
+    headers: source.headers,
+    idempotent: true,
+  })
+    .catch(async (problem) => {
+      await request(connection, `${artifact.url}/metadata`);
+      throw problem;
+    })
+    .finally(() => downloading.delete(artifact.id));
+  downloading.set(artifact.id, next);
+  return next;
 }
 
 export async function openArtifact(connection: Connection, artifact: Artifact) {
@@ -219,7 +225,7 @@ export function DraftStrip({
             </Pressable>
             <Pressable
               onPress={() => onRemove(draft.id)}
-              hitSlop={8}
+              hitSlop={12}
               accessibilityRole="button"
               accessibilityLabel={`Remove ${draft.name}`}
               style={[

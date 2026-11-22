@@ -1,16 +1,54 @@
-import { ApiError, errorText, refusedAccess } from '../connection/api';
+import { ApiError, errorText, refusedAccess, refusedToken } from '../connection/api';
 import { busyRetries, inTail, nextStep, unsent, type Failure, type Outgoing } from './chat-state';
 import type { Message } from '../connection/contracts';
 
 const busyDelays = [3000, 10000, 30000];
 const waitDelays = [5000, 15000, 30000, 60000];
 const closedReason = 'This message was not sent before the app closed.';
+export const hedgeAfter = 1500;
+
+export async function sendQuickly(
+  send: () => Promise<unknown>,
+  {
+    recover,
+    suspect,
+    after = hedgeAfter,
+    onHedge = () => {},
+  }: {
+    recover(): Promise<void>;
+    suspect(): boolean;
+    after?: number;
+    onHedge?(): void;
+  },
+) {
+  const first = send();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const slow = new Promise<'slow'>((resolve) => {
+    timer = setTimeout(() => resolve('slow'), after);
+  });
+  const winner = await Promise.race([first.then(() => 'sent' as const), slow]).finally(() =>
+    clearTimeout(timer),
+  );
+  if (winner === 'sent') return;
+  if (!suspect()) {
+    await first;
+    return;
+  }
+  first.catch(() => {});
+  onHedge();
+  await recover();
+  await send();
+}
 
 export interface OutboxDeps {
   thread(): string | null;
   sendText(item: Outgoing, threadId: string): Promise<unknown>;
   sendAudio(item: Outgoing, threadId: string, sendId: string): Promise<unknown>;
   arrived(sendId: string): Promise<boolean>;
+  stale(): boolean;
+  suspect(): boolean;
+  recover(): Promise<void>;
+  hedgeAfter?: number;
   newId(): string;
   later(run: () => void, delay: number): void;
   onChange(items: Outgoing[]): void;
@@ -26,6 +64,7 @@ export function createOutbox(deps: OutboxDeps) {
   let inFlight: string | null = null;
   const held = new Set<string>();
   const waits = new Map<string, number>();
+  const recovered = new Set<string>();
 
   const publish = () => {
     if (!stopped) deps.onChange(items);
@@ -39,6 +78,7 @@ export function createOutbox(deps: OutboxDeps) {
     items = items.filter((entry) => entry.id !== id);
     held.delete(id);
     waits.delete(id);
+    recovered.delete(id);
     publish();
   };
   const later = (run: () => void, delay: number) =>
@@ -82,16 +122,25 @@ export function createOutbox(deps: OutboxDeps) {
     inFlight = item.id;
     update(item.id, (entry) => ({ ...entry, status: 'sending' }));
     try {
+      if (deps.stale()) await deps.recover();
+      if (stopped || !present(item.id)) return;
       if (item.audio) await deps.sendAudio(item, thread, sendId);
-      else await deps.sendText(item, thread);
+      else
+        await sendQuickly(() => deps.sendText(item, thread), {
+          recover: deps.recover,
+          suspect: deps.suspect,
+          after: deps.hedgeAfter,
+          onHedge: () => recovered.add(item.id),
+        });
       if (stopped) return;
       waits.delete(item.id);
+      recovered.delete(item.id);
       if (present(item.id))
         update(item.id, (entry) => ({ ...entry, sendId, status: 'sent', error: undefined }));
       deps.onDelivered();
     } catch (problem) {
       if (stopped) return;
-      if (problem instanceof ApiError && problem.status === 401) {
+      if (refusedToken(problem)) {
         inFlight = null;
         return deps.onRefused(401);
       }
@@ -113,7 +162,11 @@ export function createOutbox(deps: OutboxDeps) {
     const delivered = check ? await deps.arrived(sendId).catch(() => undefined) : undefined;
     if (stopped || !present(item.id)) return;
     const attempts = item.attempts ?? 0;
-    const step = nextStep(failure, delivered, { voice, attempts });
+    const step = nextStep(failure, delivered, {
+      voice,
+      attempts,
+      recovered: recovered.has(item.id),
+    });
     if (step === 'done') {
       update(item.id, (entry) => ({ ...entry, sendId, status: 'sent', error: undefined }));
       return deps.onDelivered();
@@ -122,11 +175,18 @@ export function createOutbox(deps: OutboxDeps) {
       remove(item.id);
       return deps.onDropped(reason);
     }
+    if (step === 'recover') {
+      recovered.add(item.id);
+      update(item.id, (entry) => ({ ...entry, sendId, status: 'queued' }));
+      await deps.recover();
+      return;
+    }
     if (step === 'wait') {
       update(item.id, (entry) => ({ ...entry, sendId, status: 'waiting', error: reason }));
       return wake(item.id);
     }
     if (step === 'retry' || step === 'renew') {
+      recovered.delete(item.id);
       update(item.id, (entry) => ({
         ...entry,
         sendId: step === 'renew' ? deps.newId() : sendId,

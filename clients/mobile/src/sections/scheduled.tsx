@@ -27,7 +27,7 @@ import {
   type Task,
   type TaskStatus,
 } from '../connection/contracts';
-import { useNod } from '../connection/nod-context';
+import { useNodBase } from '../connection/nod-context';
 import { useTheme } from '../ui/theme';
 import {
   Button,
@@ -250,7 +250,7 @@ function ScheduleCard({
 }) {
   const theme = useTheme();
   const format = useDateFormat();
-  const { ask } = useNod();
+  const { ask } = useNodBase();
   const send = useRequest();
   const [open, setOpen] = useState(false);
   const [busy, setBusy] = useState<'pause' | 'delete'>();
@@ -382,7 +382,7 @@ function ScheduleCard({
 }
 
 export function ScheduledScreen() {
-  const { ask } = useNod();
+  const { ask } = useNodBase();
   const schedules = useResource<Schedule[]>('/api/schedules');
   const tasks = useResource<Task[]>('/api/tasks');
   const open = (tasks.data ?? []).filter((task) => !closed(task));

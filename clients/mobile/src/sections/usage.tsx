@@ -1,5 +1,5 @@
 import { CalendarClock, MessageCircle, ScanSearch, Undo2, Zap } from '../ui/icons';
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Alert, StyleSheet, Text, TextInput, View } from 'react-native';
 import type { TrustEntry, TrustPage, TrustSource, TrustView } from '../../../../src/shared/trust';
 import {
@@ -262,6 +262,14 @@ export function UsageScreen() {
   const [older, setOlder] = useState<TrustPage>();
   const [loadingMore, setLoadingMore] = useState(false);
   const [moreError, setMoreError] = useState<string>();
+  const olderFrom = useRef<string>(undefined);
+  const firstNext = trust.data?.next ? `${trust.data.next.at}|${trust.data.next.id}` : undefined;
+  useEffect(() => {
+    if (olderFrom.current !== undefined && olderFrom.current !== firstNext) {
+      olderFrom.current = undefined;
+      setOlder(undefined);
+    }
+  }, [firstNext]);
   const ids = new Set(trust.data?.entries.map((entry) => entry.id));
   const entries = [
     ...(trust.data?.entries ?? []),
@@ -283,6 +291,7 @@ export function UsageScreen() {
         `/api/trust/entries?at=${encodeURIComponent(next.at)}&id=${encodeURIComponent(next.id)}`,
         'GET',
       );
+      if (!older) olderFrom.current = firstNext;
       setOlder((current) => ({
         entries: [...(current?.entries ?? []), ...page.entries],
         next: page.next,

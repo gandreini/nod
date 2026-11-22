@@ -5,7 +5,8 @@ import {
   useFonts,
 } from '@expo-google-fonts/geist';
 import { GeistMono_400Regular } from '@expo-google-fonts/geist-mono';
-import { Stack } from 'expo-router';
+import * as Notifications from 'expo-notifications';
+import { router, Stack } from 'expo-router';
 import * as ScreenOrientation from 'expo-screen-orientation';
 import { StatusBar } from 'expo-status-bar';
 import { useCallback, useEffect, useRef, useState } from 'react';
@@ -14,14 +15,25 @@ import { KeyboardProvider } from 'react-native-keyboard-controller';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import { ConnectScreen } from '../connection/connect-screen';
 import type { Connection } from '../connection/connection';
-import { clearDownloads } from '../files/downloads';
+import { clearDownloads, clearPicked } from '../files/downloads';
 import { FileViewerProvider } from '../files/file-viewer';
 import { NodGlyph } from '../ui/nod-mark';
 import { NodProvider } from '../connection/nod-context';
+import { inCall } from '../call/active';
 import { forgetPending } from '../voice/pending-voice';
+import { forgetPush } from '../push/push';
 import { forgetConnection, loadConnection } from '../connection/stored-connection';
 import { useTheme } from '../ui/theme';
 import { errorText } from '../connection/api';
+
+Notifications.setNotificationHandler({
+  handleNotification: async () => ({
+    shouldShowBanner: false,
+    shouldShowList: false,
+    shouldPlaySound: false,
+    shouldSetBadge: false,
+  }),
+});
 
 type State =
   | { name: 'loading' }
@@ -31,7 +43,7 @@ type State =
 function Root() {
   const theme = useTheme();
   const [state, setState] = useState<State>({ name: 'loading' });
-  const [fontsLoaded] = useFonts({
+  const [fontsLoaded, fontError] = useFonts({
     Geist_400Regular,
     Geist_500Medium,
     Geist_600SemiBold,
@@ -56,10 +68,17 @@ function Root() {
   const current = useRef<Connection | null>(null);
   current.current = state.name === 'connected' ? state.connection : null;
 
+  const lastTap = Notifications.useLastNotificationResponse();
+  useEffect(() => {
+    if (lastTap && state.name === 'connected' && !inCall()) router.navigate('/');
+  }, [lastTap, state.name]);
+
   const refused = useCallback((notice: string, from: Connection) => {
     if (current.current !== from) return;
     current.current = null;
     clearDownloads();
+    clearPicked();
+    void forgetPush(from, false).catch(() => {});
     setState({ name: 'connect', notice });
     forgetConnection().catch((problem) =>
       setState((state) =>
@@ -75,14 +94,16 @@ function Root() {
 
   const disconnect = useCallback(async (from: Connection) => {
     if (current.current !== from) return;
+    await forgetConnection();
     current.current = null;
     await forgetPending(from.origin).catch(() => {});
     clearDownloads();
-    await forgetConnection();
+    clearPicked();
+    await forgetPush(from, true).catch(() => {});
     setState({ name: 'connect' });
   }, []);
 
-  if (state.name === 'loading' || !fontsLoaded)
+  if (state.name === 'loading' || (!fontsLoaded && !fontError))
     return (
       <View
         style={{
@@ -100,6 +121,7 @@ function Root() {
     return (
       <SafeAreaView style={{ flex: 1, backgroundColor: theme.background }}>
         <ConnectScreen
+          key={state.notice ?? ''}
           notice={state.notice}
           onConnected={(connection) => setState({ name: 'connected', connection })}
         />
