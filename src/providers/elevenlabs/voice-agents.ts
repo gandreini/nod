@@ -25,7 +25,7 @@ export function createElevenLabsVoiceAgents(
   const origin = options.origin ?? 'https://api.elevenlabs.io';
   const request = options.fetch ?? fetch;
 
-  async function call(path: string, init: RequestInit, signal?: AbortSignal) {
+  async function call(path: string, init: RequestInit, signal?: AbortSignal, hidden?: string) {
     const response = await request(`${origin}${path}`, {
       ...init,
       headers: { 'xi-api-key': key, 'Content-Type': 'application/json', ...init.headers },
@@ -43,6 +43,7 @@ export function createElevenLabsVoiceAgents(
               ? detail.message
               : reason;
       } catch {}
+      if (hidden) reason = reason.replaceAll(hidden, '[voice secret]');
       throw Object.assign(
         new Error(
           `ElevenLabs refused ${init.method ?? 'GET'} ${path}: ${reason} (HTTP ${response.status})`,
@@ -60,6 +61,7 @@ export function createElevenLabsVoiceAgents(
           '/v1/speech-engine',
           { method: 'POST', body: JSON.stringify(body(settings)) },
           signal,
+          settings.secret,
         ),
       );
       return created.speech_engine_id;
@@ -69,6 +71,7 @@ export function createElevenLabsVoiceAgents(
         `/v1/speech-engine/${encodeURIComponent(id)}`,
         { method: 'PATCH', body: JSON.stringify(body(settings)) },
         signal,
+        settings.secret,
       );
     },
     async conversationToken(engineId, signal) {

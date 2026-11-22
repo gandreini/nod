@@ -118,7 +118,7 @@ import { createPublicLinkPreviewProvider } from '../providers/public-web/link-pr
 import { createAgentRuntime } from '../runtime/index.ts';
 import { coreSkills } from '../runtime/prompt.ts';
 import { createApp } from './app.ts';
-import { credentialRequestKey } from './access.ts';
+import { accessKey, credentialRequestKey } from './access.ts';
 import { createWorkAdmission, createWorkConsumers } from './work-admission.ts';
 import { createWritingStyleLearning } from './writing-style.ts';
 import { createChatVerification } from './chat-verification.ts';
@@ -146,7 +146,14 @@ import { createChannels } from './channels.ts';
 import { createChannelSettings, managedChannelEnvironment } from './channel-settings.ts';
 import { createChannelMedia } from './channel-media.ts';
 import { createChannelSessionStore } from './channel-session.ts';
-import { configuration, dataRoot, desktopMode, ownerId, publicOrigin } from './config.ts';
+import {
+  authToken,
+  configuration,
+  dataRoot,
+  desktopMode,
+  ownerId,
+  publicOrigin,
+} from './config.ts';
 import { createAccountStore } from './account-store.ts';
 import { createModelTraces, type ModelTraceGate } from './traces.ts';
 import { runtimeAccount } from './account-profile.ts';
@@ -2818,6 +2825,7 @@ async function initializeApplication(
     ownerId,
     sender: adapters.push,
     quietHours: () => createPreferencesStore(pool, ownerId).get(),
+    accessKey: async () => authToken ?? (await accessKey(dataRoot)),
     redact: createTextRedactor(secrets),
     failure: diagnostics.failure,
   });
@@ -2850,7 +2858,7 @@ async function initializeApplication(
       language: process.env.NOD_VOICE_LANGUAGE || 'en',
       ttsModel: process.env.NOD_VOICE_TTS_MODEL || 'eleven_v4_turbo',
     },
-    submit: (text) => userMessages.submit(text, [], { channel: 'web' }),
+    submit: (text) => userMessages.submit(text, [], { channel: 'web', neverApprove: true }),
     failure: diagnostics.failure,
   });
   await voice.initialize();

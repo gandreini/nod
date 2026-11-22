@@ -4196,6 +4196,31 @@ test(
         },
       );
 
+      await t.test('a voice call hand-off never approves a pending confirmation', async (t) => {
+        const voiceMessages = thread.createUserMessageService({ confirmAction: approvals.chat });
+        const turn = await begin('Synthetic voice fixture');
+        const turnIds = [turn.turnId];
+        t.after(async () => {
+          await db.pool.query(
+            "UPDATE turns SET status='cancelled',finished_at=now() WHERE id=ANY($1::uuid[]) AND status IN ('queued','running','waiting')",
+            [turnIds],
+          );
+        });
+        await approvals.request(turn, 'NOD_notification_preferences_update', {
+          notificationRule: 'Synthetic voice rule',
+        });
+        await finish(turn.turnId);
+        const handedOff = await voiceMessages.submit('Yes.', [], {
+          channel: 'web',
+          neverApprove: true,
+        });
+        turnIds.push(handedOff.turnId);
+        const closed = await proposal(turn.turnId);
+        assert.notEqual(closed.status, 'confirmed');
+        assert.equal(closed.execution_turn_id, null);
+        assert.notEqual(handedOff.turnId, turn.turnId);
+      });
+
       await t.test('artifacts are owned and published only from inside the workspace', async () => {
         const { threadId: id } = await newTurn('succeeded');
         const workspace = join(dataRoot, 'workspaces', id);

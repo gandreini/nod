@@ -216,7 +216,14 @@ const awake = async () => ({
 });
 
 async function routes(pool: pg.Pool, sender?: PushSender, ownerId = 'owner-a') {
-  const push = createPush({ pool, ownerId, sender, quietHours: awake, redact: (text) => text });
+  const push = createPush({
+    pool,
+    ownerId,
+    sender,
+    quietHours: awake,
+    accessKey: async () => 'access-key-a',
+    redact: (text) => text,
+  });
   await push.initialize();
   const app = Fastify();
   push.registerRoutes(app);
@@ -393,6 +400,7 @@ test('quiet hours skip messages for good and gone tokens are removed', database,
     pool,
     ownerId: 'owner-a',
     sender,
+    accessKey: async () => 'access-key-a',
     redact: (text) => text,
     quietHours: async () => {
       const hour = new Date().getUTCHours();
@@ -437,6 +445,7 @@ test("during quiet hours only results of the owner's schedules are sent", databa
     pool,
     ownerId: 'owner-a',
     sender,
+    accessKey: async () => 'access-key-a',
     redact: (text) => text,
     quietHours: async () => {
       const hour = new Date().getUTCHours();
@@ -466,4 +475,34 @@ test("during quiet hours only results of the owner's schedules are sent", databa
   );
   await push.deliver();
   assert.equal(sent.length, 2);
+});
+
+test('a new access key stops pushes to phones registered with the old one', database, async (t) => {
+  const pool = await disposable(t);
+  const { sender, sent } = recordingSender();
+  let key = 'access-key-a';
+  const push = createPush({
+    pool,
+    ownerId: 'owner-a',
+    sender,
+    quietHours: awake,
+    accessKey: async () => key,
+    redact: (text) => text,
+  });
+  await push.initialize();
+  const app = Fastify();
+  push.registerRoutes(app);
+  await register(app, 'lost-phone');
+  key = 'access-key-b';
+  await register(app, 'new-phone');
+  await assistant(pool, { text: 'Your code is 123456' });
+  await push.deliver();
+  assert.deepEqual(
+    sent.map((item) => item.device.token),
+    ['new-phone'],
+  );
+  assert.deepEqual(
+    (await pool.query('SELECT token FROM push_devices')).rows.map((row) => row.token),
+    ['new-phone'],
+  );
 });

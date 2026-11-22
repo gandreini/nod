@@ -80,8 +80,16 @@ test('the ElevenLabs client creates a private, unrecorded Speech Engine and asks
   });
 });
 
-test('an ElevenLabs refusal keeps its own reason and status', async (t) => {
-  const server = createServer((_request, response) => {
+test('an ElevenLabs refusal keeps its own reason and status, never the engine secret', async (t) => {
+  const server = createServer(async (request, response) => {
+    const sent = await body(request);
+    if (request.method === 'PATCH') {
+      response.writeHead(422, { 'Content-Type': 'application/json' });
+      response.end(
+        JSON.stringify({ detail: [{ msg: 'Invalid header', input: JSON.parse(sent) }] }),
+      );
+      return;
+    }
     response.writeHead(401, { 'Content-Type': 'application/json' });
     response.end(JSON.stringify({ detail: { message: 'Missing permission convai_write.' } }));
   });
@@ -94,6 +102,19 @@ test('an ElevenLabs refusal keeps its own reason and status', async (t) => {
     agents.conversationToken('seng_x'),
     /ElevenLabs refused GET \/v1\/convai\/conversation\/token\?agent_id=seng_x: Missing permission convai_write\. \(HTTP 401\)/,
   );
+  const refused = await agents
+    .updateEngine('seng_x', {
+      name: 'Nod',
+      wsUrl: 'wss://nod.example.test/fork/voice/engine',
+      secretHeader: 'x-nod-voice-secret',
+      secret: 'engine-secret-that-must-not-leak',
+      voiceId: 'voice-it',
+      language: 'it',
+      ttsModel: 'eleven_v4_turbo',
+    })
+    .catch((error: Error) => error);
+  assert.match(String(refused), /HTTP 422/);
+  assert.ok(!String(refused).includes('engine-secret-that-must-not-leak'));
 });
 
 async function disposable(t: TestContext) {
@@ -113,6 +134,9 @@ async function disposable(t: TestContext) {
       created_at timestamptz NOT NULL DEFAULT clock_timestamp(), hidden_at timestamptz,
       answer_choices jsonb
     );
+    CREATE TABLE approvals (
+      id uuid PRIMARY KEY, owner_id text NOT NULL, confirmation_message_id uuid, status text NOT NULL
+    );
   `);
   t.after(async () => {
     await pool.end();
@@ -125,19 +149,22 @@ async function disposable(t: TestContext) {
 function fakeAgents() {
   const created: VoiceEngineSettings[] = [];
   const updated: string[] = [];
+  const secrets: string[] = [];
   const agents: VoiceAgents = {
     async createEngine(settings) {
       created.push(settings);
+      secrets.push(settings.secret);
       return 'seng_fake';
     },
-    async updateEngine(id) {
+    async updateEngine(id, settings) {
       updated.push(id);
+      secrets.push(settings.secret);
     },
     async conversationToken(id) {
       return `token-for-${id}`;
     },
   };
-  return { agents, created, updated };
+  return { agents, created, updated, secrets };
 }
 
 type Recorded = { instructions: string; turns: { role: string; content: string }[] };
@@ -178,7 +205,7 @@ function scriptedTalker(
 async function voiceApp(
   pool: pg.Pool,
   options: {
-    agents?: VoiceAgents;
+    agents?: ReturnType<typeof fakeAgents> | VoiceAgents;
     talker?: VoiceTalker;
     limit?: boolean;
     recorded?: unknown[];
@@ -191,7 +218,7 @@ async function voiceApp(
     pool,
     ownerId: 'owner-a',
     publicOrigin: 'https://nod.example.test',
-    agents: options.agents,
+    agents: options.agents && 'agents' in options.agents ? options.agents.agents : options.agents,
     talker: (model) => {
       options.models?.push(model?.modelId ?? 'default');
       return options.talker ?? scriptedTalker(async function* () {}).talker;
@@ -226,9 +253,11 @@ async function voiceApp(
   voice.registerRoutes(app);
   registerForkCapabilities(app, () => ({ voice: voice.feature() }));
   await app.ready();
-  const secret = (
-    await pool.query<{ secret: string }>("SELECT secret FROM voice_state WHERE owner_id='owner-a'")
-  ).rows[0]!.secret;
+  let secret = '';
+  if (options.agents && 'secrets' in options.agents) {
+    await app.inject({ method: 'POST', url: '/api/fork/voice/session' });
+    secret = options.agents.secrets.at(-1)!;
+  }
   return { app, voice, secret };
 }
 
@@ -260,34 +289,41 @@ test('capabilities list voice only with ElevenLabs configured', database, async 
     (await off.app.inject({ method: 'POST', url: '/api/fork/voice/session' })).statusCode,
     404,
   );
-  const on = await voiceApp(pool, { agents: fakeAgents().agents });
+  const on = await voiceApp(pool, { agents: fakeAgents() });
   assert.deepEqual((await on.app.inject('/api/fork/capabilities')).json(), {
     features: { voice: { version: 1 } },
   });
 });
 
 test(
-  'a session creates the engine once, with the secret, and returns a token',
+  'each session keeps one engine, rotates its secret and stores only a hash',
   database,
   async (t) => {
     const pool = await disposable(t);
     const fake = fakeAgents();
-    const { app, secret } = await voiceApp(pool, { agents: fake.agents });
+    const { app } = await voiceApp(pool, { agents: fake.agents });
     const first = await app.inject({ method: 'POST', url: '/api/fork/voice/session' });
     const second = await app.inject({ method: 'POST', url: '/api/fork/voice/session' });
     assert.deepEqual(first.json(), { conversationToken: 'token-for-seng_fake' });
     assert.deepEqual(second.json(), { conversationToken: 'token-for-seng_fake' });
     assert.equal(fake.created.length, 1);
-    assert.deepEqual(fake.updated, []);
+    assert.deepEqual(fake.updated, ['seng_fake']);
     assert.equal(fake.created[0]!.wsUrl, 'wss://nod.example.test/fork/voice/engine');
-    assert.equal(fake.created[0]!.secret, secret);
-    assert.ok(secret.length >= 40);
+    assert.equal(fake.secrets.length, 2);
+    assert.notEqual(fake.secrets[0], fake.secrets[1]);
+    assert.ok(fake.secrets.every((secret) => secret.length >= 40));
+    const stored = (
+      await pool.query<{ secret: string }>(
+        "SELECT secret FROM voice_state WHERE owner_id='owner-a'",
+      )
+    ).rows[0]!.secret;
+    assert.ok(!fake.secrets.includes(stored));
   },
 );
 
 test('the voice model choice is validated and saved', database, async (t) => {
   const pool = await disposable(t);
-  const { app } = await voiceApp(pool, { agents: fakeAgents().agents });
+  const { app } = await voiceApp(pool, { agents: fakeAgents() });
   assert.deepEqual((await app.inject('/api/fork/voice/settings')).json(), { model: null });
   const sonnet = { connectionId: randomUUID(), modelId: 'claude-sonnet-5-5', effort: 'low' };
   const saved = await app.inject({
@@ -315,12 +351,98 @@ test('the voice model choice is validated and saved', database, async (t) => {
   assert.deepEqual(cleared.json(), { model: null });
 });
 
-test('the engine refuses a connection without the right secret', database, async (t) => {
-  const pool = await disposable(t);
-  const { app } = await voiceApp(pool, { agents: fakeAgents().agents });
-  assert.equal(await (await engineSocket(app)).closed, 1008);
-  assert.equal(await (await engineSocket(app, 'wrong-secret-value')).closed, 1008);
-});
+test(
+  'the engine takes only the latest secret, for the one call it started',
+  database,
+  async (t) => {
+    const pool = await disposable(t);
+    const fake = fakeAgents();
+    const { app, secret } = await voiceApp(pool, { agents: fake });
+    assert.equal(await (await engineSocket(app)).closed, 1008);
+    assert.equal(await (await engineSocket(app, 'wrong-secret-value')).closed, 1008);
+    const answers = async (socket: Awaited<ReturnType<typeof engineSocket>>) => {
+      socket.socket.send(JSON.stringify({ type: 'ping' }));
+      await until(() => socket.received.some((message) => message.type === 'pong'));
+    };
+    const call = await engineSocket(app, secret);
+    call.socket.send(JSON.stringify({ type: 'init', conversation_id: 'conv-owner' }));
+    await answers(call);
+    const intruder = await engineSocket(app, secret);
+    intruder.socket.send(JSON.stringify({ type: 'init', conversation_id: 'conv-other' }));
+    assert.equal(await intruder.closed, 1008);
+    const reconnected = await engineSocket(app, secret);
+    reconnected.socket.send(JSON.stringify({ type: 'init', conversation_id: 'conv-owner' }));
+    await answers(reconnected);
+    const unbound = await engineSocket(app, secret);
+    unbound.socket.send(
+      JSON.stringify({
+        type: 'user_transcript',
+        user_transcript: [{ role: 'user', content: 'Manda la mail' }],
+        event_id: 1,
+      }),
+    );
+    assert.equal(await unbound.closed, 1008);
+    await app.inject({ method: 'POST', url: '/api/fork/voice/session' });
+    assert.equal(await (await engineSocket(app, secret)).closed, 1008);
+    call.socket.terminate();
+    reconnected.socket.terminate();
+  },
+);
+
+test(
+  'a confirmation from Nod is never read aloud: the call points to the screen',
+  database,
+  async (t) => {
+    const pool = await disposable(t);
+    const { talker, calls } = scriptedTalker(
+      async function* (call) {
+        if (!call.instructions.includes('The result:')) yield 'Ok, controllo. ';
+      },
+      () => true,
+    );
+    const turnIds: string[] = [];
+    const { app, secret } = await voiceApp(pool, { agents: fakeAgents(), talker, turnIds });
+    const { socket, received } = await engineSocket(app, secret);
+    socket.send(
+      JSON.stringify({
+        type: 'user_transcript',
+        user_transcript: [{ role: 'user', content: 'Scrivi a Marco che arrivo tardi' }],
+        event_id: 1,
+      }),
+    );
+    await until(() => received.some((m) => m.is_final));
+    const confirmation = randomUUID();
+    await pool.query("INSERT INTO turns(id,owner_id,status) VALUES($1,'owner-a','waiting')", [
+      turnIds[0],
+    ]);
+    await pool.query(
+      "INSERT INTO messages(id,owner_id,role,text,turn_id) VALUES($1,'owner-a','assistant','Send “Arrivo tardi” to Marco on Slack?',$2)",
+      [confirmation, turnIds[0]],
+    );
+    await pool.query(
+      "INSERT INTO approvals(id,owner_id,confirmation_message_id,status) VALUES($1,'owner-a',$2,'pending')",
+      [randomUUID(), confirmation],
+    );
+    socket.send(
+      JSON.stringify({
+        type: 'user_transcript',
+        user_transcript: [
+          { role: 'user', content: 'Scrivi a Marco che arrivo tardi' },
+          { role: 'agent', content: 'Ok, controllo.' },
+          { role: 'user', content: voiceRelayCue },
+        ],
+        event_id: 2,
+      }),
+    );
+    await until(() => received.filter((m) => m.is_final).length === 2);
+    assert.equal(
+      received.at(-2)!.content,
+      'Ti ho messo una conferma sullo schermo: toccala quando vuoi.',
+    );
+    assert.ok(!calls.some((call) => call.instructions.includes('Arrivo tardi')));
+    socket.terminate();
+  },
+);
 
 test(
   'a transcript streams chunks, ends final, and uses the chosen model and recent chat',
@@ -348,7 +470,7 @@ test(
     const recorded: unknown[] = [];
     const models: string[] = [];
     const { app, secret } = await voiceApp(pool, {
-      agents: fakeAgents().agents,
+      agents: fakeAgents(),
       talker,
       recorded,
       models,
@@ -398,7 +520,7 @@ test('a newer transcript cancels the older reply', database, async (t) => {
       yield 'answer that must never arrive';
     } else yield 'Second answer.';
   });
-  const { app, secret } = await voiceApp(pool, { agents: fakeAgents().agents, talker });
+  const { app, secret } = await voiceApp(pool, { agents: fakeAgents(), talker });
   const { socket, received } = await engineSocket(app, secret);
   socket.send(
     JSON.stringify({
@@ -436,7 +558,7 @@ test('the monthly limit stops the reply with a spoken notice', database, async (
     yield 'never';
   });
   const { app, secret } = await voiceApp(pool, {
-    agents: fakeAgents().agents,
+    agents: fakeAgents(),
     talker,
     limit: true,
   });
@@ -478,7 +600,7 @@ test(
       (call) => call.turns.at(-1)!.content.includes('meteo'),
     );
     const { app, secret } = await voiceApp(pool, {
-      agents: fakeAgents().agents,
+      agents: fakeAgents(),
       talker,
       submitted,
       turnIds,
@@ -549,7 +671,7 @@ test('a failed hand-off is said aloud and a failed Nod turn is reported', databa
     () => true,
   );
   const turnIds: string[] = [];
-  const { app, secret } = await voiceApp(pool, { agents: fakeAgents().agents, talker, turnIds });
+  const { app, secret } = await voiceApp(pool, { agents: fakeAgents(), talker, turnIds });
   const { socket, received } = await engineSocket(app, secret);
   socket.send(
     JSON.stringify({
@@ -589,7 +711,7 @@ test('silence after a hand-off stays silent and is never sent to Nod', database,
     },
     () => true,
   );
-  const { app, secret } = await voiceApp(pool, { agents: fakeAgents().agents, talker, submitted });
+  const { app, secret } = await voiceApp(pool, { agents: fakeAgents(), talker, submitted });
   const { socket, received } = await engineSocket(app, secret);
   const history = [
     { role: 'user', content: 'Guardami su Slack se ci sono messaggi' },
@@ -646,7 +768,7 @@ test(
         : 'Bene, grazie!';
     });
     const { app, secret } = await voiceApp(pool, {
-      agents: fakeAgents().agents,
+      agents: fakeAgents(),
       talker,
       submitted,
     });
@@ -679,7 +801,7 @@ test('a question from Nod reaches the call with its options', database, async (t
     },
     () => true,
   );
-  const { app, secret } = await voiceApp(pool, { agents: fakeAgents().agents, talker, turnIds });
+  const { app, secret } = await voiceApp(pool, { agents: fakeAgents(), talker, turnIds });
   const { socket, received } = await engineSocket(app, secret);
   socket.send(
     JSON.stringify({
@@ -732,7 +854,7 @@ test('asking to hang up says goodbye and closes the call', database, async (t) =
     () => false,
     (call) => call.turns.at(-1)!.content.includes('chiudi'),
   );
-  const { app, secret } = await voiceApp(pool, { agents: fakeAgents().agents, talker, submitted });
+  const { app, secret } = await voiceApp(pool, { agents: fakeAgents(), talker, submitted });
   const { socket, received, closed } = await engineSocket(app, secret);
   socket.send(
     JSON.stringify({

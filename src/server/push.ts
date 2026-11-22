@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import type { FastifyInstance } from 'fastify';
 import type { Nodes } from 'mdast';
 import type { Pool } from 'pg';
@@ -17,6 +18,7 @@ export interface PushOptions {
   ownerId: string;
   sender?: PushSender;
   quietHours(): Promise<QuietHours>;
+  accessKey(): Promise<string>;
   redact(text: string): string;
   failure?: (event: string, error: unknown, context?: Record<string, unknown>) => void;
 }
@@ -80,6 +82,10 @@ const fromSchedule = `EXISTS(SELECT 1 FROM turns o ${workOriginSql('o')}
 
 export function createPush(options: PushOptions) {
   const { pool, ownerId, sender } = options;
+  const credential = async () =>
+    createHash('sha256')
+      .update(await options.accessKey())
+      .digest('hex');
 
   async function initialize() {
     await pool.query(`
@@ -93,7 +99,12 @@ export function createPush(options: PushOptions) {
       CREATE TABLE IF NOT EXISTS push_sent (
         message_id uuid PRIMARY KEY, owner_id text NOT NULL, sent_at timestamptz NOT NULL DEFAULT now()
       );
+      ALTER TABLE push_devices ADD COLUMN IF NOT EXISTS credential text;
     `);
+    await pool.query(
+      'UPDATE push_devices SET credential=$2 WHERE owner_id=$1 AND credential IS NULL',
+      [ownerId, await credential()],
+    );
     await pool.query(
       'INSERT INTO push_state(owner_id,since) VALUES($1,clock_timestamp()) ON CONFLICT(owner_id) DO NOTHING',
       [ownerId],
@@ -113,9 +124,9 @@ export function createPush(options: PushOptions) {
           .code(400)
           .send({ error: 'Send an Android FCM token as { token, platform: "android" }.' });
       await pool.query(
-        `INSERT INTO push_devices(token,owner_id,platform) VALUES($1,$2,$3)
-         ON CONFLICT(token) DO UPDATE SET owner_id=$2,platform=$3,last_seen_at=clock_timestamp()`,
-        [parsed.data.token, ownerId, parsed.data.platform],
+        `INSERT INTO push_devices(token,owner_id,platform,credential) VALUES($1,$2,$3,$4)
+         ON CONFLICT(token) DO UPDATE SET owner_id=$2,platform=$3,credential=$4,last_seen_at=clock_timestamp()`,
+        [parsed.data.token, ownerId, parsed.data.platform, await credential()],
       );
       await pool.query(
         `DELETE FROM push_devices WHERE owner_id=$1 AND token IN (
@@ -160,9 +171,14 @@ export function createPush(options: PushOptions) {
       [ownerId],
     );
     if (claimed.rowCount) {
+      const current = await credential();
+      await pool.query(
+        'DELETE FROM push_devices WHERE owner_id=$1 AND credential IS DISTINCT FROM $2',
+        [ownerId, current],
+      );
       const devices = await pool.query<{ token: string; platform: PushPlatform }>(
-        'SELECT token,platform FROM push_devices WHERE owner_id=$1',
-        [ownerId],
+        'SELECT token,platform FROM push_devices WHERE owner_id=$1 AND credential=$2',
+        [ownerId, current],
       );
       for (const message of claimed.rows) {
         const notification = {
