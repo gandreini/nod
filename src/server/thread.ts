@@ -123,6 +123,7 @@ interface SubmitUserMessageOptions {
   clientMessageId?: string;
   questionAnswer?: QuestionAnswer;
   approvalAnswer?: { approvalId: string; approved: boolean };
+  neverApprove?: boolean;
   audioCaption?: string;
   prompt?: string;
   answer?: ChatConfirmationInput['answer'];
@@ -622,13 +623,14 @@ export async function submitUserMessage(
       confirmation.hasAttachments)
   )
     throw httpError('Answer the approval with the button you chose.', 400);
-  const answer = options.questionAnswer
+  const read = options.questionAnswer
     ? undefined
     : options.approvalAnswer
       ? options.approvalAnswer
       : options.client
         ? options.answer
         : await readAnswer(text, confirmation.hasAttachments, options, confirmAction);
+  const answer = options.neverApprove && read?.approved ? { ...read, approved: undefined } : read;
   let inserted = false;
   const markInserted = () => {
     inserted = true;

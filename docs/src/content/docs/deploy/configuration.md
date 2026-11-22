@@ -126,6 +126,16 @@ Nod never generates a replacement when encrypted data already exists. Restore th
 Saved credentials can't be read without it. Keep a copy somewhere safe, outside the repository.
 :::
 
+## Push notifications and voice calls (fork)
+
+| Variable                   | What it does                                                                                                                                                                                                                                                            | Default                |
+| -------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------- |
+| `NOD_FCM_SERVICE_ACCOUNT`  | Only in the `gandreini/nod` fork. The Firebase service account JSON, or its base64, that sends Android push notifications to the Nod mobile app. Without it the server sends no push and doesn't offer it to the app. Keep it in `.env`; it is a secret.                | Unset                  |
+| `NOD_VOICE_ELEVENLABS_KEY` | Only in the `gandreini/nod` fork. An ElevenLabs API key with ElevenAgents write and Voices read access, for live voice calls from the mobile app. Without it the server offers no calls. Keep it separate from `ELEVENLABS_API_KEY`, which Nod uses for voice messages. | Unset                  |
+| `NOD_VOICE_LANGUAGE`       | Only in the fork. The call language as an ISO code, such as `it`.                                                                                                                                                                                                       | `en`                   |
+| `NOD_VOICE_ID`             | Only in the fork. The ElevenLabs voice for calls.                                                                                                                                                                                                                       | `Xb7hH8MSUJpSbSDYk0k2` |
+| `NOD_VOICE_TTS_MODEL`      | Only in the fork. The ElevenLabs speech model for calls.                                                                                                                                                                                                                | `eleven_v4_turbo`      |
+
 ## Channels
 
 Leave every variable for a channel blank or unset to manage it in **Channels**. The app checks your account and saves its settings encrypted.
