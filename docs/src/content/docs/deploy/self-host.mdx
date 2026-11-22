@@ -136,7 +136,7 @@ To use another port, change `PORT` in `.env` and use that port in the tunnel and
 
 </Steps>
 
-Caddy obtains and renews the certificate. This profile accepts a DNS or IPv4 host with HTTPS on port 443. Use an existing proxy for a different HTTPS port or an IPv6 URL. Keep using `--profile https` when you operate this installation. If certificate setup fails, check DNS and whether the provider or router blocks ports 80 or 443.
+Caddy obtains and renews the certificate and compresses JSON responses, so a phone on a slow connection loads the chat faster; live events are sent uncompressed. This profile accepts a DNS or IPv4 host with HTTPS on port 443. Use an existing proxy for a different HTTPS port or an IPv6 URL. Keep using `--profile https` when you operate this installation. If certificate setup fails, check DNS and whether the provider or router blocks ports 80 or 443.
 
 The public URL must be an origin: scheme, hostname, and optional port. Paths, query strings, fragments, and embedded credentials are refused.
 
