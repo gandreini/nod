@@ -1,7 +1,7 @@
 import { ChevronDown } from '../ui/icons';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { ComposerNotice } from './composer-notice';
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   Animated,
   Pressable,
@@ -12,6 +12,7 @@ import {
 } from 'react-native';
 import { GradientFill } from '../ui/gradient-fill';
 import { radius, type Theme } from '../ui/theme';
+import { useFocusEffect } from 'expo-router';
 import { useNod } from '../connection/nod-context';
 import { AttachMenu } from '../files/attachment-views';
 import { sendable } from '../files/attachments';
@@ -119,6 +120,8 @@ export function ChatComposer({
   const { connection, chat } = useNod();
   const [draft, setDraft] = useState('');
   const voice = useVoiceRecorder();
+  const voiceNow = useRef(voice);
+  voiceNow.current = voice;
   const files = useAttachments(connection);
   const [attaching, setAttaching] = useState(false);
   const [notice, setNotice] = useState<string>();
@@ -133,6 +136,15 @@ export function ChatComposer({
   useEffect(() => {
     if (voice.active && voice.seconds >= maxRecordingSeconds) void finishVoice();
   }, [voice.active, voice.seconds]);
+
+  useFocusEffect(
+    useCallback(
+      () => () => {
+        if (voiceNow.current.active) voiceNow.current.cancel();
+      },
+      [],
+    ),
+  );
 
   async function finishVoice() {
     const recording = await voice.finish();

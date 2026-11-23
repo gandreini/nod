@@ -14,11 +14,13 @@ export async function sendQuickly(
     suspect,
     after = hedgeAfter,
     onHedge = () => {},
+    cancelled = () => false,
   }: {
     recover(): Promise<void>;
     suspect(): boolean;
     after?: number;
     onHedge?(): void;
+    cancelled?(): boolean;
   },
 ) {
   const first = send();
@@ -29,7 +31,7 @@ export async function sendQuickly(
   const winner = await Promise.race([first.then(() => 'sent' as const), slow]).finally(() =>
     clearTimeout(timer),
   );
-  if (winner === 'sent') return;
+  if (winner === 'sent' || cancelled()) return;
   if (!suspect()) {
     await first;
     return;
@@ -37,6 +39,7 @@ export async function sendQuickly(
   first.catch(() => {});
   onHedge();
   await recover();
+  if (cancelled()) return;
   await send();
 }
 
@@ -131,6 +134,7 @@ export function createOutbox(deps: OutboxDeps) {
           suspect: deps.suspect,
           after: deps.hedgeAfter,
           onHedge: () => recovered.add(item.id),
+          cancelled: () => stopped || !present(item.id),
         });
       if (stopped) return;
       waits.delete(item.id);

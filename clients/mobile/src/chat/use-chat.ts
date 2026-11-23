@@ -220,9 +220,7 @@ export function useChat(connection: Connection, onRefused: (notice: string) => v
   }, [live]);
 
   const send = useCallback((text: string, attachments: Draft[] = []) => {
-    const masked = attachments.length
-      ? undefined
-      : privateCode(text, stateRef.current?.verificationRequests);
+    const masked = privateCode(text, stateRef.current?.verificationRequests);
     outbox.current!.add({
       id: randomUUID(),
       text,

@@ -85,6 +85,10 @@ describe('chat state', () => {
       false,
     );
     assert.equal(persistable(outgoing('Book the table for Friday')), true);
+    const file = { uri: 'file:///photo.jpg', name: 'photo.jpg', mimeType: 'image/jpeg', size: 1 };
+    assert.equal(persistable(outgoing('482913', { files: [file] })), false);
+    assert.equal(persistable(outgoing('cvv 123', { files: [file] })), false);
+    assert.equal(persistable(outgoing('Here is the receipt', { files: [file] })), true);
   });
 
   test('the code card goes under Nod’s latest message in the waiting turn', () => {

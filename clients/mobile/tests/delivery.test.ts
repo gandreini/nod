@@ -259,6 +259,20 @@ describe('message delivery', () => {
     }
   });
 
+  test('a text stuck on a dead connection is not sent again after the outbox stops', async () => {
+    const { server, outbox, net } = await harness();
+    try {
+      net.deadSends = 1;
+      outbox.add(text('closed before the resend'));
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      outbox.stop();
+      await new Promise((resolve) => setTimeout(resolve, 600));
+      assert.deepEqual(net.steps, ['send']);
+    } finally {
+      await server.stop();
+    }
+  });
+
   test('a slow server on a healthy connection gets the message once, with no resend', async () => {
     const { server, outbox, settled, messages, net } = await harness();
     try {

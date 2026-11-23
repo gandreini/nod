@@ -8,6 +8,7 @@ import type { Connection } from '../connection/connection';
 export const pushBuild = Platform.OS === 'android' && Constants.expoConfig?.extra?.push === true;
 
 const key = 'nod.push';
+let generation = 0;
 
 export interface PushChoice {
   origin: string;
@@ -38,12 +39,17 @@ async function prepareChannel() {
 }
 
 async function register(connection: Connection, choice: PushChoice, known?: string) {
+  const started = generation;
   const token = known ?? String((await Notifications.getDevicePushTokenAsync()).data);
   await request(connection, '/api/fork/push/devices', 'PUT', { token, platform: 'android' });
   if (choice.token && choice.token !== token)
     await request(connection, '/api/fork/push/devices', 'DELETE', { token: choice.token }).catch(
       () => {},
     );
+  if (started !== generation) {
+    await request(connection, '/api/fork/push/devices', 'DELETE', { token }).catch(() => {});
+    return;
+  }
   await saveChoice({ ...choice, enabled: true, asked: true, token });
 }
 
@@ -84,6 +90,7 @@ export async function markAsked(connection: Connection) {
 
 export async function forgetPush(connection: Connection, tellServer: boolean) {
   if (!pushBuild) return;
+  generation += 1;
   const choice = await loadPushChoice(connection);
   if (tellServer && choice.token)
     await request(

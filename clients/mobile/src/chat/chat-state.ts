@@ -137,7 +137,6 @@ export function codeRequestTargets(requests: VerificationRequest[] = [], message
 
 export function persistable(item: Outgoing) {
   if (item.privateText) return false;
-  if (item.audio || item.files?.length) return true;
   const reply = classifyVerificationReply(item.text).kind;
   return reply !== 'code' && reply !== 'wrapped' && !securityCodeIn(item.text);
 }
