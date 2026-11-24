@@ -105,10 +105,24 @@
   gap: 6px;
 }
 .app-account-count {
+  display: inline-grid;
+  place-items: center;
   min-width: 2ch;
   font-size: 12px;
   line-height: 1;
   font-variant-numeric: tabular-nums;
+}
+.app-account-count > * {
+  grid-area: 1 / 1;
+}
+.app-account-plus {
+  visibility: hidden;
+}
+.app-manage:is(:hover, :focus-visible):not(:disabled) .app-account-number {
+  visibility: hidden;
+}
+.app-manage:is(:hover, :focus-visible):not(:disabled) .app-account-plus {
+  visibility: visible;
 }
 .app-account-attention {
   position: absolute;

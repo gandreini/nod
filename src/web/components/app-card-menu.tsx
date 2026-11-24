@@ -125,7 +125,7 @@ export function AppCardMenu({
   return (
     <>
       <Button
-        variant="outline"
+        variant="ghost"
         size="sm"
         className="app-manage"
         data-manage-service={serviceKey}
@@ -139,7 +139,10 @@ export function AppCardMenu({
       >
         <Users size={16} aria-hidden="true" />
         <span className="app-account-count" aria-hidden="true">
-          {accounts.length > 99 ? '99+' : accounts.length}
+          <span className="app-account-number">
+            {accounts.length > 99 ? '99+' : accounts.length}
+          </span>
+          <Plus size={14} className="app-account-plus" />
         </span>
         {issue && <span className="app-account-attention" aria-hidden="true" />}
       </Button>
@@ -150,7 +153,7 @@ export function AppCardMenu({
         trigger={
           <Button
             ref={trigger}
-            variant="outline"
+            variant="ghost"
             size="icon"
             className="app-card-menu-trigger"
             title="More options"
