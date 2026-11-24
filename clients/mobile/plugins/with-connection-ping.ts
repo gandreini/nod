@@ -1,4 +1,4 @@
-const { withMainApplication } = require('expo/config-plugins');
+import { withMainApplication, type ConfigPlugin } from 'expo/config-plugins';
 
 const imports = [
   'android.app.Activity',
@@ -28,8 +28,8 @@ const setup = `
       override fun onActivityDestroyed(activity: Activity) {}
     })`;
 
-module.exports = function withConnectionPing(config) {
-  return withMainApplication(config, (config) => {
+export const withConnectionPing: ConfigPlugin = (config) =>
+  withMainApplication(config, (config) => {
     let source = config.modResults.contents;
     if (source.includes('setOkHttpClientFactory')) return config;
     if (!source.includes('super.onCreate()'))
@@ -43,4 +43,3 @@ module.exports = function withConnectionPing(config) {
     config.modResults.contents = source;
     return config;
   });
-};

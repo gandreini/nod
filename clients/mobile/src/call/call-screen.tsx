@@ -7,9 +7,8 @@ import {
 } from '@elevenlabs/react-native';
 import { requestRecordingPermissionsAsync, useAudioPlayer } from 'expo-audio';
 import { router } from 'expo-router';
-import { StatusBar } from 'expo-status-bar';
 import { useEffect, useRef, useState } from 'react';
-import { Linking, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
+import { Linking, Pressable, ScrollView, StatusBar, StyleSheet, Text, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { ApprovalCard } from '../chat/cards';
 import { useKeepAwake } from 'expo-keep-awake';
@@ -22,6 +21,7 @@ import { Mic, MicOff, PhoneOff } from '../ui/icons';
 import { NodGlyph } from '../ui/nod-mark';
 import { darkTheme, font } from '../ui/theme';
 import { voiceRelayCue } from '../../../../src/shared/voice';
+import waitingSoundFile from '../../assets/sounds/waiting.wav';
 
 const colors = {
   background: '#111111',
@@ -45,7 +45,7 @@ function Call() {
   const connected = useRef(false);
   const seen = useRef<Set<string> | null>(null);
   const [waiting, setWaiting] = useState(false);
-  const waitingSound = useAudioPlayer(require('../../assets/sounds/waiting.wav'));
+  const waitingSound = useAudioPlayer(waitingSoundFile);
   const fade = useRef<ReturnType<typeof setInterval> | undefined>(undefined);
   const confirmation = [...chat.messages]
     .reverse()
@@ -167,7 +167,7 @@ function Call() {
     <View
       style={[styles.screen, { paddingTop: insets.top + 48, paddingBottom: insets.bottom + 40 }]}
     >
-      <StatusBar style="light" />
+      <StatusBar barStyle="light-content" />
       <View style={styles.center}>
         <View style={[styles.halo, { opacity: isSpeaking ? 1 : 0.35 }]}>
           <NodGlyph size={72} mark={colors.foreground} />

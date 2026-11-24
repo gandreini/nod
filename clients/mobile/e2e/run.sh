@@ -51,7 +51,7 @@ trap cleanup EXIT
 
 stale() {
   [ ! -e "$1" ] || [ "${E2E_BUILD:-}" = 1 ] ||
-    [ -n "$(find src assets modules plugins app.json app.config.js package.json pnpm-lock.yaml metro.config.js ../../src/shared ../../src/web/lib ../../src/web/components/icon-drawings.ts -newer "$1" -print -quit)" ]
+    [ -n "$(find src assets modules plugins app.json app.config.ts package.json pnpm-lock.yaml metro.config.ts ../../src/shared ../../src/web/lib ../../src/web/components/icon-drawings.ts -newer "$1" -print -quit)" ]
 }
 
 start_android() {

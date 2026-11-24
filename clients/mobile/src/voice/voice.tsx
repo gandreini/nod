@@ -33,8 +33,8 @@ function loudness(data: ArrayBuffer | ArrayBufferView) {
     : new Int16Array(data, 0, Math.floor(data.byteLength / 2));
   if (!samples.length) return 0;
   let sum = 0;
-  for (let index = 0; index < samples.length; index++) {
-    const value = samples[index] / 32768;
+  for (const sample of samples) {
+    const value = sample / 32768;
     sum += value * value;
   }
   return Math.sqrt(sum / samples.length);

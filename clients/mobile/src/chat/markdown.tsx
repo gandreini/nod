@@ -81,128 +81,107 @@ function CodeBlock({
   );
 }
 
-class NodRenderer extends Renderer {
-  constructor(
-    private connection: Connection,
-    private theme: Theme,
-    private show: (file: Artifact) => void,
-  ) {
-    super();
-  }
+function nodRenderer(connection: Connection, theme: Theme, show: (file: Artifact) => void) {
+  const renderer = new Renderer();
+  const key = () => renderer.getKey();
+  const baseList = renderer.list.bind(renderer);
+  const baseTable = renderer.table.bind(renderer);
 
-  code(text: string, _language?: string, containerStyle?: ViewStyle, textStyle?: TextStyle) {
-    return (
-      <CodeBlock
-        key={this.getKey()}
-        text={text}
-        theme={this.theme}
-        containerStyle={containerStyle}
-        textStyle={textStyle}
-      />
-    );
-  }
-
-  link(
-    children: string | ReactNode[],
-    href: string,
-    styles?: TextStyle,
-    title?: string,
-  ): ReactNode {
-    if (!safeLink(href, this.connection.origin))
-      return (
-        <Text
-          key={this.getKey()}
-          style={[styles, { color: this.theme.foreground, textDecorationLine: 'none' }]}
-        >
-          {children}
-        </Text>
-      );
-    return (
-      <Text
-        key={this.getKey()}
-        accessibilityRole="link"
-        accessibilityLabel={title}
-        onPress={() => open(this.connection, href, this.show)}
-        style={styles}
-      >
-        {children}
-      </Text>
-    );
-  }
-
-  image(uri: string, alt?: string, style?: ImageStyle, title?: string): ReactNode {
+  const image = (uri: string, alt?: string, style?: ImageStyle, title?: string): ReactNode => {
     const label = alt || title || 'Image';
-    const file = imageArtifact(uri, this.connection.origin);
+    const file = imageArtifact(uri, connection.origin);
     if (!file)
       return (
-        <Text
-          key={this.getKey()}
-          style={{ color: this.theme.mutedForeground, fontStyle: 'italic' }}
-        >
+        <Text key={key()} style={{ color: theme.mutedForeground, fontStyle: 'italic' }}>
           [{label}]
         </Text>
       );
     return (
       <Pressable
-        key={this.getKey()}
-        onPress={() => open(this.connection, file.path, this.show)}
+        key={key()}
+        onPress={() => open(connection, file.path, show)}
         accessibilityRole="imagebutton"
         accessibilityLabel={label}
       >
         <Image
-          source={artifactSource(this.connection, file.path)}
+          source={artifactSource(connection, file.path)}
           resizeMode="cover"
           style={[
             {
               width: 240,
               height: 240,
               borderRadius: radius.bubble,
-              backgroundColor: this.theme.inset,
+              backgroundColor: theme.inset,
             },
             style,
           ]}
         />
       </Pressable>
     );
-  }
+  };
 
-  linkImage(
-    href: string,
-    imageUrl: string,
-    alt?: string,
-    style?: ImageStyle,
-    title?: string,
-  ): ReactNode {
-    return this.image(imageUrl, alt, style, title);
-  }
-
-  list(
-    ordered: boolean,
-    li: ReactNode[],
-    listStyle?: ViewStyle,
-    textStyle?: TextStyle,
-    startIndex?: number,
-  ): ReactNode {
-    return (
-      <View key={this.getKey()} style={{ gap: 4, marginBottom: 12 }}>
-        {super.list(ordered, li, listStyle, textStyle, startIndex)}
+  return Object.assign(renderer, {
+    code: (text: string, _language?: string, containerStyle?: ViewStyle, textStyle?: TextStyle) => (
+      <CodeBlock
+        key={key()}
+        text={text}
+        theme={theme}
+        containerStyle={containerStyle}
+        textStyle={textStyle}
+      />
+    ),
+    link: (
+      children: string | ReactNode[],
+      href: string,
+      styles?: TextStyle,
+      title?: string,
+    ): ReactNode =>
+      safeLink(href, connection.origin) ? (
+        <Text
+          key={key()}
+          accessibilityRole="link"
+          accessibilityLabel={title}
+          onPress={() => open(connection, href, show)}
+          style={styles}
+        >
+          {children}
+        </Text>
+      ) : (
+        <Text key={key()} style={[styles, { color: theme.foreground, textDecorationLine: 'none' }]}>
+          {children}
+        </Text>
+      ),
+    image,
+    linkImage: (
+      _href: string,
+      imageUrl: string,
+      alt?: string,
+      style?: ImageStyle,
+      title?: string,
+    ): ReactNode => image(imageUrl, alt, style, title),
+    list: (
+      ordered: boolean,
+      li: ReactNode[],
+      listStyle?: ViewStyle,
+      textStyle?: TextStyle,
+      startIndex?: number,
+    ): ReactNode => (
+      <View key={key()} style={{ gap: 4, marginBottom: 12 }}>
+        {baseList(ordered, li, listStyle, textStyle, startIndex)}
       </View>
-    );
-  }
-
-  table(
-    header: ReactNode[][],
-    rows: ReactNode[][][],
-    tableStyle?: ViewStyle,
-    rowStyle?: ViewStyle,
-    cellStyle?: ViewStyle,
-  ): ReactNode {
-    return (
-      <View key={this.getKey()} style={{ marginTop: 4, marginBottom: 20 }}>
-        {super.table(header, rows, tableStyle, rowStyle, cellStyle)}
+    ),
+    table: (
+      header: ReactNode[][],
+      rows: ReactNode[][][],
+      tableStyle?: ViewStyle,
+      rowStyle?: ViewStyle,
+      cellStyle?: ViewStyle,
+    ): ReactNode => (
+      <View key={key()} style={{ marginTop: 4, marginBottom: 20 }}>
+        {baseTable(header, rows, tableStyle, rowStyle, cellStyle)}
       </View>
-    );
-  }
+    ),
+  });
 }
 
 function markdownStyles(theme: Theme) {
@@ -277,7 +256,7 @@ export const Markdown = memo(function Markdown({ text, theme }: { text: string; 
       ...markdownStyles(theme),
       colorScheme: theme.dark ? ('dark' as const) : ('light' as const),
       baseUrl: connection.origin,
-      renderer: new NodRenderer(connection, theme, viewer.open),
+      renderer: nodRenderer(connection, theme, viewer.open),
     }),
     [connection, theme, viewer.open],
   );
