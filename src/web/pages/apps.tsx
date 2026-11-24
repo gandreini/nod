@@ -13,7 +13,8 @@ import { SearchPicker } from '../components/search-picker';
 import { Tabs } from '../components/tabs';
 import { Tooltip } from '../components/tooltip';
 import { AppAccountManager } from '../components/app-account-manager';
-import { AppCardMenu, toolCountLabel, useMcpToolCounts } from '../components/app-card-menu';
+import { AppCardMenu, useMcpToolCounts } from '../components/app-card-menu';
+import { accountIssue, addAccountTarget, toolCountLabel } from '../lib/app-tools';
 import { api, ApiError, errorMessage } from '../lib/api';
 import { connectionUrl, readSetup } from '../lib/connection-url';
 import { searchApps } from '../lib/app-search';
@@ -527,20 +528,9 @@ export function Apps({
     return (
       <div className={catalogCards ? 'app-grid app-catalog-grid' : 'app-grid'}>
         {items.map(({ key, service, accounts }) => {
-          const addAccount =
-            accounts.find(
-              (account) => account.slug === service.slug && account.status !== 'not_configured',
-            ) ??
-            (service.direct ? service : undefined) ??
-            accounts.find((account) => account.status !== 'not_configured') ??
-            service;
-          const usableNotion =
-            service.slug === 'notion' &&
-            accounts.some((account) => account.slug === 'notion' && !connectionIssue(account));
-          const issue = accounts.some(
-            (account) =>
-              !(usableNotion && account.slug === 'notion_mcp') && connectionIssue(account),
-          );
+          const addAccount = addAccountTarget(service, accounts);
+          const issue = accountIssue(service, accounts);
+          const tools = accounts.length ? toolCountLabel(accounts, toolCounts) : undefined;
           return (
             <IntegrationCard
               key={key}
@@ -550,19 +540,21 @@ export function Apps({
               logo={<ServiceLogo {...service} />}
               description={service.description}
               badge={
-                service.status === 'not_configured' && (
-                  <Tooltip content="Sign-in unavailable">
-                    <span className="app-card-attention">
-                      <AlertCircle size={14} aria-label="Sign-in unavailable" />
-                    </span>
-                  </Tooltip>
-                )
+                <>
+                  {service.status === 'not_configured' && (
+                    <Tooltip content="Sign-in unavailable">
+                      <span className="app-card-attention">
+                        <AlertCircle size={14} aria-label="Sign-in unavailable" />
+                      </span>
+                    </Tooltip>
+                  )}
+                  {tools && <span className="app-tool-count">{tools}</span>}
+                </>
               }
               actions={
                 accounts.length ? (
                   <AppCardMenu
                     service={service}
-                    tools={toolCountLabel(accounts, toolCounts)}
                     accounts={accounts}
                     serviceKey={key}
                     issue={issue}
@@ -577,11 +569,7 @@ export function Apps({
                       setManageService(key);
                     }}
                     onAddAccount={
-                      !addAccount.browserUrl &&
-                      !addAccount.savedLogin &&
-                      addAccount.status !== 'not_configured'
-                        ? () => void connect(addAccount, 'apps', true)
-                        : undefined
+                      addAccount ? () => void connect(addAccount, 'apps', true) : undefined
                     }
                     onRename={service.canRename ? (name) => rename(service.slug, name) : undefined}
                     onCounts={(counts) => setToolCounts((current) => ({ ...current, ...counts }))}
