@@ -103,7 +103,7 @@ export function createDockerWorkspace(options: {
   return createCommandWorkspace({
     workspaceRoot: options.workspaceRoot,
     instructions:
-      'Use IPv4 for internet access from your Linux workspace. Node, Python (with pdfplumber and pillow_heif), pipx, git, curl, ripgrep, jq, ffmpeg, yt-dlp, poppler-utils, qpdf, Ghostscript and Tesseract OCR are installed. Python also has pypdf, openpyxl, python-docx and python-pptx, and LibreOffice (soffice) converts office files. Install trusted Python libraries with pip install <package>, trusted CLIs with npm install -g <package> or pipx install <package>; /home/node persists across tasks and restarts. A connected app CLI never runs from here: Nod installs its own copy from the source you propose. You run as an unprivileged user without sudo or a graphical display; use a CLI or browser web app. Keep outputs in this workspace and install tools here, not on the user’s device.',
+      'Installed: Node, Python (pypdf, pdfplumber, pillow_heif, openpyxl, python-docx, python-pptx), LibreOffice (soffice), ffmpeg, yt-dlp, poppler-utils, qpdf, Ghostscript, Tesseract OCR, git, curl, ripgrep, jq and pipx. Install trusted Python libraries with pip install <package>, trusted CLIs with npm install -g <package> or pipx install <package>; /home/node persists across tasks and restarts. You have no sudo or display, so use a CLI or a web app in the browser, and IPv4 for internet access. Keep outputs in this workspace and never install on the owner\u2019s device.',
     runCommand: (id, args, input) =>
       runWorkspaceCommand({
         container: options.container,
@@ -287,13 +287,24 @@ export function createCommandWorkspace(options: {
         path: `/workspace/${id}`,
         instructions: options.instructions,
         async exec(script, { input: stdin, signal, timeoutMs = 600_000, onData, notices } = {}) {
-          const result = await command(id, ['bash', '-c', script], {
-            input: stdin,
-            signal: signal ? AbortSignal.any([signal, input.signal]) : input.signal,
-            timeoutMs: Math.max(1000, timeoutMs),
-            onData: onData ?? (() => {}),
-            session: notices,
-          });
+          const result = await command(
+            id,
+            [
+              '/bin/bash',
+              '--noprofile',
+              '--norc',
+              '-p',
+              '-c',
+              `nod_workspace_path=$PATH\nexport PATH='/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'\n${script}`,
+            ],
+            {
+              input: stdin,
+              signal: signal ? AbortSignal.any([signal, input.signal]) : input.signal,
+              timeoutMs: Math.max(1000, timeoutMs),
+              onData: onData ?? (() => {}),
+              session: notices,
+            },
+          );
           return { exitCode: result.exitCode };
         },
         ...(connected
@@ -317,6 +328,8 @@ export function createCommandWorkspace(options: {
                 return {
                   exitCode: result.exitCode,
                   output: Buffer.concat([result.stdout, result.stderr]).toString('utf8'),
+                  stdout: result.stdout.toString('utf8'),
+                  stderr: result.stderr.toString('utf8'),
                 };
               },
             }

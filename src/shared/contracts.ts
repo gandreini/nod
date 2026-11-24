@@ -17,7 +17,7 @@ export type AgentReactionResult =
   | { status: 'updated' | 'unchanged' }
   | {
       status: 'skipped';
-      reason: 'cooldown' | 'already_reacted' | 'unavailable' | 'unsupported' | 'delivery_failed';
+      reason: 'already_reacted' | 'unavailable' | 'unsupported' | 'delivery_failed';
     };
 export interface Message {
   id: string;
@@ -40,18 +40,21 @@ export interface Message {
   choiceAnswer?: { choiceIds: string[]; text?: string };
   approval?: MessageApproval;
   cardAnswer?: true;
-  work?: { kind: 'task' | 'schedule'; id: string; title: string };
+  work?: { kind: 'task' | 'schedule'; id: string; title: string; turnId?: string };
 }
 export type ApprovalState = 'pending' | 'working' | 'done' | 'declined' | 'expired' | 'uncertain';
 export interface MessageApproval {
   id: string;
   state: ApprovalState;
+  failure?: string;
   title: string;
+  decline?: string;
   app: string;
   slug: string;
   fields?: Array<{ label: string; value: string }>;
   body?: string;
   bodyCut?: true;
+  cardQuestion?: string;
 }
 export interface SubmitMessageResponse {
   threadId: string;
@@ -90,6 +93,8 @@ export interface Activity {
   received?: true;
   background?: true;
   runId?: string;
+  scheduleId?: string;
+  recent?: Array<{ id: string; summary: string; site: string | null }>;
 }
 export interface VaultLoginEntry {
   kind: 'login';
@@ -204,6 +209,7 @@ export interface CredentialRequest {
   methods?: { id: string; label: string }[];
   fields?: { kind: 'identifier' | 'password' | 'otp'; selector: string; label: string }[];
   status: 'pending' | 'entering' | 'uncertain' | 'filled' | 'expired';
+  notEntered?: boolean;
   savedEntries?: (VaultLoginEntry & { username: string })[];
   username?: string;
   passwordManager?: { name: string; account?: string };
@@ -216,6 +222,7 @@ export interface PasswordManagerLogin {
 }
 export interface Connection {
   canReconnect?: boolean;
+  canRename?: boolean;
   reconnectRequired?: boolean;
   disconnectPending?: boolean;
   slug: string;
@@ -248,6 +255,7 @@ export interface AppSetupStatus {
     logoUrl?: string;
     pairingConfirmed?: boolean;
     available?: boolean;
+    error?: string;
   }>;
 }
 export interface Configuration {
@@ -255,12 +263,15 @@ export interface Configuration {
   model: string;
   llmReady: boolean;
   modelReconnect: boolean;
+  modelChecking?: boolean;
   modelIssue?: ModelIssue;
   modelAlternative?: ModelSelection & { label: string };
   integrationsReady: boolean;
   conversationResetEnabled: boolean;
 }
 export interface AppState {
+  chatRecovery?: { turnId: string };
+  chatClearedAt?: string;
   tasks?: Task[];
   threadId: string;
   hasEarlierMessages?: boolean;
@@ -280,7 +291,7 @@ export interface MessageHistoryPage {
   hasMore: boolean;
 }
 export interface CurrentBrowser {
-  threadId: string;
+  browserId: string;
   title: string;
   status: string;
   lastActivityAt: string;
@@ -349,7 +360,11 @@ export interface Schedule {
   revision: number;
   nextRun: string | null;
   lastRun: ScheduleRun | null;
-  activeRun: { turnId: string; status: 'queued' | 'running' | 'waiting' } | null;
+  activeRun: {
+    turnId: string;
+    status: 'queued' | 'running' | 'waiting';
+    questionMessageId: string | null;
+  } | null;
   baselineObservation: ScheduleObservation | null;
   watch: string[] | null;
   model: ModelSelection | null;
@@ -374,6 +389,7 @@ export interface ScheduleRun {
   messageId: string | null;
   messagePreview: string | null;
   messageText: string | null;
+  attachmentMessageId: string | null;
   costUsd?: number | null;
 }
 export interface ScheduleHistory {

@@ -249,6 +249,7 @@ function connectionFailure(phase: IntegrationConnectionError['phase'], signal?: 
 export function createComposioProvider(options: {
   proxy: ReturnType<typeof createComposioProxy>;
   fileDownload?: Parameters<typeof createComposioFiles>[0];
+  inboxRetryDelay?: (attempt: number) => number;
 }): IntegrationProvider {
   const files = createComposioFiles(options.fileDownload);
   const identities = new Map<string, AccountIdentity>();
@@ -617,6 +618,41 @@ export function createComposioProvider(options: {
           );
         }
       },
+      async offers(action, signal) {
+        actionToolkit(action);
+        const response = await client
+          .getClient()
+          .toolRouter.session.executeMeta(
+            value.sessionId,
+            {
+              slug: 'COMPOSIO_GET_TOOL_SCHEMAS',
+              arguments: { tool_slugs: [action], include: ['input_schema'] },
+            },
+            { signal, maxRetries: 0 },
+          )
+          .catch((error: unknown) => {
+            if (
+              error instanceof APIError &&
+              error.status === 404 &&
+              (error.error as { error?: unknown } | undefined)?.error === 'not_found'
+            )
+              return undefined;
+            throw error;
+          });
+        signal?.throwIfAborted();
+        if (!response) return false;
+        const missing = z.object({ not_found: z.array(z.string()).optional() });
+        const answer = z
+          .object({ data: missing.extend({ data: missing.optional() }) })
+          .safeParse(response);
+        return !(
+          answer.success &&
+          [
+            ...(answer.data.data.not_found ?? []),
+            ...(answer.data.data.data?.not_found ?? []),
+          ].includes(action)
+        );
+      },
       async execute(action, args, accountId, signal) {
         signal?.throwIfAborted();
         const toolkit = actionToolkit(action);
@@ -625,7 +661,11 @@ export function createComposioProvider(options: {
             signal,
             maxRetries: 0,
           } as Parameters<typeof value.execute>[3])
-          .catch((error: unknown) => {
+          .catch((wrapped: unknown) => {
+            const error =
+              !signal?.aborted && wrapped instanceof Error && wrapped.cause instanceof APIError
+                ? wrapped.cause
+                : wrapped;
             if (
               error instanceof APIError &&
               error.status === 403 &&
@@ -641,6 +681,13 @@ export function createComposioProvider(options: {
                 { status: 403 },
               );
             }
+            if (error instanceof APIError && error.status === 404)
+              throw Object.assign(
+                new Error(
+                  `The connection service answered ${action} with HTTP ${error.message}. If this action name did not come from SEARCH_TOOLS, find the exact name there before calling it again.`,
+                ),
+                { status: 404 },
+              );
             const kind = error instanceof Error ? error.constructor.name : '';
             const reason =
               kind === 'APIConnectionTimeoutError'
@@ -807,9 +854,12 @@ export function createComposioProvider(options: {
               throw transient;
             const attempt = 2 - retriesRemaining;
             retriesRemaining--;
-            await delay(350 * 2 ** attempt + Math.floor(Math.random() * 150), undefined, {
-              signal: operation,
-            });
+            await delay(
+              options.inboxRetryDelay?.(attempt) ??
+                350 * 2 ** attempt + Math.floor(Math.random() * 150),
+              undefined,
+              { signal: operation },
+            );
           }
         }
       }
@@ -1129,7 +1179,7 @@ export function createComposioProvider(options: {
     },
     async deleteAccount(id, ownerId) {
       if (ownerId) userId(ownerId);
-      if (options.proxy.isPendingAccount(id)) return;
+      if (options.proxy.isPendingAccount(id)) return options.proxy.finishPendingAccount(id);
       if (ownerId) await ownedAccount(id, ownerId, AbortSignal.timeout(10_000));
       await client.connectedAccounts.delete(id);
       for (const key of identities.keys()) if (JSON.parse(key)[1] === id) identities.delete(key);

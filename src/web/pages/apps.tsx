@@ -2,7 +2,7 @@ import { PageTitle } from '../components/page-title';
 import { useEffect, useId, useRef, useState } from 'react';
 import { flushSync } from 'react-dom';
 import { AlertCircle, ListFilter, MessageCircle, Plus, X } from '../components/icons';
-import type { AppSetupStatus, Configuration, Connection } from '../../shared/contracts';
+import type { Configuration, Connection } from '../../shared/contracts';
 import { SetupNotice } from '../components/setup-notice';
 import { ServiceLogo } from '../components/service-logo';
 import { AppConnectionDialog, type AppSignIn } from '../components/app-connection-dialog';
@@ -15,8 +15,9 @@ import { Tooltip } from '../components/tooltip';
 import { AppAccountManager } from '../components/app-account-manager';
 import { AppCardMenu, toolCountLabel, useMcpToolCounts } from '../components/app-card-menu';
 import { api, ApiError, errorMessage } from '../lib/api';
-import { connectionUrl, setupLinkHash } from '../lib/connection-url';
+import { connectionUrl, readSetup } from '../lib/connection-url';
 import { searchApps } from '../lib/app-search';
+import { navigate } from '../lib/navigation';
 import { desktopLinksAvailable, openConnection } from '../lib/desktop';
 import {
   connectionGroups,
@@ -104,6 +105,7 @@ export function Apps({
   const [error, setError] = useState('');
   const [announcement, setAnnouncement] = useState('');
   const [notice, setNotice] = useState('');
+  const [connectedApp, setConnectedApp] = useState('');
   const [busy, setBusy] = useState('');
   const [signIn, setSignIn] = useState<
     AppSignIn & {
@@ -120,6 +122,7 @@ export function Apps({
   const manualMcpOrigin = useRef<HTMLButtonElement | null>(null);
   const manualMcpAnalytics = useRef<ReturnType<typeof appConnectionAnalytics> | null>(null);
   function openManualMcp(trigger: HTMLButtonElement) {
+    setConnectedApp('');
     captureAnalytics('app_connect_clicked', { entry: 'apps', result: 'opened' });
     manualMcpAnalytics.current = appConnectionAnalytics('apps');
     manualMcpOrigin.current = trigger;
@@ -184,7 +187,7 @@ export function Apps({
     actionRequest.current?.abort();
     actionRequest.current = null;
     setBusy('');
-    if (signIn?.outcome === 'connected') setAnnouncement(`${signIn.name} connected.`);
+    if (signIn?.outcome === 'connected') setConnectedApp(signIn.name);
     setSignIn(undefined);
   }
   useEffect(() => {
@@ -227,7 +230,8 @@ export function Apps({
     let checking: Promise<boolean> | undefined;
     let poll: number | undefined;
     let pairingConfirmed = signIn.pairingConfirmed === true;
-    const settle = (outcome: NonNullable<AppSignIn['outcome']>) => {
+    let failed = false;
+    const settle = (outcome: NonNullable<AppSignIn['outcome']>, error?: string) => {
       if (controller.signal.aborted) return;
       controller.abort();
       if (outcome === 'connected') signIn.report();
@@ -238,23 +242,16 @@ export function Apps({
         current?.url === url &&
         current.service === signIn.service &&
         current.attempt === signIn.attempt
-          ? { ...current, outcome }
+          ? { ...current, outcome, ...(error ? { error } : {}) }
           : current,
       );
       void refresh();
     };
     const read = async () => {
       try {
-        const hash = await setupLinkHash(url);
-        const result = await api<AppSetupStatus>('/api/apps/setup-status', {
-          method: 'POST',
-          body: JSON.stringify({ hashes: [hash], pairingUrl: url }),
-          signal: AbortSignal.any([controller.signal, AbortSignal.timeout(10_000)]),
-          cache: 'no-store',
-        });
+        const { completed, app } = await readSetup(url, controller.signal);
         if (controller.signal.aborted) return false;
-        if (!result.completed.includes(hash)) {
-          const app = result.apps.find((app) => app.hash === hash);
+        if (!completed) {
           if (app && app.available !== false) {
             if (app.pairingConfirmed === true && !pairingConfirmed) {
               pairingConfirmed = true;
@@ -269,7 +266,7 @@ export function Apps({
             }
             return false;
           }
-          settle('unavailable');
+          settle(app?.error || failed ? 'failed' : 'unavailable', app?.error);
           return true;
         }
         settle('connected');
@@ -323,13 +320,12 @@ export function Apps({
           void check();
           return;
         }
-        settle(
-          event.data.connection === 'cancelled'
-            ? 'cancelled'
-            : event.data.connection === 'expired'
-              ? 'unavailable'
-              : 'failed',
-        );
+        if (event.data.connection === 'failed') {
+          failed = true;
+          void read().then((settled) => settled || settle('failed'));
+          return;
+        }
+        settle(event.data.connection === 'cancelled' ? 'cancelled' : 'unavailable');
       };
     return () => {
       controller.abort();
@@ -372,6 +368,7 @@ export function Apps({
     );
     setError('');
     setAnnouncement('');
+    setConnectedApp('');
     const context = {
       service: connection.slug,
       name: connection.name,
@@ -463,6 +460,7 @@ export function Apps({
   }
   async function disconnect(connection: Connection) {
     if (!connection.connectionId || actionRequest.current || busy) return;
+    setConnectedApp('');
     const capture = analyticsForCurrentSession();
     const request = new AbortController();
     actionRequest.current = request;
@@ -492,6 +490,23 @@ export function Apps({
       if (!request.signal.aborted) setBusy('');
     }
   }
+  async function rename(service: string, name: string) {
+    const renamed = await api<{ name: string }>(`/api/apps/mcp/${encodeURIComponent(service)}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ name }),
+      signal: AbortSignal.timeout(15000),
+    });
+    update(
+      (current) =>
+        current?.map((connection) =>
+          connection.slug === service && connection.canRename
+            ? { ...connection, name: renamed.name }
+            : connection,
+        ) ?? null,
+    );
+    void refresh();
+  }
+
   function restoreAppFocus() {
     const button = Array.from(
       page.current?.querySelectorAll<HTMLButtonElement>(
@@ -505,7 +520,7 @@ export function Apps({
     setPointerRestoredService(
       !manageKeyboard.current && button?.dataset.manageService ? dialogService.current : null,
     );
-    button?.focus({ preventScroll: true });
+    (button ?? appSearch.current)?.focus({ preventScroll: true });
   }
 
   function cards(items: typeof groups, catalogCards = false) {
@@ -568,7 +583,7 @@ export function Apps({
                         ? () => void connect(addAccount, 'apps', true)
                         : undefined
                     }
-                    onChanged={() => void refresh()}
+                    onRename={service.canRename ? (name) => rename(service.slug, name) : undefined}
                     onCounts={(counts) => setToolCounts((current) => ({ ...current, ...counts }))}
                     onResult={({ kind, text }) => {
                       setError(kind === 'error' ? text : '');
@@ -614,6 +629,23 @@ export function Apps({
         </Button>
       </header>
       {configuration && <SetupNotice configuration={configuration} />}
+      {connectedApp && (
+        <Notice kind="success" onDismiss={() => setConnectedApp('')}>
+          {connectedApp} connected.
+          <div className="notice-actions">
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => {
+                captureAnalytics('app_connection_chat_requested');
+                navigate('/');
+              }}
+            >
+              Open chat
+            </Button>
+          </div>
+        </Notice>
+      )}
       {error && <Notice onDismiss={() => setError('')}>{error}</Notice>}
       {notice && (
         <Notice kind="success" onDismiss={() => setNotice('')}>
@@ -851,6 +883,7 @@ export function Apps({
         onClose={() => setManageService(null)}
         onConnect={(account, addAccount) => void connect(account, 'manage', addAccount)}
         onDisconnect={disconnect}
+        onRename={managed?.service.canRename ? rename : undefined}
         onRestoreFocus={restoreAppFocus}
         onKeyboard={() => {
           manageKeyboard.current = true;
@@ -898,7 +931,7 @@ export function Apps({
           onConnected={(name) => {
             window.history.replaceState(null, '', '/apps');
             setDiscoveryId(null);
-            setAnnouncement(`${name} connected.`);
+            setConnectedApp(name);
             void refresh();
             void refreshCatalog();
           }}

@@ -90,7 +90,7 @@ export function AppCardMenu({
   onPointerReset,
   onManage,
   onAddAccount,
-  onChanged,
+  onRename,
   onCounts,
   onResult,
 }: {
@@ -104,13 +104,10 @@ export function AppCardMenu({
   onPointerReset(): void;
   onManage(event: MouseEvent<HTMLButtonElement>): void;
   onAddAccount?(): void;
-  onChanged(): void;
+  onRename?(name: string): Promise<void>;
   onCounts(counts: Record<string, number>): void;
   onResult(result: { kind: 'success' | 'error'; text: string }): void;
 }) {
-  const discovered = accounts.some((account) =>
-    account.accessPaths?.some((path) => path.kind !== 'browser'),
-  );
   const mcp = mcpAccounts(accounts).length > 0;
   const [refreshing, setRefreshing] = useState(false);
   const [renaming, setRenaming] = useState(false);
@@ -135,7 +132,8 @@ export function AppCardMenu({
       );
       onResult({ kind: 'success', text: summary(service.name, result) });
     } catch (cause) {
-      if (!controller.signal.aborted) onResult({ kind: 'error', text: errorMessage(cause) });
+      if (!controller.signal.aborted)
+        onResult({ kind: 'error', text: `${service.name}: ${errorMessage(cause)}` });
     } finally {
       if (request.current === controller) request.current = null;
       if (!controller.signal.aborted) setRefreshing(false);
@@ -144,29 +142,21 @@ export function AppCardMenu({
 
   async function rename(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (request.current) return;
     const name = String(new FormData(event.currentTarget).get('name') ?? '').trim();
     if (name === service.name) {
       setRenaming(false);
       return;
     }
-    const controller = new AbortController();
-    request.current = controller;
+    if (!onRename) return;
     setSaving(true);
     setRenameError('');
     try {
-      await api(`/api/fork/apps/mcp/${encodeURIComponent(service.slug)}`, {
-        method: 'PATCH',
-        body: JSON.stringify({ name }),
-        signal: controller.signal,
-      });
+      await onRename(name);
       setRenaming(false);
-      onChanged();
     } catch (cause) {
-      if (!controller.signal.aborted) setRenameError(errorMessage(cause));
+      setRenameError(errorMessage(cause));
     } finally {
-      if (request.current === controller) request.current = null;
-      if (!controller.signal.aborted) setSaving(false);
+      setSaving(false);
     }
   }
 
@@ -224,7 +214,7 @@ export function AppCardMenu({
                 Refresh tools
               </ActionMenuItem>
             )}
-            {discovered && (
+            {onRename && (
               <ActionMenuItem
                 onClick={() => {
                   close();
@@ -276,9 +266,7 @@ export function AppCardMenu({
                 name="name"
                 defaultValue={service.name}
                 required
-                minLength={2}
                 maxLength={80}
-                pattern="[A-Za-z0-9][A-Za-z0-9 .&amp;'_\-]{1,79}"
                 disabled={saving}
                 autoFocus
               />
