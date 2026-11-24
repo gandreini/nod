@@ -51,12 +51,14 @@ function Chip({
   label,
   onPress,
   disabled,
+  filled,
   children,
 }: {
   label: string;
   onPress(): void;
   disabled?: boolean;
-  children: ReactNode;
+  filled?: boolean;
+  children: ReactNode | ((pressed: boolean) => ReactNode);
 }) {
   const theme = useTheme();
   return (
@@ -68,10 +70,12 @@ function Chip({
       accessibilityLabel={label}
       style={({ pressed }) => [
         styles.chip,
-        { backgroundColor: pressed ? theme.controlActive : theme.control },
+        {
+          backgroundColor: pressed ? theme.controlActive : filled ? theme.control : 'transparent',
+        },
       ]}
     >
-      {children}
+      {({ pressed }) => (typeof children === 'function' ? children(pressed) : children)}
     </Pressable>
   );
 }
@@ -145,11 +149,22 @@ function AppRow({
             disabled={busy}
             onPress={onManage}
           >
-            <Users size={16} color={theme.foreground} />
-            <Text style={[text.label, { color: theme.foreground }]}>
-              {count > 99 ? '99+' : count}
-            </Text>
-            {issue ? <View style={[styles.dot, { backgroundColor: theme.accent }]} /> : null}
+            {(pressed) => (
+              <>
+                <Users size={16} color={theme.foreground} />
+                <View style={styles.count}>
+                  <Text style={[text.label, { color: theme.foreground, opacity: pressed ? 0 : 1 }]}>
+                    {count > 99 ? '99+' : count}
+                  </Text>
+                  {pressed ? (
+                    <View style={styles.plus}>
+                      <Plus size={16} color={theme.foreground} />
+                    </View>
+                  ) : null}
+                </View>
+                {issue ? <View style={[styles.dot, { backgroundColor: theme.accent }]} /> : null}
+              </>
+            )}
           </Chip>
           <Chip label={`${service.name} options`} disabled={busy} onPress={onMore}>
             {busy ? (
@@ -160,7 +175,7 @@ function AppRow({
           </Chip>
         </View>
       ) : (
-        <Chip label={`Connect ${service.name}`} disabled={busy} onPress={onConnect}>
+        <Chip label={`Connect ${service.name}`} disabled={busy} filled onPress={onConnect}>
           <Text style={[text.label, { color: theme.foreground }]}>Connect</Text>
         </Chip>
       )}
@@ -473,6 +488,8 @@ const styles = StyleSheet.create({
     borderRadius: radius.full,
   },
   dot: { position: 'absolute', top: 5, right: 5, width: 6, height: 6, borderRadius: 3 },
+  count: { minWidth: 16, alignItems: 'center', justifyContent: 'center' },
+  plus: { ...StyleSheet.absoluteFill, alignItems: 'center', justifyContent: 'center' },
   search: {
     flexDirection: 'row',
     alignItems: 'center',
