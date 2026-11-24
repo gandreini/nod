@@ -187,10 +187,15 @@ export function createComposioProxy(options: {
     disableVersionCheck: true,
     fileUploadDirs: false,
   });
+  const verbs = ['get', 'post', 'patch', 'put', 'delete'] as const;
   function signedClient<TClient extends ComposioClient>(raw: TClient): TClient {
     const derive = raw.withOptions.bind(raw);
     raw.withOptions = (value) => signedClient(derive({ ...value, maxRetries: 0 }));
-    raw.request = <T>(value: Parameters<ComposioClient['request']>[0]) => {
+    const send = <T>(
+      verb: (typeof verbs)[number],
+      path: string,
+      value: Parameters<ComposioClient['post']>[1] = {},
+    ) => {
       const signal = value.signal;
       const controller = new AbortController();
       const abort = () => controller.abort(new APIUserAbortError());
@@ -238,7 +243,7 @@ export function createComposioProxy(options: {
                     signal: AbortSignal.any([input.signal, controller.signal]),
                   }),
               },
-            }).request<T>({ ...value, signal: controller.signal, maxRetries: 0 });
+            })[verb]<T>(path, { ...value, signal: controller.signal, maxRetries: 0 });
             resolve(operation.asResponse());
           } catch (error) {
             reject(error);
@@ -266,13 +271,14 @@ export function createComposioProxy(options: {
         }
       });
     };
+    for (const verb of verbs) raw[verb] = (path, value) => send(verb, path, value);
     return raw;
   }
   signedClient(client.getClient());
   async function rpc(
     path: string,
     body: unknown,
-    options: { signal?: AbortSignal; timeout?: number; failure?: string } = {},
+    options: { signal?: AbortSignal; timeout?: number } = {},
   ) {
     const timeout = AbortSignal.timeout(options.timeout ?? 30_000);
     const signal = options.signal ? AbortSignal.any([options.signal, timeout]) : timeout;
@@ -284,16 +290,13 @@ export function createComposioProxy(options: {
       signal,
     });
     if (!response.ok) {
-      if (options.failure) {
-        await response.body?.cancel();
-        throw new Error(options.failure);
-      }
       const refusal = await read(response, signal)
         .then((text) => JSON.parse(text) as unknown)
         .catch(() => {
           signal.throwIfAborted();
           return undefined;
         });
+      refused({ status: response.status, error: refusal });
       throw new IntegrationConnectionError(
         connectionReason(response.status, false, false) ?? 'unavailable',
         'link',
@@ -404,11 +407,7 @@ export function createComposioProxy(options: {
               mimeType: file.mimeType,
               data: Buffer.from(file.bytes).toString('base64'),
             },
-            {
-              signal,
-              timeout: 210_000,
-              failure: 'The file could not be uploaded for this app.',
-            },
+            { signal, timeout: 210_000 },
           ),
         );
       signal?.throwIfAborted();
@@ -531,6 +530,7 @@ export function createComposioProxy(options: {
         .parse(query);
       if (!pending?.verificationSecret || pending.accountId !== `${pendingPrefix}${input.state}`)
         throw new Error('This integration connection attempt is unavailable.');
+      options.browser?.finish(input.state);
       const result = z
         .object({
           connectedAccountId: z.string().regex(/^[A-Za-z0-9_-]{1,200}$/),
@@ -546,7 +546,6 @@ export function createComposioProxy(options: {
         );
       if (result.toolkit !== pending.service)
         throw new Error('The connected integration does not match this attempt.');
-      options.browser?.finish(input.state);
       return {
         state: input.state,
         accountId: result.connectedAccountId,
@@ -555,5 +554,8 @@ export function createComposioProxy(options: {
       };
     },
     isPendingAccount: (id: string) => id.startsWith(pendingPrefix),
+    finishPendingAccount(id: string) {
+      if (id.startsWith(pendingPrefix)) options.browser?.finish(id.slice(pendingPrefix.length));
+    },
   };
 }

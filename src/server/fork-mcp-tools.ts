@@ -1,9 +1,8 @@
 import type { FastifyInstance } from 'fastify';
 import type { Pool } from 'pg';
-import { z } from 'zod';
-import type { DiscoveredCatalog, DiscoveredOAuthState } from '../ports/discovered.ts';
+import type { z } from 'zod';
+import type { DiscoveredCatalog } from '../ports/discovered.ts';
 import type { AccountRow } from './discovered-connections.ts';
-import type { createAppGrantVault } from './vault-app-grants.ts';
 
 type McpPath = Extract<AccountRow['paths'][number], { kind: 'mcp' }>;
 type CatalogEntry = { at: number; value: Promise<DiscoveredCatalog>; ready?: DiscoveredCatalog };
@@ -13,7 +12,6 @@ export function registerForkMcpRoutes(
   options: {
     pool: Pool;
     owner: string;
-    grantVault: Awaited<ReturnType<typeof createAppGrantVault>>;
     catalogs: Map<string, CatalogEntry>;
     catalog(
       row: AccountRow,
@@ -21,9 +19,7 @@ export function registerForkMcpRoutes(
       signal?: AbortSignal,
       allowStale?: boolean,
     ): Promise<DiscoveredCatalog>;
-    refresh?: () => void;
-    schema: { service: z.ZodType<string>; name: z.ZodType<string> };
-    redact(value: unknown, token: string): unknown;
+    schema: { service: z.ZodType<string> };
     error(message: string, statusCode?: number): Error;
   },
 ) {
@@ -42,19 +38,6 @@ export function registerForkMcpRoutes(
     ).rows;
     if (!rows.length) throw error('This connected service is unavailable.', 404);
     return rows;
-  }
-
-  async function secrets(row: AccountRow) {
-    const secret = await options.grantVault
-      .read(row.id)
-      .then((grant) => grant.value)
-      .catch(() => '');
-    const found = [secret];
-    try {
-      const token = (JSON.parse(secret) as DiscoveredOAuthState).tokens?.access_token;
-      if (token) found.push(token);
-    } catch {}
-    return found.filter(Boolean);
   }
 
   async function toolCounts() {
@@ -83,20 +66,15 @@ export function registerForkMcpRoutes(
     if (!found.length) throw error('This service has no connected MCP server to refresh.', 409);
     const results = await Promise.all(
       found.map(async ({ row, path }) => {
-        const key = `${row.id}:${path.id}:${row.account_id}`;
+        const key = JSON.stringify([row.id, row.account_id, path]);
         const previous = catalogs.get(key);
         const before = previous?.ready?.tools.map((tool) => tool.name);
         catalogs.delete(key);
         const tools = await catalog(row, path, signal).then(
           (listed) => listed.tools,
-          async (cause: unknown) => {
+          (cause: unknown) => {
             if (previous && !catalogs.has(key)) catalogs.set(key, previous);
-            if (cause && typeof cause === 'object' && 'statusCode' in cause) throw cause;
-            const message = (await secrets(row)).reduce<unknown>(
-              (text, value) => options.redact(text, value),
-              cause instanceof Error ? cause.message : String(cause),
-            );
-            throw error(`Couldn't read the tools from ${row.name}: ${String(message)}`, 502);
+            throw cause;
           },
         );
         const names = tools.map((tool) => tool.name);
@@ -115,22 +93,6 @@ export function registerForkMcpRoutes(
     return { results };
   }
 
-  async function rename(service: string, name: string) {
-    await serviceRows(service);
-    const parsed = options.schema.name.safeParse(name);
-    if (!parsed.success)
-      throw error(
-        "Use 2 to 80 letters, digits, spaces or . & ' _ -, starting with a letter or digit.",
-      );
-    await pool.query('UPDATE discovered_connections SET name=$3 WHERE owner_id=$1 AND service=$2', [
-      owner,
-      service,
-      parsed.data,
-    ]);
-    options.refresh?.();
-    return { name: parsed.data };
-  }
-
   app.get('/api/fork/apps/mcp/tools', async (_request, reply) =>
     reply.header('Cache-Control', 'no-store').send({ counts: await toolCounts() }),
   );
@@ -143,15 +105,6 @@ export function registerForkMcpRoutes(
       return reply
         .header('Cache-Control', 'no-store')
         .send(await refreshTools(request.params.service, signal));
-    },
-  );
-  app.patch<{ Params: { service: string } }>(
-    '/api/fork/apps/mcp/:service',
-    async (request, reply) => {
-      const { name } = z.object({ name: z.string() }).strict().parse(request.body);
-      return reply
-        .header('Cache-Control', 'no-store')
-        .send(await rename(request.params.service, name));
     },
   );
 }
