@@ -1,4 +1,4 @@
-import { Fragment, memo, useMemo, type ReactNode } from 'react';
+import { Fragment, memo, useEffect, useMemo, useState, type ReactNode } from 'react';
 import {
   Alert,
   Image,
@@ -10,6 +10,7 @@ import {
   type TextStyle,
   type ViewStyle,
 } from 'react-native';
+import { setStringAsync } from 'expo-clipboard';
 import { Renderer, useMarkdown } from 'react-native-marked';
 import { artifactSource, errorText, request } from '../connection/api';
 import type { Connection } from '../connection/connection';
@@ -17,7 +18,7 @@ import type { Artifact } from '../connection/contracts';
 import { useFileViewer } from '../files/file-viewer-context';
 import { imageArtifact, safeLink } from '../connection/links';
 import { useNodBase } from '../connection/nod-context';
-import { ScrollFade } from '../ui/scroll-fade';
+import { Check, Copy } from '../ui/icons';
 import { font, radius, type Theme } from '../ui/theme';
 
 function open(connection: Connection, href: string, show: (file: Artifact) => void) {
@@ -31,6 +32,55 @@ function open(connection: Connection, href: string, show: (file: Artifact) => vo
   void Linking.openURL(link.url).catch(fail);
 }
 
+function CodeBlock({
+  text,
+  theme,
+  containerStyle,
+  textStyle,
+}: {
+  text: string;
+  theme: Theme;
+  containerStyle?: ViewStyle;
+  textStyle?: TextStyle;
+}) {
+  const [copied, setCopied] = useState(false);
+  useEffect(() => {
+    if (!copied) return;
+    const timer = setTimeout(() => setCopied(false), 1500);
+    return () => clearTimeout(timer);
+  }, [copied]);
+  const copy = () =>
+    void setStringAsync(text)
+      .then(() => setCopied(true))
+      .catch((problem: unknown) => Alert.alert('Could not copy the code', errorText(problem)));
+  const Icon = copied ? Check : Copy;
+  return (
+    <View style={containerStyle}>
+      <Text selectable style={[textStyle, { paddingLeft: 16, paddingRight: 48 }]}>
+        {text}
+      </Text>
+      <Pressable
+        onPress={copy}
+        accessibilityRole="button"
+        accessibilityLabel={copied ? 'Copied' : 'Copy code'}
+        style={({ pressed }) => ({
+          position: 'absolute',
+          top: 0,
+          right: 0,
+          width: 44,
+          height: 46,
+          alignItems: 'center',
+          justifyContent: 'center',
+          backgroundColor: theme.inset,
+          opacity: pressed ? 0.6 : 1,
+        })}
+      >
+        <Icon size={16} color={copied ? theme.foreground : theme.mutedForeground} />
+      </Pressable>
+    </View>
+  );
+}
+
 class NodRenderer extends Renderer {
   constructor(
     private connection: Connection,
@@ -42,16 +92,13 @@ class NodRenderer extends Renderer {
 
   code(text: string, _language?: string, containerStyle?: ViewStyle, textStyle?: TextStyle) {
     return (
-      <ScrollFade
+      <CodeBlock
         key={this.getKey()}
-        color={this.theme.inset}
-        style={containerStyle}
-        contentContainerStyle={{ paddingHorizontal: 16 }}
-      >
-        <Text selectable style={textStyle}>
-          {text}
-        </Text>
-      </ScrollFade>
+        text={text}
+        theme={this.theme}
+        containerStyle={containerStyle}
+        textStyle={textStyle}
+      />
     );
   }
 

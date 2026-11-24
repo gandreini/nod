@@ -52,6 +52,7 @@ export const CircleCheck = n8n('check-circle');
 export const CircleSlash = n8n('slash-circle');
 export const Clock = n8n('clock');
 export const CodeXml = n8n('brackets-curly');
+export const Copy = n8n('copy');
 export const Ellipsis = n8n('dots-horizontal');
 export const ExternalLink = n8n('arrow-square-out');
 export const Eye = n8n('eyes');
