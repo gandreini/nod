@@ -169,6 +169,26 @@ export function AppCardMenu({
       >
         {(close) => (
           <>
+            {onAddAccount && (
+              <ActionMenuItem
+                onClick={() => {
+                  close();
+                  onAddAccount();
+                }}
+              >
+                <Plus size={16} aria-hidden="true" />
+                Add account
+              </ActionMenuItem>
+            )}
+            <ActionMenuItem
+              onClick={(event) => {
+                close();
+                onManage(event);
+              }}
+            >
+              <Users size={16} aria-hidden="true" />
+              Manage accounts
+            </ActionMenuItem>
             {mcp && (
               <ActionMenuItem
                 disabled={refreshing}
@@ -191,26 +211,6 @@ export function AppCardMenu({
               >
                 <Pencil size={16} aria-hidden="true" />
                 Rename
-              </ActionMenuItem>
-            )}
-            <ActionMenuItem
-              onClick={(event) => {
-                close();
-                onManage(event);
-              }}
-            >
-              <Users size={16} aria-hidden="true" />
-              Manage accounts
-            </ActionMenuItem>
-            {onAddAccount && (
-              <ActionMenuItem
-                onClick={() => {
-                  close();
-                  onAddAccount();
-                }}
-              >
-                <Plus size={16} aria-hidden="true" />
-                Add account
               </ActionMenuItem>
             )}
           </>
