@@ -533,9 +533,7 @@ export function Apps({
               className="app-card"
               name={service.name}
               logo={<ServiceLogo {...service} />}
-              description={[service.description, toolCountLabel(accounts, toolCounts)]
-                .filter(Boolean)
-                .join(' · ')}
+              description={service.description}
               badge={
                 service.status === 'not_configured' && (
                   <Tooltip content="Sign-in unavailable">
@@ -549,6 +547,7 @@ export function Apps({
                 accounts.length ? (
                   <AppCardMenu
                     service={service}
+                    tools={toolCountLabel(accounts, toolCounts)}
                     accounts={accounts}
                     serviceKey={key}
                     issue={issue}
