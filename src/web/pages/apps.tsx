@@ -1,7 +1,7 @@
 import { PageTitle } from '../components/page-title';
 import { useEffect, useId, useRef, useState } from 'react';
 import { flushSync } from 'react-dom';
-import { AlertCircle, ListFilter, MessageCircle, Plus, Users, X } from '../components/icons';
+import { AlertCircle, ListFilter, MessageCircle, Plus, X } from '../components/icons';
 import type { AppSetupStatus, Configuration, Connection } from '../../shared/contracts';
 import { SetupNotice } from '../components/setup-notice';
 import { ServiceLogo } from '../components/service-logo';
@@ -13,6 +13,7 @@ import { SearchPicker } from '../components/search-picker';
 import { Tabs } from '../components/tabs';
 import { Tooltip } from '../components/tooltip';
 import { AppAccountManager } from '../components/app-account-manager';
+import { AppCardMenu, toolCountLabel, useMcpToolCounts } from '../components/app-card-menu';
 import { api, ApiError, errorMessage } from '../lib/api';
 import { connectionUrl, setupLinkHash } from '../lib/connection-url';
 import { searchApps } from '../lib/app-search';
@@ -72,6 +73,7 @@ export function Apps({
     refresh,
     update,
   } = usePageData<Connection[]>('/api/apps');
+  const [toolCounts, setToolCounts] = useMcpToolCounts(connections);
   const {
     data: catalog,
     error: catalogError,
@@ -101,6 +103,7 @@ export function Apps({
   const [visibleCount, setVisibleCount] = useState(24);
   const [error, setError] = useState('');
   const [announcement, setAnnouncement] = useState('');
+  const [notice, setNotice] = useState('');
   const [busy, setBusy] = useState('');
   const [signIn, setSignIn] = useState<
     AppSignIn & {
@@ -523,10 +526,6 @@ export function Apps({
             (account) =>
               !(usableNotion && account.slug === 'notion_mcp') && connectionIssue(account),
           );
-          const connectLabel =
-            service.slug === 'notion' && !usableNotion
-              ? `Connect ${service.name}`
-              : `Connect another ${service.name} account`;
           return (
             <IntegrationCard
               key={key}
@@ -534,7 +533,9 @@ export function Apps({
               className="app-card"
               name={service.name}
               logo={<ServiceLogo {...service} />}
-              description={service.description}
+              description={[service.description, toolCountLabel(accounts, toolCounts)]
+                .filter(Boolean)
+                .join(' · ')}
               badge={
                 service.status === 'not_configured' && (
                   <Tooltip content="Sign-in unavailable">
@@ -546,44 +547,35 @@ export function Apps({
               }
               actions={
                 accounts.length ? (
-                  <>
-                    <Button
-                      variant="ghost"
-                      size="icon"
-                      className="app-manage"
-                      data-manage-service={key}
-                      data-pointer-restored={pointerRestoredService === key || undefined}
-                      aria-label={`Manage ${service.name} accounts (${accounts.length})${issue ? ', sign-in required' : ''}`}
-                      title={`${accounts.length} ${accounts.length === 1 ? 'account' : 'accounts'}${issue ? ' · Sign-in required' : ''} · Manage accounts`}
-                      onKeyDown={() => setPointerRestoredService(null)}
-                      onBlur={() => setPointerRestoredService(null)}
-                      onClick={(event) => {
-                        dialogService.current = key;
-                        manageKeyboard.current = event.detail === 0;
-                        setPointerRestoredService(null);
-                        setError('');
-                        setManageService(key);
-                      }}
-                    >
-                      <Users size={16} aria-hidden="true" />
-                      <span className="app-account-count" aria-hidden="true">
-                        {accounts.length > 99 ? '99+' : accounts.length}
-                      </span>
-                      {issue && <span className="app-account-attention" aria-hidden="true" />}
-                    </Button>
-                    {!addAccount.browserUrl && !addAccount.savedLogin && (
-                      <Button
-                        variant="outline"
-                        size="icon"
-                        aria-label={connectLabel}
-                        title={connectLabel}
-                        disabled={locked || addAccount.status === 'not_configured'}
-                        onClick={() => void connect(addAccount, 'apps', true)}
-                      >
-                        <Plus size={16} aria-hidden="true" />
-                      </Button>
-                    )}
-                  </>
+                  <AppCardMenu
+                    service={service}
+                    accounts={accounts}
+                    serviceKey={key}
+                    issue={issue}
+                    locked={locked}
+                    pointerRestored={pointerRestoredService === key}
+                    onPointerReset={() => setPointerRestoredService(null)}
+                    onManage={(event) => {
+                      dialogService.current = key;
+                      manageKeyboard.current = event.detail === 0;
+                      setPointerRestoredService(null);
+                      setError('');
+                      setManageService(key);
+                    }}
+                    onAddAccount={
+                      !addAccount.browserUrl &&
+                      !addAccount.savedLogin &&
+                      addAccount.status !== 'not_configured'
+                        ? () => void connect(addAccount, 'apps', true)
+                        : undefined
+                    }
+                    onChanged={() => void refresh()}
+                    onCounts={(counts) => setToolCounts((current) => ({ ...current, ...counts }))}
+                    onResult={({ kind, text }) => {
+                      setError(kind === 'error' ? text : '');
+                      setNotice(kind === 'success' ? text : '');
+                    }}
+                  />
                 ) : (
                   <Button
                     variant="outline"
@@ -624,6 +616,11 @@ export function Apps({
       </header>
       {configuration && <SetupNotice configuration={configuration} />}
       {error && <Notice onDismiss={() => setError('')}>{error}</Notice>}
+      {notice && (
+        <Notice kind="success" onDismiss={() => setNotice('')}>
+          {notice}
+        </Notice>
+      )}
       {loadError && (
         <Notice>
           {loadError}{' '}

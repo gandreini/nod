@@ -12547,3 +12547,134 @@ test(
     assert.equal((await f.service.activitySources()).length, 0);
   },
 );
+
+test(
+  'connected MCP tool refresh and rename stay inside the owner and never show the token',
+  { skip: !process.env.TEST_DATABASE_URL },
+  async (t) => {
+    const schema = `test_discovered_manage_${randomUUID().replaceAll('-', '')}`;
+    const admin = new pg.Pool({ connectionString: process.env.TEST_DATABASE_URL });
+    await admin.query(`CREATE SCHEMA ${schema}`);
+    const pool = new pg.Pool({
+      connectionString: process.env.TEST_DATABASE_URL,
+      options: `-c search_path=${schema}`,
+    });
+    t.after(async () => {
+      await pool.end();
+      await admin.query(`DROP SCHEMA ${schema} CASCADE`);
+      await admin.end();
+    });
+    const token = 'synthetic-manage-token';
+    let tools = [{ name: 'first', inputSchema: { type: 'object' } }];
+    let failure: string | undefined;
+    const transport = {
+      validateEndpoint: async (endpoint: string) => endpoint,
+      http: async () => ({ status: 200, body: {} }),
+      listTools: async () => {
+        if (failure) throw new Error(failure);
+        return { tools };
+      },
+      callTool: async () => ({}),
+    };
+    const setup = async (ownerId: string) => {
+      const keyStore = {
+        id: 'fixture',
+        configured: true,
+        getKey: async () => Buffer.alloc(32, 7),
+      };
+      const grantVault = await createAppGrantVault(pool, { ownerId, keyStore });
+      const discovered = await createDiscoveredConnections(pool, {
+        ownerId,
+        baseUrl: 'http://localhost:4310',
+        grantVault,
+        transport,
+        oauth: {} as Parameters<typeof createDiscoveredConnections>[1]['oauth'],
+      });
+      const connectionId = randomUUID();
+      await pool.query(
+        'INSERT INTO discovered_connections(id,owner_id,service,name,account_name,paths) VALUES($1,$2,$3,$4,$5,$6)',
+        [
+          connectionId,
+          ownerId,
+          'fixture-mcp',
+          'Fixture MCP',
+          'Synthetic account',
+          JSON.stringify([
+            {
+              id: randomUUID(),
+              kind: 'mcp',
+              endpoint: 'https://fixture.example/mcp',
+              auth: 'bearer',
+            },
+          ]),
+        ],
+      );
+      await grantVault.put(connectionId, token);
+      const app = Fastify();
+      t.after(() => app.close());
+      discovered.registerRoutes(app);
+      return { connectionId, app };
+    };
+    const own = await setup('fixture-owner');
+    const foreign = await setup('foreign-owner');
+    const counts = await own.app.inject('/api/fork/apps/mcp/tools');
+    assert.deepEqual(counts.json(), { counts: [{ connectionId: own.connectionId, tools: 1 }] });
+
+    tools = [
+      { name: 'first', inputSchema: { type: 'object' } },
+      { name: 'second', inputSchema: { type: 'object' } },
+    ];
+    const refreshed = await own.app.inject({
+      method: 'POST',
+      url: '/api/fork/apps/mcp/fixture-mcp/refresh',
+    });
+    assert.equal(refreshed.statusCode, 200, refreshed.body);
+    assert.deepEqual(refreshed.json().results, [
+      { connectionId: own.connectionId, tools: 2, added: ['second'], removed: [] },
+    ]);
+    assert.deepEqual((await foreign.app.inject('/api/fork/apps/mcp/tools')).json(), {
+      counts: [{ connectionId: foreign.connectionId, tools: 2 }],
+    });
+
+    failure = `upstream rejected ${token}`;
+    const failed = await own.app.inject({
+      method: 'POST',
+      url: '/api/fork/apps/mcp/fixture-mcp/refresh',
+    });
+    assert.equal(failed.statusCode, 502);
+    assert.match(
+      failed.json().message,
+      /Couldn't read the tools from Fixture MCP: upstream rejected \[redacted\]/,
+    );
+    assert.ok(!failed.body.includes(token));
+    failure = undefined;
+    assert.deepEqual((await own.app.inject('/api/fork/apps/mcp/tools')).json(), {
+      counts: [{ connectionId: own.connectionId, tools: 2 }],
+    });
+
+    const renamed = await own.app.inject({
+      method: 'PATCH',
+      url: '/api/fork/apps/mcp/fixture-mcp',
+      payload: { name: 'Renamed MCP' },
+    });
+    assert.equal(renamed.statusCode, 200, renamed.body);
+    const names = await pool.query<{ owner_id: string; name: string }>(
+      'SELECT owner_id,name FROM discovered_connections ORDER BY owner_id',
+    );
+    assert.deepEqual(names.rows, [
+      { owner_id: 'fixture-owner', name: 'Renamed MCP' },
+      { owner_id: 'foreign-owner', name: 'Fixture MCP' },
+    ]);
+    const invalid = await own.app.inject({
+      method: 'PATCH',
+      url: '/api/fork/apps/mcp/fixture-mcp',
+      payload: { name: '!' },
+    });
+    assert.equal(invalid.statusCode, 400);
+    const missing = await own.app.inject({
+      method: 'POST',
+      url: '/api/fork/apps/mcp/other-service/refresh',
+    });
+    assert.equal(missing.statusCode, 404);
+  },
+);

@@ -1,0 +1,21 @@
+.apps-page .integration-card-actions .app-card-menu-trigger {
+  position: relative;
+}
+.app-card-menu.action-menu-surface {
+  min-width: 194px;
+}
+.app-rename-dialog {
+  width: min(440px, calc(100vw - 32px));
+}
+.app-rename-dialog form {
+  display: grid;
+  gap: 16px;
+  margin-top: 24px;
+}
+.app-rename-dialog .input {
+  min-width: 0;
+  min-height: 44px;
+}
+.apps-page .app-card-menu-trigger[data-pointer-restored]:focus {
+  outline: none;
+}
