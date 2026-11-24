@@ -30,3 +30,8 @@
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
 }
+.app-account-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}

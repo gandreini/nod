@@ -173,6 +173,16 @@ export function AppCardMenu({
   const label = `${service.name} options${issue ? ', sign-in required' : ''}`;
   return (
     <>
+      {accounts.length > 1 && (
+        <span
+          className="app-tool-count app-account-pill"
+          title={`${accounts.length} accounts`}
+          aria-label={`${accounts.length} accounts`}
+        >
+          <Users size={12} aria-hidden="true" />
+          {accounts.length > 99 ? '99+' : accounts.length}
+        </span>
+      )}
       {tools && <span className="app-tool-count">{tools}</span>}
       <ActionMenu
         label={label}
