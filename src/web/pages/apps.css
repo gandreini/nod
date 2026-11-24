@@ -139,6 +139,7 @@
 .app-card-attention {
   display: inline-flex;
   flex: none;
+  align-self: center;
   color: var(--muted-foreground);
 }
 .apps-page .app-manage[data-pointer-restored]:focus {
