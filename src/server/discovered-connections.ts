@@ -18,6 +18,7 @@ import { transaction } from './transaction.ts';
 import type { createAppGrantVault } from './vault-app-grants.ts';
 import type { TurnRef } from './thread.ts';
 import { isIntegrationFile } from './integration-files.ts';
+import { registerForkMcpRoutes } from './fork-mcp-tools.ts';
 import type { AnalyticsEvent, CaptureAnalytics } from './analytics.ts';
 import {
   captureConnection,
@@ -108,7 +109,7 @@ const proposalSchema = z.object({
   connectionId: z.uuid().optional(),
 });
 type AccessPath = z.infer<typeof pathSchema> & { id: string; local?: boolean };
-type AccountRow = {
+export type AccountRow = {
   id: string;
   owner_id: string;
   service: string;
@@ -1458,6 +1459,17 @@ export async function createDiscoveredConnections(
     return rows.rows.flatMap((row) => row.paths.map(connection));
   }
   function registerRoutes(app: FastifyInstance) {
+    registerForkMcpRoutes(app, {
+      pool,
+      owner,
+      grantVault: options.grantVault,
+      catalogs,
+      catalog,
+      refresh: options.refresh,
+      schema: proposalSchema.shape,
+      redact,
+      error,
+    });
     app.post('/api/apps/mcp', async (request, reply) => {
       const parsed = z
         .object({
