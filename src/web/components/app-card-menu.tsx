@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, type FormEvent, type MouseEvent } from 'react';
 import type { Connection } from '../../shared/contracts';
 import { api, errorMessage } from '../lib/api';
+import { mcpAccounts, refreshSummary, type Refreshed } from '../lib/app-tools';
 import { ActionMenu, ActionMenuItem } from './action-menu';
 import { Ellipsis, LoaderCircle, Pencil, Plus, RefreshCw, Users } from './icons';
 import {
@@ -14,14 +15,6 @@ import {
   Notice,
 } from './ui';
 import './app-card-menu.css';
-
-type Refreshed = {
-  results: Array<{ connectionId: string; tools: number; added?: string[]; removed?: string[] }>;
-};
-
-export function mcpAccounts(accounts: Connection[]) {
-  return accounts.filter((account) => account.accessPaths?.some((path) => path.kind === 'mcp'));
-}
 
 export function useMcpToolCounts(apps: Connection[] | null | undefined) {
   const [counts, setCounts] = useState<Record<string, number>>({});
@@ -49,39 +42,8 @@ export function useMcpToolCounts(apps: Connection[] | null | undefined) {
   return [counts, setCounts] as const;
 }
 
-export function toolCountLabel(accounts: Connection[], counts: Record<string, number>) {
-  const count = mcpAccounts(accounts)
-    .map((account) => counts[account.connectionId ?? ''])
-    .find((value) => value !== undefined);
-  return count === undefined ? undefined : `${count} ${count === 1 ? 'tool' : 'tools'}`;
-}
-
-function names(list: string[]) {
-  return list.length > 5
-    ? `${list.slice(0, 5).join(', ')} and ${list.length - 5} more`
-    : list.join(', ');
-}
-
-function summary(name: string, { results }: Refreshed) {
-  const [first] = results;
-  if (!first) return `${name}: no tools found.`;
-  const added = results.flatMap((result) => result.added ?? []);
-  const removed = results.flatMap((result) => result.removed ?? []);
-  const known = results.some((result) => result.added);
-  const changes = [
-    added.length ? `New: ${names(added)}.` : '',
-    removed.length ? `Removed: ${names(removed)}.` : '',
-  ]
-    .filter(Boolean)
-    .join(' ');
-  return `${name}: ${first.tools} ${first.tools === 1 ? 'tool' : 'tools'}. ${
-    changes || (known ? 'No changes.' : 'Nod will use this list from your next message.')
-  }`;
-}
-
 export function AppCardMenu({
   service,
-  tools,
   accounts,
   serviceKey,
   issue,
@@ -95,7 +57,6 @@ export function AppCardMenu({
   onResult,
 }: {
   service: Connection;
-  tools?: string;
   accounts: Connection[];
   serviceKey: string;
   issue: boolean;
@@ -130,7 +91,7 @@ export function AppCardMenu({
       onCounts(
         Object.fromEntries(result.results.map((entry) => [entry.connectionId, entry.tools])),
       );
-      onResult({ kind: 'success', text: summary(service.name, result) });
+      onResult({ kind: 'success', text: refreshSummary(service.name, result) });
     } catch (cause) {
       if (!controller.signal.aborted)
         onResult({ kind: 'error', text: `${service.name}: ${errorMessage(cause)}` });
@@ -160,20 +121,28 @@ export function AppCardMenu({
     }
   }
 
-  const label = `${service.name} options${issue ? ', sign-in required' : ''}`;
+  const label = `${service.name} options`;
   return (
     <>
-      {accounts.length > 1 && (
-        <span
-          className="app-tool-count app-account-pill"
-          title={`${accounts.length} accounts`}
-          aria-label={`${accounts.length} accounts`}
-        >
-          <Users size={12} aria-hidden="true" />
+      <Button
+        variant="outline"
+        size="sm"
+        className="app-manage"
+        data-manage-service={serviceKey}
+        data-pointer-restored={pointerRestored || undefined}
+        aria-label={`Manage ${service.name} accounts (${accounts.length})${issue ? ', sign-in required' : ''}`}
+        title={`${accounts.length} ${accounts.length === 1 ? 'account' : 'accounts'}${issue ? ' · Sign-in required' : ''} · Manage accounts`}
+        disabled={locked}
+        onKeyDown={onPointerReset}
+        onBlur={onPointerReset}
+        onClick={onManage}
+      >
+        <Users size={16} aria-hidden="true" />
+        <span className="app-account-count" aria-hidden="true">
           {accounts.length > 99 ? '99+' : accounts.length}
         </span>
-      )}
-      {tools && <span className="app-tool-count">{tools}</span>}
+        {issue && <span className="app-account-attention" aria-hidden="true" />}
+      </Button>
       <ActionMenu
         label={label}
         disabled={locked}
@@ -181,14 +150,10 @@ export function AppCardMenu({
         trigger={
           <Button
             ref={trigger}
-            variant="ghost"
+            variant="outline"
             size="icon"
             className="app-card-menu-trigger"
-            data-manage-service={serviceKey}
-            data-pointer-restored={pointerRestored || undefined}
-            onKeyDown={onPointerReset}
-            onBlur={onPointerReset}
-            title={`${accounts.length} ${accounts.length === 1 ? 'account' : 'accounts'}${issue ? ' · Sign-in required' : ''}`}
+            title="More options"
             aria-busy={refreshing}
           >
             {refreshing ? (
@@ -196,7 +161,6 @@ export function AppCardMenu({
             ) : (
               <Ellipsis size={18} aria-hidden="true" />
             )}
-            {issue && <span className="app-account-attention" aria-hidden="true" />}
           </Button>
         }
       >

@@ -100,7 +100,8 @@
 }
 .apps-page .integration-card-actions .app-manage {
   position: relative;
-  width: 56px;
+  min-width: 56px;
+  padding: 4px 12px;
   gap: 6px;
 }
 .app-account-count {
