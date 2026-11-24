@@ -1,9 +1,11 @@
 import { Fragment, memo, useEffect, useMemo, useState, type ReactNode } from 'react';
 import {
   Alert,
+  Dimensions,
   Image,
   Linking,
   Pressable,
+  StyleSheet,
   Text,
   View,
   type ImageStyle,
@@ -19,6 +21,7 @@ import { useFileViewer } from '../files/file-viewer-context';
 import { imageArtifact, safeLink } from '../connection/links';
 import { useNodBase } from '../connection/nod-context';
 import { Check, Copy } from '../ui/icons';
+import { ScrollFade } from '../ui/scroll-fade';
 import { font, radius, type Theme } from '../ui/theme';
 
 function open(connection: Connection, href: string, show: (file: Artifact) => void) {
@@ -81,11 +84,62 @@ function CodeBlock({
   );
 }
 
+function TableBlock({
+  header,
+  rows,
+  theme,
+}: {
+  header: ReactNode[][];
+  rows: ReactNode[][][];
+  theme: Theme;
+}) {
+  const columns = Math.max(header.length, 1);
+  const width = Math.max(120, Math.floor((Dimensions.get('window').width - 120) / columns));
+  const line = (cells: ReactNode[][], key: string, head: boolean) => (
+    <View
+      key={key}
+      style={[
+        styles.tableRow,
+        { borderColor: theme.border },
+        head ? { backgroundColor: theme.inset, borderTopWidth: 0 } : null,
+      ]}
+    >
+      {cells.map((cell, column) => (
+        <View key={`${key}-${String(column)}`} style={[styles.tableCell, { width }]}>
+          {cell}
+        </View>
+      ))}
+    </View>
+  );
+  return (
+    <View style={[styles.table, { borderColor: theme.border }]}>
+      <ScrollFade color={theme.chatReceived} contentContainerStyle={styles.tableContent}>
+        <View style={styles.tableContent}>
+          {line(header, 'head', true)}
+          {rows.map((cells, row) => line(cells, `row-${String(row)}`, false))}
+        </View>
+      </ScrollFade>
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  table: {
+    marginTop: 4,
+    marginBottom: 20,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderRadius: radius.control,
+    overflow: 'hidden',
+  },
+  tableRow: { flexDirection: 'row', borderTopWidth: StyleSheet.hairlineWidth },
+  tableContent: { flexGrow: 1 },
+  tableCell: { flexGrow: 1, paddingHorizontal: 12, paddingVertical: 8 },
+});
+
 function nodRenderer(connection: Connection, theme: Theme, show: (file: Artifact) => void) {
   const renderer = new Renderer();
   const key = () => renderer.getKey();
   const baseList = renderer.list.bind(renderer);
-  const baseTable = renderer.table.bind(renderer);
 
   const image = (uri: string, alt?: string, style?: ImageStyle, title?: string): ReactNode => {
     const label = alt || title || 'Image';
@@ -170,16 +224,8 @@ function nodRenderer(connection: Connection, theme: Theme, show: (file: Artifact
         {baseList(ordered, li, listStyle, textStyle, startIndex)}
       </View>
     ),
-    table: (
-      header: ReactNode[][],
-      rows: ReactNode[][][],
-      tableStyle?: ViewStyle,
-      rowStyle?: ViewStyle,
-      cellStyle?: ViewStyle,
-    ): ReactNode => (
-      <View key={key()} style={{ marginTop: 4, marginBottom: 20 }}>
-        {baseTable(header, rows, tableStyle, rowStyle, cellStyle)}
-      </View>
+    table: (header: ReactNode[][], rows: ReactNode[][][]): ReactNode => (
+      <TableBlock key={key()} header={header} rows={rows} theme={theme} />
     ),
   });
 }
@@ -241,9 +287,6 @@ function markdownStyles(theme: Theme) {
         color: theme.foreground,
       },
       hr: { backgroundColor: theme.border, height: 1, marginVertical: 16 },
-      table: { borderColor: theme.border, borderRadius: radius.control, marginBottom: 12 },
-      tableRow: { borderColor: theme.border },
-      tableCell: { padding: 8 },
     },
   };
 }
