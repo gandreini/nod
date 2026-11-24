@@ -14,6 +14,7 @@ export {
   Pause,
   Phone,
   PhoneOff,
+  Users,
 } from 'lucide-react-native';
 
 type Props = { size?: number; color?: string; solid?: boolean; strokeWidth?: number };
@@ -68,6 +69,7 @@ export const MessageCircle = n8n('chat-bubble');
 export const Mic = n8n('microphone');
 export const Paperclip = n8n('paperclip');
 export const Play = n8n('play');
+export const Pencil = n8n('pencil');
 export const Plus = n8n('plus');
 export const RefreshCw = n8n('arrows-cw');
 export const ScanSearch = n8n('binoculars');

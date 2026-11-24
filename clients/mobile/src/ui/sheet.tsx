@@ -103,12 +103,14 @@ export function SheetTitle({
 export function Sheet({
   theme,
   handleTestID,
+  fit,
   onClose,
   header,
   children,
 }: {
   theme: Theme;
   handleTestID: string;
+  fit?: boolean;
   onClose(): void;
   header(close: CloseSheet): ReactNode;
   children(close: CloseSheet): ReactNode;
@@ -202,7 +204,7 @@ export function Sheet({
             style={[
               styles.sheet,
               {
-                top,
+                ...(fit ? { maxHeight: box - top, paddingBottom: insets.bottom + 8 } : { top }),
                 backgroundColor: theme.background,
                 borderColor: theme.hairline,
                 boxShadow: theme.shadow.sheet,

@@ -1,8 +1,27 @@
-import { Blocks, CircleAlert, Plus, Search, X } from '../ui/icons';
+import { Blocks, Ellipsis, Plus, Search, Users, X } from '../ui/icons';
 import * as WebBrowser from 'expo-web-browser';
-import { useEffect, useState } from 'react';
-import { Alert, AppState, Pressable, StyleSheet, Text, TextInput, View } from 'react-native';
+import { useEffect, useState, type ReactNode } from 'react';
+import {
+  ActivityIndicator,
+  Alert,
+  AppState,
+  Pressable,
+  StyleSheet,
+  Text,
+  TextInput,
+  View,
+} from 'react-native';
 import { searchApps } from '../../../../src/web/lib/app-search';
+import {
+  accountIssue,
+  addAccountTarget,
+  mcpAccounts,
+  refreshSummary,
+  toolCountLabel,
+  type Refreshed,
+} from '../../../../src/web/lib/app-tools';
+import { connectionGroups } from '../../../../src/web/lib/secondary-pages';
+import { AccountsSheet, OptionsSheet, RenameSheet } from './app-sheets';
 import { errorText } from '../connection/api';
 import { AppLogo } from './app-logo';
 import type { AppConnection } from '../connection/contracts';
@@ -13,58 +32,79 @@ import { useRequest, useResource } from './use-resource';
 
 const page = 40;
 
-function search(items: AppConnection[], query: string) {
+type AppGroup = ReturnType<typeof connectionGroups>[number];
+
+function search(groups: AppGroup[], query: string) {
   return searchApps(
-    items.map((app) => ({
-      ...app,
-      description: app.description ?? '',
-      category: (app.categories ?? []).join(' '),
+    groups.map((group) => ({
+      ...group,
+      name: group.service.name,
+      slug: group.service.slug,
+      description: group.service.description ?? '',
+      category: (group.service.categories ?? []).join(' '),
     })),
     query,
   );
 }
 
-function account(app: AppConnection) {
-  return app.accountName || app.accountEmail || null;
-}
-
-function needsYou(app: AppConnection) {
-  return Boolean(
-    app.connectionId &&
-    (app.reconnectRequired || app.status !== 'connected' || app.browserState === 'needs_sign_in'),
+function Chip({
+  label,
+  onPress,
+  disabled,
+  children,
+}: {
+  label: string;
+  onPress(): void;
+  disabled?: boolean;
+  children: ReactNode;
+}) {
+  const theme = useTheme();
+  return (
+    <Pressable
+      onPress={onPress}
+      disabled={disabled}
+      hitSlop={6}
+      accessibilityRole="button"
+      accessibilityLabel={label}
+      style={({ pressed }) => [
+        styles.chip,
+        { backgroundColor: pressed ? theme.controlActive : theme.control },
+      ]}
+    >
+      {children}
+    </Pressable>
   );
 }
 
 function AppRow({
-  app,
+  group,
   first,
   busy,
-  onPress,
+  tools,
+  issue,
+  onManage,
+  onMore,
+  onConnect,
 }: {
-  app: AppConnection;
+  group: AppGroup;
   first: boolean;
   busy: boolean;
-  onPress(): void;
+  tools?: string;
+  issue: boolean;
+  onManage(): void;
+  onMore(): void;
+  onConnect(): void;
 }) {
   const theme = useTheme();
   const { connection } = useNodBase();
-  const who = account(app);
+  const { service, accounts } = group;
+  const count = accounts.length;
   return (
     <Pressable
-      onPress={onPress}
+      onPress={count ? onManage : onConnect}
       disabled={busy}
       accessibilityRole="button"
-      accessibilityLabel={[
-        app.name,
-        who,
-        !app.connectionId
-          ? 'Connect'
-          : needsYou(app)
-            ? 'Sign in again'
-            : app.disconnectPending
-              ? 'Disconnecting'
-              : null,
-      ]
+      accessibilityLabel={[service.name, tools, !count ? 'Connect' : issue ? 'Sign in again' : null]
         .filter(Boolean)
         .join(', ')}
       style={({ pressed }) => [
@@ -78,25 +118,52 @@ function AppRow({
       ]}
     >
       <View style={[styles.logo, { backgroundColor: theme.muted }]}>
-        <AppLogo slug={app.slug} logoUrl={app.logoUrl} origin={connection.origin} theme={theme} />
+        <AppLogo
+          slug={service.slug}
+          logoUrl={service.logoUrl}
+          origin={connection.origin}
+          theme={theme}
+        />
       </View>
       <View style={styles.fill}>
-        <Text style={[text.label, { color: theme.foreground }]} numberOfLines={1}>
-          {app.name}
-        </Text>
-        {who ? (
+        <View style={styles.heading}>
+          <Text style={[text.label, styles.shrink, { color: theme.foreground }]} numberOfLines={1}>
+            {service.name}
+          </Text>
+          {tools ? <Pill label={tools} /> : null}
+        </View>
+        {service.description ? (
           <Text style={[text.small, { color: theme.mutedForeground }]} numberOfLines={1}>
-            {who}
+            {service.description}
           </Text>
         ) : null}
       </View>
-      {!app.connectionId ? (
-        <Text style={[text.label, { color: theme.accent }]}>Connect</Text>
-      ) : needsYou(app) ? (
-        <Pill label="Sign in again" icon={CircleAlert} kind="attention" />
-      ) : app.disconnectPending ? (
-        <Pill label="Disconnecting" />
-      ) : null}
+      {count ? (
+        <View style={styles.actions}>
+          <Chip
+            label={`Manage ${service.name} accounts (${count})${issue ? ', sign-in required' : ''}`}
+            disabled={busy}
+            onPress={onManage}
+          >
+            <Users size={16} color={theme.foreground} />
+            <Text style={[text.label, { color: theme.foreground }]}>
+              {count > 99 ? '99+' : count}
+            </Text>
+            {issue ? <View style={[styles.dot, { backgroundColor: theme.accent }]} /> : null}
+          </Chip>
+          <Chip label={`${service.name} options`} disabled={busy} onPress={onMore}>
+            {busy ? (
+              <ActivityIndicator size="small" color={theme.foreground} />
+            ) : (
+              <Ellipsis size={16} color={theme.foreground} />
+            )}
+          </Chip>
+        </View>
+      ) : (
+        <Chip label={`Connect ${service.name}`} disabled={busy} onPress={onConnect}>
+          <Text style={[text.label, { color: theme.foreground }]}>Connect</Text>
+        </Chip>
+      )}
     </Pressable>
   );
 }
@@ -107,10 +174,16 @@ export function AppsScreen() {
   const send = useRequest();
   const apps = useResource<AppConnection[]>('/api/apps');
   const catalog = useResource<AppConnection[]>('/api/apps/catalog', { optional: true });
+  const counted = useResource<{ counts: Array<{ connectionId: string; tools: number }> }>(
+    '/api/fork/apps/mcp/tools',
+    { optional: true },
+  );
+  const [refreshed, setRefreshed] = useState<Record<string, number>>({});
   const [busy, setBusy] = useState<string>();
   const [error, setError] = useState<string>();
   const [query, setQuery] = useState('');
   const [shown, setShown] = useState(page);
+  const [sheet, setSheet] = useState<{ kind: 'accounts' | 'options' | 'rename'; key: string }>();
   const reload = apps.reload;
   useEffect(() => {
     const subscription = AppState.addEventListener('change', (status) => {
@@ -118,32 +191,44 @@ export function AppsScreen() {
     });
     return () => subscription.remove();
   }, [reload]);
+  const counts = {
+    ...Object.fromEntries(
+      (counted.data?.counts ?? []).map((count) => [count.connectionId, count.tools]),
+    ),
+    ...refreshed,
+  };
   const searching = query.trim().length > 0;
-  const find = (items: AppConnection[]) => (searching ? search(items, query) : items);
-  const list = (apps.data ?? []).filter((app) => app.connectionId);
-  const attention = find(list.filter(needsYou));
-  const connected = find(list.filter((app) => !needsYou(app)));
-  const taken = new Set(list.map((app) => app.slug));
-  const pool = (catalog.data?.length ? catalog.data : (apps.data ?? [])).filter(
-    (app) => !app.connectionId && app.status !== 'not_configured' && !taken.has(app.slug),
+  const groups = apps.data ? connectionGroups(apps.data, catalog.data ?? []) : [];
+  const find = (items: AppGroup[]) => (searching ? search(items, query) : items);
+  const list = groups.filter((group) => group.accounts.length);
+  const attention = find(list.filter((group) => accountIssue(group.service, group.accounts)));
+  const connected = find(list.filter((group) => !accountIssue(group.service, group.accounts)));
+  const pool = groups.filter(
+    (group) => !group.accounts.length && group.service.status !== 'not_configured',
   );
   const matches = find(pool);
   const available = matches.slice(0, shown);
+  const open = sheet && groups.find((group) => group.key === sheet.key);
   const connect = () =>
     Alert.alert('Connect an app?', 'Nod asks you which app and opens the sign-in in the chat.', [
       { text: 'Cancel', style: 'cancel' },
       { text: 'Connect', onPress: () => ask('Help me connect a new app. Ask me which one.') },
     ]);
 
-  async function signIn(app: AppConnection, connectionId?: string) {
-    const key = connectionId ?? app.slug;
+  async function signIn(key: string, app: AppConnection, addAccount = false) {
     setBusy(key);
     setError(undefined);
     try {
       const { url } = await send<{ url: string }>(
         `/api/apps/${encodeURIComponent(app.slug)}/connect`,
         'POST',
-        { returnTo: 'window', ...(connectionId ? { connectionId } : {}) },
+        {
+          returnTo: 'window',
+          ...(addAccount && app.accessPaths?.length ? { newAccount: true } : {}),
+          ...((!addAccount || app.accessPaths?.length) && app.connectionId
+            ? { connectionId: app.connectionId }
+            : {}),
+        },
       );
       await WebBrowser.openBrowserAsync(new URL(url, connection.origin).href, {
         presentationStyle: WebBrowser.WebBrowserPresentationStyle.PAGE_SHEET,
@@ -156,53 +241,74 @@ export function AppsScreen() {
     }
   }
 
-  function manage(app: AppConnection) {
-    if (!app.connectionId) return void signIn(app);
-    const who = account(app);
-    const label = who ? `${app.name} (${who})` : app.name;
-    const reconnect = needsYou(app)
-      ? [{ text: 'Sign in again', onPress: () => void signIn(app, app.connectionId) }]
-      : [];
-    Alert.alert(label, 'Nod uses this account when you ask it to.', [
-      ...reconnect,
-      ...(app.connectionId && !app.disconnectPending
-        ? [{ text: 'Disconnect', style: 'destructive' as const, onPress: () => disconnect(app) }]
-        : []),
-      { text: 'Close', style: 'cancel' },
-    ]);
-  }
-
-  async function disconnect(app: AppConnection) {
-    if (!app.connectionId) return;
-    setBusy(app.connectionId);
+  async function disconnect(key: string, account: AppConnection) {
+    if (!account.connectionId) return;
+    setBusy(key);
     setError(undefined);
     try {
       await send(
-        `/api/apps/${encodeURIComponent(app.slug)}/accounts/${encodeURIComponent(app.connectionId)}/disconnect`,
+        `/api/apps/${encodeURIComponent(account.slug)}/accounts/${encodeURIComponent(account.connectionId)}/disconnect`,
         'POST',
         {},
       );
     } catch (problem) {
-      setError(`Disconnecting ${app.name} failed: ${errorText(problem)}`);
+      setError(`Disconnecting ${account.name} failed: ${errorText(problem)}`);
     } finally {
       setBusy(undefined);
       void apps.reload();
     }
   }
 
-  const group = (items: AppConnection[]) => (
+  async function refreshTools(group: AppGroup) {
+    setBusy(group.key);
+    setError(undefined);
+    try {
+      const result = await send<Refreshed>(
+        `/api/fork/apps/mcp/${encodeURIComponent(group.service.slug)}/refresh`,
+        'POST',
+        {},
+      );
+      setRefreshed((current) => ({
+        ...current,
+        ...Object.fromEntries(result.results.map((entry) => [entry.connectionId, entry.tools])),
+      }));
+      Alert.alert('Tools refreshed', refreshSummary(group.service.name, result));
+    } catch (problem) {
+      setError(`Refreshing ${group.service.name} failed: ${errorText(problem)}`);
+    } finally {
+      setBusy(undefined);
+    }
+  }
+
+  async function rename(group: AppGroup, name: string) {
+    await send(`/api/apps/mcp/${encodeURIComponent(group.service.slug)}`, 'PATCH', { name });
+    void apps.reload();
+  }
+
+  const group = (items: AppGroup[]) => (
     <Group>
-      {items.map((app, index) => (
-        <AppRow
-          key={app.connectionId ?? `${app.slug}:${index}`}
-          app={app}
-          first={index === 0}
-          busy={busy !== undefined && busy === (app.connectionId ?? app.slug)}
-          onPress={() => manage(app)}
-        />
-      ))}
+      {items.map((item, index) => {
+        const target = addAccountTarget(item.service, item.accounts);
+        return (
+          <AppRow
+            key={item.key}
+            group={item}
+            first={index === 0}
+            busy={busy === item.key}
+            tools={item.accounts.length ? toolCountLabel(item.accounts, counts) : undefined}
+            issue={accountIssue(item.service, item.accounts)}
+            onManage={() => setSheet({ kind: 'accounts', key: item.key })}
+            onMore={() => setSheet({ kind: 'options', key: item.key })}
+            onConnect={() => void signIn(item.key, target ?? item.service)}
+          />
+        );
+      })}
     </Group>
   );
+
+  const openTarget = open ? addAccountTarget(open.service, open.accounts) : undefined;
+  const add = open && openTarget ? () => void signIn(open.key, openTarget, true) : undefined;
+  const close = () => setSheet(undefined);
 
   return (
     <Page
@@ -219,6 +325,38 @@ export function AppsScreen() {
         ) : null
       }
     >
+      {open && sheet?.kind === 'accounts' ? (
+        <AccountsSheet
+          name={open.service.name}
+          accounts={open.accounts}
+          theme={theme}
+          onClose={close}
+          onSignIn={(account) => void signIn(open.key, account)}
+          onDisconnect={(account) => void disconnect(open.key, account)}
+          onAdd={add}
+        />
+      ) : null}
+      {open && sheet?.kind === 'options' ? (
+        <OptionsSheet
+          name={open.service.name}
+          theme={theme}
+          onClose={close}
+          onRefresh={mcpAccounts(open.accounts).length ? () => void refreshTools(open) : undefined}
+          onRename={
+            open.service.canRename ? () => setSheet({ kind: 'rename', key: open.key }) : undefined
+          }
+          onManage={() => setSheet({ kind: 'accounts', key: open.key })}
+          onAdd={add}
+        />
+      ) : null}
+      {open && sheet?.kind === 'rename' ? (
+        <RenameSheet
+          name={open.service.name}
+          theme={theme}
+          onClose={close}
+          onSave={(name) => rename(open, name)}
+        />
+      ) : null}
       {apps.data && (list.length || pool.length) ? (
         <View
           style={[styles.search, { backgroundColor: theme.surface, borderColor: theme.border }]}
@@ -313,6 +451,8 @@ export function AppsScreen() {
 
 const styles = StyleSheet.create({
   fill: { flex: 1 },
+  shrink: { flexShrink: 1 },
+  heading: { flexDirection: 'row', alignItems: 'center', gap: 6 },
   row: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -321,6 +461,18 @@ const styles = StyleSheet.create({
     paddingHorizontal: 16,
     paddingVertical: 12,
   },
+  actions: { flexDirection: 'row', alignItems: 'center', gap: 6 },
+  chip: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 4,
+    minWidth: 36,
+    height: 36,
+    paddingHorizontal: 10,
+    borderRadius: radius.full,
+  },
+  dot: { position: 'absolute', top: 5, right: 5, width: 6, height: 6, borderRadius: 3 },
   search: {
     flexDirection: 'row',
     alignItems: 'center',

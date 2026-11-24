@@ -777,6 +777,22 @@ if (demo) {
   app.post<{ Params: { id: string } }>('/api/apps/:slug/accounts/:id/disconnect', (request) =>
     remove(request.params.id),
   );
+  app.get('/api/fork/apps/mcp/tools', async () => ({
+    counts: [{ connectionId: '00000000-0000-4000-8000-000000000404', tools: 7 }],
+  }));
+  app.post('/api/fork/apps/mcp/:slug/refresh', async () => ({
+    results: [
+      {
+        connectionId: '00000000-0000-4000-8000-000000000404',
+        tools: 8,
+        added: ['search_pages'],
+        removed: [],
+      },
+    ],
+  }));
+  app.patch('/api/apps/mcp/:slug', async (request) => ({
+    name: String((request.body as { name?: unknown })?.name ?? ''),
+  }));
   app.post<{ Params: { id: string } }>('/api/tasks/:id/stop', async (request) => {
     store.demo!.stopped = [...new Set([...store.demo!.stopped, request.params.id])];
     await persist();

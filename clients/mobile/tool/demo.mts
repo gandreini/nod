@@ -180,6 +180,8 @@ function lastAt(now: number, weekday: number, hour: number) {
 const ids = {
   mail: uuid(401),
   calendar: uuid(402),
+  work: uuid(403),
+  docs: uuid(404),
   task: uuid(421),
   login: uuid(431),
   card: uuid(432),
@@ -259,6 +261,29 @@ export function demoSections(now: number, state: DemoState) {
       accountEmail: 'demo@example.com',
       triggersEnabled: false,
       description: 'Sample calendar for the demo.',
+    },
+    {
+      slug: 'demo-mail',
+      name: 'Demo Mail',
+      status: 'connected',
+      connectionId: ids.work,
+      accountId: 'demo-mail-work',
+      accountEmail: 'work@example.com',
+      reconnectRequired: true,
+      triggersEnabled: false,
+      description: 'Sample inbox for the demo.',
+    },
+    {
+      slug: 'mcp-demo-docs',
+      name: 'Demo Docs',
+      status: 'connected',
+      connectionId: ids.docs,
+      accountId: 'demo-docs-account',
+      accountName: 'Demo Docs',
+      triggersEnabled: false,
+      canRename: true,
+      accessPaths: [{ id: 'demo-docs-mcp', kind: 'mcp', endpoint: 'https://example.com/mcp' }],
+      description: 'MCP',
     },
   ]);
   const catalog = [
