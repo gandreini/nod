@@ -27,7 +27,7 @@ import { AppLogo } from './app-logo';
 import type { AppConnection } from '../connection/contracts';
 import { useNodBase } from '../connection/nod-context';
 import { radius, useTheme } from '../ui/theme';
-import { Button, Empty, Group, Loaded, Notice, Page, Pill, SectionTitle, text } from '../ui/ui';
+import { Button, Empty, Group, Loaded, Notice, Page, SectionTitle, text } from '../ui/ui';
 import { useRequest, useResource } from './use-resource';
 
 const page = 40;
@@ -134,7 +134,9 @@ function AppRow({
           <Text style={[text.label, styles.shrink, { color: theme.foreground }]} numberOfLines={1}>
             {service.name}
           </Text>
-          {tools ? <Pill label={tools} /> : null}
+          {tools ? (
+            <Text style={[text.small, { color: theme.mutedForeground }]}>{tools}</Text>
+          ) : null}
         </View>
         {service.description ? (
           <Text style={[text.small, { color: theme.mutedForeground }]} numberOfLines={1}>
@@ -467,7 +469,7 @@ export function AppsScreen() {
 const styles = StyleSheet.create({
   fill: { flex: 1 },
   shrink: { flexShrink: 1 },
-  heading: { flexDirection: 'row', alignItems: 'center', gap: 6 },
+  heading: { flexDirection: 'row', alignItems: 'baseline', gap: 8 },
   row: {
     flexDirection: 'row',
     alignItems: 'center',
