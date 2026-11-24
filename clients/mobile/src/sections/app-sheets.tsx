@@ -213,6 +213,15 @@ export function OptionsSheet({
     >
       {(close) => (
         <View style={styles.menu}>
+          {onAdd ? (
+            <MenuItem icon={Plus} label="Add account" theme={theme} onPress={() => close(onAdd)} />
+          ) : null}
+          <MenuItem
+            icon={Users}
+            label="Manage accounts"
+            theme={theme}
+            onPress={() => close(onManage)}
+          />
           {onRefresh ? (
             <MenuItem
               icon={RefreshCw}
@@ -223,15 +232,6 @@ export function OptionsSheet({
           ) : null}
           {onRename ? (
             <MenuItem icon={Pencil} label="Rename" theme={theme} onPress={() => close(onRename)} />
-          ) : null}
-          <MenuItem
-            icon={Users}
-            label="Manage accounts"
-            theme={theme}
-            onPress={() => close(onManage)}
-          />
-          {onAdd ? (
-            <MenuItem icon={Plus} label="Add account" theme={theme} onPress={() => close(onAdd)} />
           ) : null}
         </View>
       )}
