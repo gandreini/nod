@@ -81,6 +81,7 @@ function summary(name: string, { results }: Refreshed) {
 
 export function AppCardMenu({
   service,
+  tools,
   accounts,
   serviceKey,
   issue,
@@ -94,6 +95,7 @@ export function AppCardMenu({
   onResult,
 }: {
   service: Connection;
+  tools?: string;
   accounts: Connection[];
   serviceKey: string;
   issue: boolean;
@@ -171,6 +173,7 @@ export function AppCardMenu({
   const label = `${service.name} options${issue ? ', sign-in required' : ''}`;
   return (
     <>
+      {tools && <span className="app-tool-count">{tools}</span>}
       <ActionMenu
         label={label}
         disabled={locked}

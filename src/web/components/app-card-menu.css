@@ -19,3 +19,14 @@
 .apps-page .app-card-menu-trigger[data-pointer-restored]:focus {
   outline: none;
 }
+.app-tool-count {
+  flex: none;
+  padding: 0 8px;
+  border-radius: var(--radius-full);
+  background: var(--control);
+  color: var(--muted-foreground);
+  font-size: 12px;
+  line-height: 22px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
