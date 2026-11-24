@@ -476,7 +476,7 @@ const styles = StyleSheet.create({
     paddingHorizontal: 16,
     paddingVertical: 12,
   },
-  actions: { flexDirection: 'row', alignItems: 'center', gap: 6 },
+  actions: { flexDirection: 'row', alignItems: 'center' },
   chip: {
     flexDirection: 'row',
     alignItems: 'center',
