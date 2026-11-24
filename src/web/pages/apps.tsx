@@ -871,7 +871,6 @@ export function Apps({
         onClose={() => setManageService(null)}
         onConnect={(account, addAccount) => void connect(account, 'manage', addAccount)}
         onDisconnect={disconnect}
-        onRename={managed?.service.canRename ? rename : undefined}
         onRestoreFocus={restoreAppFocus}
         onKeyboard={() => {
           manageKeyboard.current = true;
